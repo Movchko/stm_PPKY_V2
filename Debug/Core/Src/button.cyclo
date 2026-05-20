@@ -1,8 +1,0 @@
-../Core/Src/button.c:19:13:Button_SetAllError	2
-../Core/Src/button.c:26:13:Button_ResetStates	2
-../Core/Src/button.c:35:16:Button_ReinitI2CDriver	1
-../Core/Src/button.c:40:28:Button_ReinitReaderChip	1
-../Core/Src/button.c:45:6:Button_Init	2
-../Core/Src/button.c:56:6:Button_Process	10
-../Core/Src/button.c:94:13:Button_GetState	1
-../Core/Src/button.c:98:6:Button_ReadPin	1

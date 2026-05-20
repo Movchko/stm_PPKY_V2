@@ -1,8 +1,0 @@
-../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:104:18:virtual void touchgfx::Screen::afterTransition()	16	static
-../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:115:18:virtual void touchgfx::Screen::tearDownScreen()	16	static
-../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:154:18:virtual void touchgfx::Screen::handleKeyEvent(uint8_t)	16	static
-../TouchGFX/gui/include/gui/screen_logo_screen/screen_logoView.hpp:11:13:screen_logoView::~screen_logoView()	16	static
-../TouchGFX/gui/include/gui/screen_logo_screen/screen_logoView.hpp:11:13:virtual screen_logoView::~screen_logoView()	16	static
-../TouchGFX/gui/src/screen_logo_screen/screen_logoView.cpp:3:1:screen_logoView::screen_logoView()	16	static
-../TouchGFX/gui/src/screen_logo_screen/screen_logoView.cpp:8:6:virtual void screen_logoView::setupScreen()	16	static
-../TouchGFX/gui/src/screen_logo_screen/screen_logoView.cpp:13:6:virtual void screen_logoView::tearDownScreen()	16	static
