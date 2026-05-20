@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TextDatabase xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="texts.xsd" Version="4.25.0">
+  <Languages>
+    <Language Id="GB" />
+  </Languages>
+  <Texts>
+    <TextGroup Id="Group1" />
+    <TextGroup Id="Unsorted">
+      <Text Id="__SingleUse_P23D" Alignment="Left" TypographyId="Default">
+        <Translation Language="GB"></Translation>
+      </Text>
+      <Text Id="__SingleUse_2J37" Alignment="Center" TypographyId="Small">
+        <Translation Language="GB">&lt;value&gt;</Translation>
+      </Text>
+      <Text Id="__SingleUse_K01E" Alignment="Left" TypographyId="Large">
+        <Translation Language="GB"></Translation>
+      </Text>
+      <Text Id="__SingleUse_H127" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">&lt;value&gt;</Translation>
+      </Text>
+      <Text Id="__SingleUse_MO05" Alignment="Left" TypographyId="Default">
+        <Translation Language="GB">АВАРИЯ</Translation>
+      </Text>
+      <Text Id="__SingleUse_4WPO" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">&lt;value&gt;</Translation>
+      </Text>
+      <Text Id="ResourceId2" Alignment="Left" TypographyId="Default">
+        <Translation Language="GB">New Text</Translation>
+      </Text>
+      <Text Id="ruH" Alignment="Left" TypographyId="Large">
+        <Translation Language="GB" Alignment="Center">QWERTYUIOP[]ASDFGHJKL;'\ZXCVBNM,./!@#$%^&amp;*()_+-=:"{}|?&gt;&lt;ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ 1234567890-</Translation>
+      </Text>
+      <Text Id="__SingleUse_9MQN" Alignment="Left" TypographyId="Large">
+        <Translation Language="GB"></Translation>
+      </Text>
+      <Text Id="__SingleUse_MF0S" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">&lt;value&gt;</Translation>
+      </Text>
+      <Text Id="__SingleUse_WSFU" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">....</Translation>
+      </Text>
+      <Text Id="turnon" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">Вкл</Translation>
+      </Text>
+      <Text Id="turnoff" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">Откл</Translation>
+      </Text>
+      <Text Id="ru" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">йцукенгшщзхъфывапролджэячсмитьбю ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ-/|\</Translation>
+      </Text>
+      <Text Id="alphabet" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">QWERTYUIOPASDFGHJKLZXCVBNM qwertyuiopasdfghjklzxcvbnm*()?:%;№"!</Translation>
+      </Text>
+      <Text Id="__SingleUse_D1VE" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">&lt;value&gt;</Translation>
+      </Text>
+      <Text Id="Data" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">03.02.26&#10;</Translation>
+      </Text>
+      <Text Id="Time" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">01:01:01&#10;&#10;</Translation>
+      </Text>
+      <Text Id="__SingleUse_YQF0" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">12345678901234567890123456789</Translation>
+      </Text>
+      <Text Id="__SingleUse_XB5O" Alignment="Left" TypographyId="Small">
+        <Translation Language="GB">12345678901234</Translation>
+      </Text>
+      <Text Id="Connect" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">СВЯЗЬ</Translation>
+      </Text>
+      <Text Id="Jurnal" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">ЖУРНАЛ</Translation>
+      </Text>
+      <Text Id="Settings" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">НАСТРОЙКИ</Translation>
+      </Text>
+      <Text Id="Sound" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">ЗВУК</Translation>
+      </Text>
+      <Text Id="Mode" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">РЕЖИМ</Translation>
+      </Text>
+      <Text Id="Test" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">ТЕСТ</Translation>
+      </Text>
+      <Text Id="__SingleUse_B5JP" Alignment="Center" TypographyId="Large">
+        <Translation Language="GB">&lt;value&gt;</Translation>
+      </Text>
+    </TextGroup>
+  </Texts>
+  <Typographies>
+    <Typography Id="Default" Font="MonospaceRegular.ttf" Size="20" Bpp="4" IsVector="no" Direction="LTR" FallbackCharacter="?" />
+    <Typography Id="Large" Font="MonospaceRegular.ttf" Size="20" Bpp="4" IsVector="no" Direction="LTR" FallbackCharacter="?" />
+    <Typography Id="Small" Font="MonospaceRegular.ttf" Size="15" Bpp="4" IsVector="no" Direction="LTR" FallbackCharacter="?" />
+  </Typographies>
+</TextDatabase>

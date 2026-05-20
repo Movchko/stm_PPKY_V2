@@ -1,0 +1,14 @@
+../Core/Src/can_bus.c:65:13:check_can_bus	6
+../Core/Src/can_bus.c:87:13:can_rx_push	3
+../Core/Src/can_bus.c:111:13:CanTxEnqueueOne	3
+../Core/Src/can_bus.c:135:13:CanTxEnqueue	3
+../Core/Src/can_bus.c:145:13:App_CanTxProcessBus	4
+../Core/Src/can_bus.c:179:13:can_rx_drain_fifo	3
+../Core/Src/can_bus.c:192:6:CanRxPush	1
+../Core/Src/can_bus.c:197:6:CanInit	2
+../Core/Src/can_bus.c:206:6:CanProcess	17
+../Core/Src/can_bus.c:301:6:App_CanTxProcess	2
+../Core/Src/can_bus.c:311:6:CANSendData	2
+../Core/Src/can_bus.c:329:6:HAL_FDCAN_RxFifo0Callback	3
+../Core/Src/can_bus.c:339:6:HAL_FDCAN_RxFifo1Callback	3
+../Core/Src/can_bus.c:349:6:HAL_FDCAN_ErrorStatusCallback	2

@@ -1,0 +1,30 @@
+
+{
+  "Application": {
+    "Name": "stm_PPKY_V2",
+    "TouchGfxPath": "../Middlewares/ST/touchgfx",
+    "AvailableColorDepths": [ 1 ],
+    "AvailableLCDs":
+    {
+      "1": "LCD1bpp"
+    },
+    "AvailableResolutions": [
+      {
+        "Width": 128,
+        "Height": 64
+      }
+    ],
+    "PostGenerateTargetCommand": "touchgfx update_project",
+    "Family": "STM32H5",
+    "SubFamily": "STM32H5x3",
+    "Platform": "m33",
+    "Toolchain": "STM32CubeIDE",
+    "ProjectFile": "../stm_PPKY_V2.ioc",
+    "OptionalComponentsRoot": "../Middlewares/ST/touchgfx_components",
+    "OptionalComponents": [
+    ],
+    "AdditionalFeatures": [
+    ]
+  },
+  "Version": "4.25.0"
+}

@@ -1,0 +1,12 @@
+../Core/Src/led.c:34:13:Led_UpdateStatusBrightness	8
+../Core/Src/led.c:63:16:Led_PackGroupState	3
+../Core/Src/led.c:75:13:Led_SyncToI2C	7
+../Core/Src/led.c:103:6:Led_Init	4
+../Core/Src/led.c:158:6:Led_SetAll	2
+../Core/Src/led.c:165:6:Led_OffAll	2
+../Core/Src/led.c:172:6:Led_Set	3
+../Core/Src/led.c:185:6:Led_Snake	2
+../Core/Src/led.c:205:6:Led_TestToogle	4
+../Core/Src/led.c:219:6:Led_Process	18
+../Core/Src/led.c:272:6:Led_SetBrightness	2
+../Core/Src/led.c:279:6:Led_ForceStatusBright	2

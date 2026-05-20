@@ -1,0 +1,32 @@
+../Core/Src/warning.cpp:84:20:const char* {anonymous}::McuTypeName(uint8_t)	7
+../Core/Src/warning.cpp:97:20:const char* {anonymous}::Warning_McuTypeSerialToken(uint8_t)	7
+../Core/Src/warning.cpp:110:20:const char* {anonymous}::Warning_ChannelTypeShort(uint8_t)	5
+../Core/Src/warning.cpp:122:13:void {anonymous}::Warning_GetZoneName(const WarningItem&, char*, size_t)	5
+../Core/Src/warning.cpp:138:13:void {anonymous}::Warning_GetSerialPlaceholder(const WarningItem&, char*, size_t)	1
+../Core/Src/warning.cpp:144:13:void {anonymous}::Warning_FormatMkuAndSerial(char*, size_t, const WarningItem&)	1
+../Core/Src/warning.cpp:155:16:uint8_t {anonymous}::IsTrackedVdevType(uint8_t)	4
+../Core/Src/warning.cpp:163:16:uint8_t {anonymous}::IsFaultLineState(uint8_t)	3
+../Core/Src/warning.cpp:168:16:uint8_t {anonymous}::IsAttentionKind(uint8_t)	3
+../Core/Src/warning.cpp:173:16:uint8_t {anonymous}::IsFaultKind(uint8_t)	4
+../Core/Src/warning.cpp:181:12:int {anonymous}::FindItem(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t)	10
+../Core/Src/warning.cpp:202:13:void {anonymous}::RemoveItemAt(uint8_t)	2
+../Core/Src/warning.cpp:210:16:uint8_t {anonymous}::TimeReached(uint32_t, uint32_t)	2
+../Core/Src/warning.cpp:216:13:void {anonymous}::UpsertItem(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint32_t)	4
+../Core/Src/warning.cpp:250:13:void {anonymous}::MarkRecovered(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint32_t)	2
+../Core/Src/warning.cpp:261:16:uint8_t {anonymous}::IsItemStillFaulty(const WarningItem&)	31
+../Core/Src/warning.cpp:312:13:void {anonymous}::ConsumeChangedStatuses(uint32_t)	12
+../Core/Src/warning.cpp:363:13:void {anonymous}::PruneInactiveItems(uint32_t)	7
+../Core/Src/warning.cpp:390:13:void {anonymous}::SyncMissingFaultItems(uint32_t)	12
+../Core/Src/warning.cpp:433:13:void {anonymous}::SyncMkuCanFaultItems(uint32_t)	9
+../Core/Src/warning.cpp:459:13:void {anonymous}::SyncPpkuCanFaultItems(uint32_t)	4
+../Core/Src/warning.cpp:477:16:uint8_t {anonymous}::BuildUiPayload(char (*)[24], char (*)[65])	46
+../Core/Src/warning.cpp:578:16:uint8_t {anonymous}::HasActiveFaultNow()	8
+../Core/Src/warning.cpp:591:16:uint8_t {anonymous}::CountActiveFaultNow()	13
+../Core/Src/warning.cpp:616:16:uint8_t {anonymous}::CountActiveAttentionNow()	7
+../Core/Src/warning.cpp:627:13:void {anonymous}::UpdateFaultSound(uint32_t)	20
+../Core/Src/warning.cpp:709:13:void {anonymous}::UpdateErrorLed(uint32_t)	6
+../Core/Src/warning.cpp:744:13:void {anonymous}::PushUiIfChanged(uint8_t, uint8_t, char (*)[24], char (*)[65])	9
+../Core/Src/warning.cpp:772:6:void WarningProcess1ms()	3
+../Core/Src/warning.cpp:796:17:void Warning_SetPowerFaultMask(uint8_t)	1
+../Core/Src/warning.cpp:801:17:void Warning_SetPpkuInputFaultMask(uint8_t)	1
+../Core/Src/warning.cpp:806:20:uint8_t Warning_HasActiveFault()	1

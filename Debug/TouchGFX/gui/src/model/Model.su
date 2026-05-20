@@ -1,0 +1,5 @@
+../TouchGFX/gui/src/model/Model.cpp:9:1:Model::Model()	16	static
+../TouchGFX/gui/src/model/Model.cpp:16:6:void Model::tick()	80	static
+../TouchGFX/gui/src/model/Model.cpp:58:6:void Model::notifySoundToggled(bool)	16	static
+../TouchGFX/gui/src/model/Model.cpp:64:6:void Model::setFireStatusFromApp(bool, uint8_t, uint8_t, uint8_t, uint8_t, char (*)[65])	24	static
+../TouchGFX/gui/src/model/Model.cpp:85:6:void Model::setWarningStatusFromApp(bool, uint8_t, char (*)[24], char (*)[65])	32	static

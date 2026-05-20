@@ -1,0 +1,18 @@
+../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:104:18:virtual void touchgfx::Screen::afterTransition()	1
+../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:115:18:virtual void touchgfx::Screen::tearDownScreen()	1
+../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:144:18:virtual void touchgfx::Screen::handleTickEvent()	1
+../Middlewares/ST/touchgfx/framework/include/touchgfx/Screen.hpp:154:18:virtual void touchgfx::Screen::handleKeyEvent(uint8_t)	1
+../Middlewares/ST/touchgfx/framework/include/touchgfx/widgets/TextAreaWithWildcard.hpp:79:10:void touchgfx::TextAreaWithOneWildcard::setWildcard1(const touchgfx::Unicode::UnicodeChar*)	1
+../Middlewares/ST/touchgfx/framework/include/touchgfx/widgets/TextAreaWithWildcard.hpp:98:10:void touchgfx::TextAreaWithOneWildcard::setWildcard(const touchgfx::Unicode::UnicodeChar*)	1
+../TouchGFX/gui/include/gui/screen_devices_screen/screen_devicesView.hpp:11:13:screen_devicesView::~screen_devicesView()	1
+../TouchGFX/gui/include/gui/screen_devices_screen/screen_devicesView.hpp:11:13:virtual screen_devicesView::~screen_devicesView()	1
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:12:13:bool {anonymous}::isMcuType(uint8_t)	7
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:22:20:const char* {anonymous}::mcuTypeShortName(uint8_t)	7
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:35:13:void {anonymous}::trimZoneName(char*, size_t, const int8_t*, size_t)	8
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:53:1:screen_devicesView::screen_devicesView()	1
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:58:6:virtual void screen_devicesView::setupScreen()	1
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:66:6:virtual void screen_devicesView::tearDownScreen()	1
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:72:6:void screen_devicesView::renderSelected()	5
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:108:6:void screen_devicesView::refreshDeviceUi()	4
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:136:6:void screen_devicesView::nextDevice()	2
+../TouchGFX/gui/src/screen_devices_screen/screen_devicesView.cpp:145:6:void screen_devicesView::prevDevice()	3

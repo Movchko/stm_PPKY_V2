@@ -1,0 +1,7 @@
+../Core/Src/event_logger.cpp:20:10:uint16_t EventLogger_CalculateChecksum(EventLogRecord_t*)	4
+../Core/Src/event_logger.cpp:49:6:bool EventLogger_VerifyChecksum(EventLogRecord_t*)	1
+../Core/Src/event_logger.cpp:60:13:bool EventLogger_IsRecordEmpty(EventLogRecord_t*)	3
+../Core/Src/event_logger.cpp:79:17:uint32_t EventLogger_GetAddressByIndex(EventLogger_t*, uint32_t)	1
+../Core/Src/event_logger.cpp:103:6:bool EventLogger_Init(EventLogger_t*, SPIF_HandleTypeDef*, uint32_t, uint32_t)	19
+../Core/Src/event_logger.cpp:256:6:bool EventLogger_WriteEvent(EventLogger_t*, EventLogRecord_t*)	9
+../Core/Src/event_logger.cpp:340:6:bool EventLogger_ReadEvent(EventLogger_t*, uint32_t, EventLogRecord_t*)	6

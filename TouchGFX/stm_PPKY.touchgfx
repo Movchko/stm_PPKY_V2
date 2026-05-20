@@ -1,0 +1,530 @@
+{
+  "Application": {
+    "Screens": [
+      {
+        "Name": "mainscreen",
+        "Components": [
+          {
+            "Type": "Box",
+            "Name": "box1",
+            "Width": 128,
+            "Height": 64
+          },
+          {
+            "Type": "CustomContainerInstance",
+            "Name": "customContainerTopBar1",
+            "Width": 128,
+            "Height": 15,
+            "CustomContainerDefinitionName": "CustomContainerTopBar"
+          },
+          {
+            "Type": "CustomContainerInstance",
+            "Name": "customContainerScrollTime1",
+            "Width": 72,
+            "Height": 15,
+            "CustomContainerDefinitionName": "CustomContainerScrollTime"
+          },
+          {
+            "Type": "CustomContainerInstance",
+            "Name": "CustomContainerSrollText",
+            "Y": 46,
+            "Width": 128,
+            "Height": 18,
+            "CustomContainerDefinitionName": "CustomContainerSollText"
+          },
+          {
+            "Type": "TextArea",
+            "Name": "textAreatime_top_bar",
+            "Width": 128,
+            "Height": 15,
+            "Visible": false,
+            "TextId": "__SingleUse_4WPO",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Wildcard1": {
+              "TextId": "__SingleUse_MO05",
+              "UseBuffer": true,
+              "BufferSize": 15
+            },
+            "Draggable": true,
+            "Moveable": true
+          },
+          {
+            "Type": "TextArea",
+            "Name": "textArea1",
+            "Y": 18,
+            "Width": 128,
+            "Height": 28,
+            "TextId": "__SingleUse_MF0S",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Wildcard1": {
+              "TextId": "__SingleUse_9MQN",
+              "UseBuffer": true,
+              "BufferSize": 14
+            }
+          }
+        ],
+        "Interactions": []
+      },
+      {
+        "Name": "ScreenMenu",
+        "Components": [
+          {
+            "Type": "Box",
+            "Name": "box1",
+            "Width": 128,
+            "Height": 64
+          },
+          {
+            "Type": "TextArea",
+            "Name": "textAreatime_2",
+            "Y": 49,
+            "Width": 36,
+            "Height": 15,
+            "TextId": "__SingleUse_WSFU",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            }
+          },
+          {
+            "Type": "ScrollableContainer",
+            "Name": "scrollableContainer1",
+            "Y": 15,
+            "Width": 128,
+            "Height": 30,
+            "HorizontalScrollEnabled": true,
+            "ScrollbarsAlpha": 255,
+            "Components": [
+              {
+                "Type": "ScrollWheel",
+                "Name": "scrollWheel1",
+                "Y": 2,
+                "Width": 128,
+                "Height": 30,
+                "IsCircular": true,
+                "ItemTemplateName": "mainmenu",
+                "NumberofItems": 6,
+                "Easing": "Back",
+                "EasingOption": "Out",
+                "SwipeAcceleration": 1.0,
+                "DragAcceleration": 1.0,
+                "OverShootPercentage": 75
+              }
+            ]
+          },
+          {
+            "Type": "CustomContainerInstance",
+            "Name": "customContainerTopBar1",
+            "Width": 128,
+            "Height": 15,
+            "CustomContainerDefinitionName": "CustomContainerTopBar"
+          },
+          {
+            "Type": "ScrollableContainer",
+            "Name": "scrollableContainer1_1",
+            "Width": 79,
+            "Height": 15,
+            "HorizontalScrollEnabled": true,
+            "ScrollbarsVisibleOnPressed": true,
+            "ScrollbarsAlpha": 255,
+            "Components": [
+              {
+                "Type": "ScrollWheel",
+                "Name": "scrollWheel1_1",
+                "Width": 72,
+                "Height": 15,
+                "IsCircular": true,
+                "ItemTemplateName": "CustomContainerTime",
+                "NumberofItems": 2,
+                "Easing": "Back",
+                "EasingOption": "Out",
+                "SwipeAcceleration": 1.0,
+                "DragAcceleration": 1.0,
+                "OverShootPercentage": 75
+              }
+            ]
+          }
+        ],
+        "Interactions": [
+          {
+            "InteractionName": "Interaction1",
+            "Trigger": {
+              "Type": "TriggerWhen",
+              "ActionCustomTypeName": "Call ScreenMenu Button_Press"
+            },
+            "Action": {
+              "Type": "ActionExecuteCode"
+            }
+          }
+        ],
+        "CustomActions": [
+          {
+            "Name": "Button_Press",
+            "HasValue": true,
+            "ValueType": "uint8_t"
+          }
+        ]
+      },
+      {
+        "Name": "screen_logo",
+        "Components": [
+          {
+            "Type": "Image",
+            "Name": "image1",
+            "X": 34,
+            "Width": 60,
+            "Height": 60,
+            "RelativeFilename": "images.png"
+          },
+          {
+            "Type": "AnimatedImage",
+            "Name": "animatedImage1",
+            "Y": 18,
+            "Width": 29,
+            "Height": 29,
+            "FileNameFirst": "logo_small.png",
+            "FileNameLast": "logo_small1.png",
+            "UpdateTicksInterval": 1000,
+            "StartOnLoad": true,
+            "LoopEnabled": true
+          }
+        ],
+        "Interactions": [
+          {
+            "InteractionName": "Interaction1",
+            "Trigger": {
+              "Type": "TriggerOnEveryTick",
+              "TickCount": 400
+            },
+            "Action": {
+              "Type": "ActionGotoScreen",
+              "ScreenTransitionType": "ScreenTransitionNone",
+              "ActionComponent": "mainscreen"
+            }
+          }
+        ]
+      },
+      {
+        "Name": "screen_devices",
+        "Components": [
+          {
+            "Type": "Box",
+            "Name": "box1",
+            "Width": 128,
+            "Height": 64
+          },
+          {
+            "Type": "CustomContainerInstance",
+            "Name": "CustomContainerSrollText",
+            "Width": 128,
+            "Height": 18,
+            "CustomContainerDefinitionName": "CustomContainerSollText"
+          },
+          {
+            "Type": "TextArea",
+            "Name": "textArea_next_MCU",
+            "Y": 49,
+            "Width": 128,
+            "Height": 15,
+            "TextId": "__SingleUse_2J37",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Wildcard1": {
+              "TextId": "__SingleUse_P23D",
+              "UseBuffer": true,
+              "BufferSize": 12
+            },
+            "Draggable": true,
+            "Moveable": true
+          },
+          {
+            "Type": "TextArea",
+            "Name": "textAreaCurrentMCU",
+            "Y": 21,
+            "Width": 128,
+            "Height": 28,
+            "TextId": "__SingleUse_H127",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Wildcard1": {
+              "TextId": "__SingleUse_K01E",
+              "UseBuffer": true,
+              "BufferSize": 14
+            }
+          }
+        ],
+        "Interactions": []
+      }
+    ],
+    "CustomContainerDefinitions": [
+      {
+        "Name": "mainmenu",
+        "Y": 32,
+        "Width": 128,
+        "Height": 30,
+        "Components": [
+          {
+            "Type": "TextArea",
+            "Name": "textAreaMainMenu",
+            "Width": 128,
+            "Height": 20,
+            "TextId": "__SingleUse_B5JP",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Wildcard1": {
+              "UseBuffer": true,
+              "BufferSize": 10
+            }
+          }
+        ],
+        "Interactions": []
+      },
+      {
+        "Name": "CustomContainerTime",
+        "Width": 72,
+        "Height": 15,
+        "Components": [
+          {
+            "Type": "TextArea",
+            "Name": "textAreatime",
+            "Y": -2,
+            "Width": 72,
+            "Height": 15,
+            "TextId": "__SingleUse_D1VE",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Wildcard1": {
+              "UseBuffer": true,
+              "BufferSize": 10
+            }
+          }
+        ],
+        "Interactions": []
+      },
+      {
+        "Name": "CustomContainerSollText",
+        "Y": 46,
+        "Width": 128,
+        "Height": 18,
+        "Components": [
+          {
+            "Type": "TextArea",
+            "Name": "textAreatime",
+            "X": 1,
+            "Width": 427,
+            "Height": 16,
+            "TextId": "__SingleUse_YQF0",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "Draggable": true,
+            "Moveable": true
+          }
+        ],
+        "Interactions": []
+      },
+      {
+        "Name": "CustomContainerTopBar_1",
+        "Y": 49,
+        "Width": 128,
+        "Height": 15,
+        "Components": [
+          {
+            "Type": "TextArea",
+            "Name": "textAreatime",
+            "Width": 126,
+            "Height": 18,
+            "TextId": "__SingleUse_XB5O",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            },
+            "AutoSize": true
+          }
+        ],
+        "Interactions": []
+      },
+      {
+        "Name": "CustomContainerScrollTime",
+        "Width": 72,
+        "Height": 15,
+        "Components": [
+          {
+            "Type": "ScrollableContainer",
+            "Name": "scrollableContainer1",
+            "Width": 79,
+            "Height": 15,
+            "HorizontalScrollEnabled": true,
+            "ScrollbarsAlpha": 255,
+            "Components": [
+              {
+                "Type": "ScrollWheel",
+                "Name": "scrollWheel1",
+                "Width": 72,
+                "Height": 15,
+                "IsCircular": true,
+                "ItemTemplateName": "CustomContainerTime",
+                "NumberofItems": 2,
+                "Easing": "Back",
+                "EasingOption": "Out",
+                "SwipeAcceleration": 1.0,
+                "DragAcceleration": 1.0,
+                "OverShootPercentage": 75
+              }
+            ]
+          }
+        ],
+        "Interactions": [
+          {
+            "InteractionName": "Interaction1",
+            "Trigger": {
+              "Type": "TriggerOnEveryTick",
+              "TickCount": 800
+            },
+            "Action": {
+              "Type": "ActionExecuteCode",
+              "Code": "/*\r\nwrire code here\r\n*/\r\n    \tuint8_t current = scrollWheel1.getSelectedItem();\r\n    \tcurrent ^= 1;\r\n    \tscrollWheel1.animateToItem(current, 0);"
+            }
+          }
+        ],
+        "CustomActions": [
+          {
+            "Name": "SetTime",
+            "HasValue": true,
+            "ValueType": "uint32_t"
+          }
+        ]
+      },
+      {
+        "Name": "CustomContainerTopBar",
+        "Width": 128,
+        "Height": 15,
+        "Components": [
+          {
+            "Type": "TextArea",
+            "Name": "textAreatime_1",
+            "Y": -3,
+            "Width": 72,
+            "Height": 15,
+            "Visible": false,
+            "TextId": "Data",
+            "TextRotation": "0",
+            "Color": {
+              "Red": 255,
+              "Green": 255,
+              "Blue": 255
+            }
+          },
+          {
+            "Type": "Image",
+            "Name": "imageMute_2",
+            "X": 95,
+            "Width": 14,
+            "Height": 14,
+            "Visible": false,
+            "RelativeFilename": "no_beep.png"
+          },
+          {
+            "Type": "Image",
+            "Name": "imageMute",
+            "X": 79,
+            "Width": 14,
+            "Height": 14,
+            "Visible": false,
+            "RelativeFilename": "no_beep.png"
+          },
+          {
+            "Type": "Image",
+            "Name": "imageWifi",
+            "X": 111,
+            "Y": 2,
+            "Width": 15,
+            "Height": 11,
+            "Visible": false,
+            "RelativeFilename": "wifi.png"
+          }
+        ],
+        "Interactions": []
+      }
+    ],
+    "Name": "MyApplication",
+    "Resolution": {
+      "Width": 128,
+      "Height": 64
+    },
+    "SelectedColorDepth": 1,
+    "StartupScreenName": "screen_logo",
+    "SelectedStartupLanguage": "GB",
+    "TouchGfxPath": "../Middlewares/ST/touchgfx",
+    "UIPath": ".",
+    "AvailableColorDepths": [
+      1
+    ],
+    "AvailableLCDs": {
+      "1": "LCD1bpp"
+    },
+    "AvailableSections": [
+      "ExtFlashSection",
+      "IntFlashSection"
+    ],
+    "AvailableResolutions": [
+      {
+        "Width": 128,
+        "Height": 64
+      }
+    ],
+    "PhysicalButtons": [],
+    "GenerateAssetsCommand": "make -f simulator/gcc/Makefile assets -j8",
+    "PostGenerateCommand": "touchgfx update_project --project-file=simulator/msvs/Application.vcxproj",
+    "PostGenerateTargetCommand": "touchgfx update_project",
+    "CompileSimulatorCommand": "make -f simulator/gcc/Makefile -j8",
+    "RunSimulatorCommand": "build\\bin\\simulator.exe",
+    "LandscapeSkinX": 0,
+    "LandscapeSkinY": 0,
+    "PortraitSkinX": 0,
+    "PortraitSkinY": 0,
+    "DisplayOrientation": "Landscape",
+    "Family": "STM32H5",
+    "SubFamily": "STM32H5x3",
+    "Toolchain": "STM32CubeIDE",
+    "Platform": "m33",
+    "ProjectFile": "../stm_PPKY.ioc",
+    "OptionalComponentsRoot": "../Middlewares/ST/touchgfx_components",
+    "OptionalComponents": [],
+    "AdditionalFeatures": []
+  },
+  "Version": "4.25.0"
+}

@@ -1,0 +1,10 @@
+../Core/Src/config.cpp:13:6:void ReadSavedConfig()	32	static
+../Core/Src/config.cpp:46:6:void SaveConfig()	32	static
+../Core/Src/config.cpp:65:6:void SetConfigWord(uint16_t, uint32_t)	32	static
+../Core/Src/config.cpp:82:10:uint32_t GetConfigSize()	4	static
+../Core/Src/config.cpp:87:10:uint32_t GetConfigWord(uint16_t)	32	static
+../Core/Src/config.cpp:107:17:uint32_t mku_id_seed(uint32_t, uint32_t)	16	static
+../Core/Src/config.cpp:111:6:void FillConfigTemplate()	80	static
+../Core/Src/config.cpp:192:6:void ResetConfig()	8	static
+../Core/Src/config.cpp:197:6:void DefaultConfig()	24	static
+../Core/Src/config.cpp:236:6:void FlashWriteData(uint8_t*, uint32_t)	40	static
