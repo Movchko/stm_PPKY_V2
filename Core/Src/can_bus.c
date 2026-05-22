@@ -291,12 +291,12 @@ static void uart_bridge_process_rx_frames(void)
 		uart_rx_tail = ring_next_u8(uart_rx_tail, UART_BRIDGE_QUEUE_SIZE);
 
 		if (uart_frame_is_for_ppku(f->id)) {
-			ProtocolParse(f->id, f->data, BUS_CAN12);
+			ProtocolParse(f->id, f->data, BUS_UART1);
 		} else {
 			/* Кадр пришёл из UART (WiFi/конвертер) и не адресован ППКУ напрямую:
 			 * обрабатываем его локально так же, как обычный входящий кадр из CAN,
 			 * затем ретранслируем в обе CAN-линии для кольца. */
-			ProtocolParse(f->id, f->data, BUS_CAN12);
+			ProtocolParse(f->id, f->data, BUS_UART1);
 			CanTxEnqueue(f->id, f->data, BUS_CAN12);
 		}
 	}
@@ -588,6 +588,17 @@ void CANSendData(uint8_t *Buf)
 	uint8_t bus_mask = Buf[4 + 8];
 
 	CanTxEnqueue(id, data, bus_mask);
+}
+
+void UARTSendData(uint8_t *Buf)
+{
+	if (isMainInit == 0u) {
+		return;
+	}
+
+	uint32_t id = (*(uint32_t *)Buf);
+	const uint8_t *data = &Buf[4];
+	uart_tx_packet_push(CAN_BUS_1, id, data);
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifoITs)
