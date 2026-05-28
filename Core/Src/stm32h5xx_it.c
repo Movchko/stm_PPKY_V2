@@ -20,8 +20,16 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32h5xx_it.h"
+#include "power_control.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void PControl_OnStatusFault(uint8_t ch, uint32_t now_ms);
+#ifdef __cplusplus
+}
+#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -206,6 +214,51 @@ void SysTick_Handler(void)
 /* For the available peripheral interrupt handler names,                      */
 /* please refer to the startup file (startup_stm32h5xx.s).                    */
 /******************************************************************************/
+
+/**
+  * @brief This function handles EXTI Line3 interrupt.
+  */
+void EXTI3_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI3_IRQn 0 */
+  uint32_t now = HAL_GetTick();
+  PControl_OnStatusFault(POWER_CH_PANEL, now);
+  /* USER CODE END EXTI3_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(PANEL_DG_Pin);
+  /* USER CODE BEGIN EXTI3_IRQn 1 */
+
+  /* USER CODE END EXTI3_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI Line8 interrupt.
+  */
+void EXTI8_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI8_IRQn 0 */
+  uint32_t now = HAL_GetTick();
+  PControl_OnStatusFault(POWER_CH_MKU_2, now);
+  /* USER CODE END EXTI8_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(ST2_MK_Pin);
+  /* USER CODE BEGIN EXTI8_IRQn 1 */
+
+  /* USER CODE END EXTI8_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI Line9 interrupt.
+  */
+void EXTI9_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_IRQn 0 */
+  uint32_t now = HAL_GetTick();
+  PControl_OnStatusFault(POWER_CH_MKU_1, now);
+  /* USER CODE END EXTI9_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(ST1_MK_Pin);
+  /* USER CODE BEGIN EXTI9_IRQn 1 */
+
+  /* USER CODE END EXTI9_IRQn 1 */
+}
 
 /**
   * @brief This function handles GPDMA1 Channel 0 global interrupt.

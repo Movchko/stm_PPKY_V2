@@ -62,7 +62,7 @@ struct WarningItem {
 	uint8_t v_d_type;
 	uint8_t line_state; /* 1=обрыв, 2=КЗ */
 	uint8_t can_idx; /* 1 или 2 для CAN-предупреждений */
-	uint8_t extra; /* произвольный параметр (например температура DPT) */
+	int16_t extra; /* произвольный параметр (например температура DPT) */
 	uint8_t fault_now;
 	uint32_t show_until_ms;
 };
@@ -215,7 +215,7 @@ static uint8_t TimeReached(uint32_t now_ms, uint32_t deadline_ms)
 /* Добавляет/обновляет запись неисправности и продлевает окно отображения. */
 static void UpsertItem(uint8_t kind, uint8_t zone, uint8_t h_adr, uint8_t v_l_adr,
 		       uint8_t mcu_d_type, uint8_t v_d_type, uint8_t line_state,
-		       uint8_t can_idx, uint8_t extra, uint32_t now_ms)
+		       uint8_t can_idx, int16_t extra, uint32_t now_ms)
 {
 	int idx = FindItem(kind, zone, h_adr, v_l_adr, mcu_d_type, v_d_type, can_idx);
 	if (idx >= 0) {
@@ -348,7 +348,7 @@ static void ConsumeChangedStatuses(uint32_t now_ms)
 			if (v->v_d_type == DEVICE_DPT_TYPE) {
 				if (v->status_cmd == (uint8_t)DeviceDPTStatus_Warning) {
 					UpsertItem(WARN_KIND_DPT_WARNING_ATTN, m->dev.zone, m->dev.h_adr, v->v_l_adr, m->dev.d_type,
-						   v->v_d_type, 0u, 0u, (uint8_t)v->max_temp_c, now_ms);
+						   v->v_d_type, 0u, 0u, v->max_temp_c, now_ms);
 				} else {
 					MarkRecovered(WARN_KIND_DPT_WARNING_ATTN, m->dev.zone, m->dev.h_adr, v->v_l_adr, m->dev.d_type,
 						      v->v_d_type, 0u, now_ms);
@@ -419,7 +419,7 @@ static void SyncMissingFaultItems(uint32_t now_ms)
 			if (v->v_d_type == DEVICE_DPT_TYPE) {
 				if (v->status_cmd == (uint8_t)DeviceDPTStatus_Warning) {
 					UpsertItem(WARN_KIND_DPT_WARNING_ATTN, m->dev.zone, m->dev.h_adr, v->v_l_adr, m->dev.d_type,
-						   v->v_d_type, 0u, 0u, (uint8_t)v->max_temp_c, now_ms);
+						   v->v_d_type, 0u, 0u, v->max_temp_c, now_ms);
 				} else {
 					MarkRecovered(WARN_KIND_DPT_WARNING_ATTN, m->dev.zone, m->dev.h_adr, v->v_l_adr, m->dev.d_type,
 						      v->v_d_type, 0u, now_ms);
@@ -522,7 +522,7 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 			snprintf(big_titles[count], WARN_TITLE_LEN, "%cОТКРЫТИЕ", (char)WARN_TITLE_MARK_ATTN);
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
 		} else if (it.kind == WARN_KIND_DPT_WARNING_ATTN) {
-			int temp_c = (int)(int8_t)it.extra;
+			int temp_c = (int)it.extra;
 			snprintf(big_titles[count], WARN_TITLE_LEN, "%cТЕМП. %d", (char)WARN_TITLE_MARK_ATTN, temp_c);
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
 		}
@@ -530,11 +530,15 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 	}
 
 	/* Далее системные неисправности питания ППКУ. */
-	for (uint8_t ch = 0u; ch < 2u && count < WARN_MAX_ITEMS; ch++) {
+	for (uint8_t ch = 0u; ch < 3u && count < WARN_MAX_ITEMS; ch++) {
 		if ((g_power_fault_mask & (1u << ch)) == 0u) {
 			continue;
 		}
-		snprintf(big_titles[count], WARN_TITLE_LEN, "ВЫХОД %u", (unsigned)(ch + 1u));
+		if (ch == 2u) {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ПАНЕЛЬ");
+		} else {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ВЫХОД %u", (unsigned)(ch + 1u));
+		}
 		snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N 123456789");
 		count++;
 	}
@@ -592,7 +596,7 @@ static uint8_t CountActiveFaultNow(void)
 {
 	uint8_t count = 0u;
 	if (g_power_fault_mask != 0u) {
-		for (uint8_t i = 0u; i < 2u; i++) {
+		for (uint8_t i = 0u; i < 3u; i++) {
 			if ((g_power_fault_mask & (1u << i)) != 0u) {
 				count++;
 			}
@@ -795,7 +799,7 @@ void WarningProcess1ms(void)
 
 extern "C" void Warning_SetPowerFaultMask(uint8_t mask)
 {
-	g_power_fault_mask = (uint8_t)(mask & 0x03u);
+	g_power_fault_mask = (uint8_t)(mask & 0x07u);
 }
 
 extern "C" void Warning_SetPpkuInputFaultMask(uint8_t mask)

@@ -9,7 +9,7 @@ extern "C" {
 
 /* Обработка предупреждений/неисправностей виртуальных устройств. */
 void WarningProcess1ms(void);
-/* Ошибки выходов модуля power (внешнее питание МКУ): bits0..1 => ВЫХОД1/2 */
+/* Ошибки выходов модуля power: bits0..1 => ВЫХОД1/2 (МКУ), bit2 => панель */
 void Warning_SetPowerFaultMask(uint8_t mask);
 /* Ошибки входов питания ППКУ: bits0..1 => ПИТАНИЕ1/2 */
 void Warning_SetPpkuInputFaultMask(uint8_t mask);

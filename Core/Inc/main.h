@@ -70,6 +70,7 @@ void LedOffAll();
 /* Private defines -----------------------------------------------------------*/
 #define PANEL_DG_Pin GPIO_PIN_3
 #define PANEL_DG_GPIO_Port GPIOC
+#define PANEL_DG_EXTI_IRQn EXTI3_IRQn
 #define FLASH_CS_Pin GPIO_PIN_4
 #define FLASH_CS_GPIO_Port GPIOA
 #define ESP32_EN_Pin GPIO_PIN_5
@@ -86,8 +87,10 @@ void LedOffAll();
 #define KEY_1_GPIO_Port GPIOC
 #define ST2_MK_Pin GPIO_PIN_8
 #define ST2_MK_GPIO_Port GPIOA
+#define ST2_MK_EXTI_IRQn EXTI8_IRQn
 #define ST1_MK_Pin GPIO_PIN_9
 #define ST1_MK_GPIO_Port GPIOA
+#define ST1_MK_EXTI_IRQn EXTI9_IRQn
 #define LED_Pin GPIO_PIN_10
 #define LED_GPIO_Port GPIOC
 
