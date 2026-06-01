@@ -388,8 +388,36 @@ static void CanTxEnqueueOne(CanTxEntry *ring,
 	*head = next;
 }
 
+/* Для BUS_CAN12 выбираем только одну линию:
+ * приоритет CAN1, fallback CAN2, если CAN1 неактивен.
+ * Неактивность определяется по can_bus_error_flags (бит выставлен = no-rx timeout). */
+static uint8_t CanSelectSingleBusMask(uint8_t bus_mask)
+{
+	uint8_t has_can1 = ((bus_mask & BUS_CAN0) != 0u) ? 1u : 0u;
+	uint8_t has_can2 = ((bus_mask & BUS_CAN1) != 0u) ? 1u : 0u;
+
+	if (!(has_can1 && has_can2)) {
+		return bus_mask;
+	}
+
+	uint8_t can1_active = ((can_bus_error_flags & 0x01u) == 0u) ? 1u : 0u;
+	uint8_t can2_active = ((can_bus_error_flags & 0x02u) == 0u) ? 1u : 0u;
+
+	if (can1_active) {
+		return BUS_CAN0;
+	}
+	if (can2_active) {
+		return BUS_CAN1;
+	}
+
+	/* Если обе линии сейчас неактивны — оставляем приоритет CAN1. */
+	return BUS_CAN0;
+}
+
 static void CanTxEnqueue(uint32_t id, const uint8_t *data, uint8_t bus_mask)
 {
+	bus_mask = CanSelectSingleBusMask(bus_mask);
+
 	if ((bus_mask & BUS_CAN0) != 0u) {
 		CanTxEnqueueOne(can1_tx_ring, &can1_tx_head, &can1_tx_tail, id, data);
 	}
