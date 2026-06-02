@@ -397,6 +397,9 @@ void mainscreenView::updateFireStatus(bool active, uint8_t mode, uint8_t zone, u
 		} else if (mode == 3u) {
 			snprintf(buf, sizeof(buf), "ТУШ.ВЫП.");
 									//  1234567890
+		} else if (mode == 7u) {
+			snprintf(buf, sizeof(buf), "ТУШ.ОШ.");
+									//  1234567890
 		} else if (mode == 4u) {
 			snprintf(buf, sizeof(buf), "ПОЖАР/ОСТ.");
 									//  1234567890

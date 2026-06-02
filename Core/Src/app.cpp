@@ -7,6 +7,8 @@
 #include "backend.h"
 #include "service.h"
 #include "config_sync.hpp"
+#include "device_dpt.hpp"
+#include "device_igniter.hpp"
 #include "gui/common/FrontendHeap.hpp"
 #include "fire.h"
 #include "warning.h"
@@ -26,6 +28,18 @@ ActiveDeviceInfo g_active_devices[NUM_ACTIVE_DEVICE];
 uint8_t g_active_devices_count = 0;
 uint8_t g_mku_mismatch_flag = 0;
 static uint8_t g_cfg_crc_mismatch_flag = 0u;
+static constexpr uint8_t RELAY_AUTO_MAX_TRACK = 64u;
+static uint8_t g_relay_fire_zone_active[ZONE_NUMBER];
+
+typedef struct {
+	uint8_t valid;
+	uint8_t zone;
+	uint8_t h_adr;
+	uint8_t l_adr;
+	uint8_t target_state;
+} RelayAutoTrack;
+
+static RelayAutoTrack g_relay_auto_track[RELAY_AUTO_MAX_TRACK];
 
 /* --- Механизм автоматической установки адресов по команде 10 --- */
 typedef enum {
@@ -63,6 +77,8 @@ RTC_DateTypeDef cur_date;
 
 static void AddrAuto_ClearActiveDevices(void) {
 	memset(g_active_devices, 0, sizeof(g_active_devices));
+	memset(g_relay_auto_track, 0, sizeof(g_relay_auto_track));
+	memset(g_relay_fire_zone_active, 0, sizeof(g_relay_fire_zone_active));
 	g_active_devices_count = 0;
 	g_mku_mismatch_flag = 0;
 }
@@ -371,6 +387,193 @@ static int FindActiveMcuByZoneHAdrIndex(uint8_t zone, uint8_t h_adr) {
 		}
 	}
 	return -1;
+}
+
+static uint8_t RelayAuto_IsFireTriggerInZone(uint8_t zone)
+{
+	uint8_t z_can = (uint8_t)(zone & 0x7Fu);
+	if (z_can >= 1u && z_can <= ZONE_NUMBER) {
+		uint8_t zi = (uint8_t)(z_can - 1u);
+		if (g_relay_fire_zone_active[zi] != 0u) {
+			return 1u;
+		}
+	}
+	return 0u;
+}
+
+static void RelayAuto_OnFireServiceCmd(uint32_t MsgID, uint8_t command)
+{
+	can_ext_id_t id;
+	id.ID = MsgID;
+	uint8_t z_can = (uint8_t)(id.field.zone & 0x7Fu);
+	if (command == ServiceCmd_Fire_SetStatusFire) {
+		if (z_can >= 1u && z_can <= ZONE_NUMBER) {
+			uint8_t zi = (uint8_t)(z_can - 1u);
+			g_relay_fire_zone_active[zi] = 1u;
+		}
+	} else if (command == ServiceCmd_Fire_StopExtinguishment) {
+		if (z_can == 0u) {
+			memset(g_relay_fire_zone_active, 0, sizeof(g_relay_fire_zone_active));
+		} else if (z_can >= 1u && z_can <= ZONE_NUMBER) {
+			uint8_t zi = (uint8_t)(z_can - 1u);
+			g_relay_fire_zone_active[zi] = 0u;
+		}
+	}
+}
+
+static uint8_t RelayAuto_IsFaultTriggerInZone(uint8_t zone)
+{
+	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
+		const ActiveDeviceInfo *m = &g_active_devices[i];
+		if (!m->online || ((m->dev.zone & 0x7Fu) != (zone & 0x7Fu))) {
+			continue;
+		}
+		if (m->can_status_valid != 0u && (m->can_state_mask & 0x0Fu) != 0u) {
+			return 1u;
+		}
+		for (uint8_t j = 0u; j < m->vdev_count; j++) {
+			const ActiveDeviceInfo::s_active_vdev *v = &m->vdevs[j];
+			if (!v->online) {
+				continue;
+			}
+			if (v->v_d_type == DEVICE_IGNITER_TYPE) {
+				if (v->status_cmd == DeviceIgniterStatus_Error ||
+				    v->line_state == DeviceIgniterLineState_Break ||
+				    v->line_state == DeviceIgniterLineState_Short) {
+					return 1u;
+				}
+			} else if (v->v_d_type == DEVICE_DPT_TYPE ||
+				   v->v_d_type == DEVICE_BUTTON_TYPE ||
+				   v->v_d_type == DEVICE_LSWITCH_TYPE) {
+				if (v->status_cmd == DeviceDPTStatus_Error ||
+				    v->line_state == DeviceDPTLineState_Break ||
+				    v->line_state == DeviceDPTLineState_Short ||
+				    v->line_state == DeviceDPTLineState_Fault) {
+					return 1u;
+				}
+			}
+		}
+	}
+	return 0u;
+}
+
+static uint8_t RelayAuto_IsLswitchOpenTriggerInZone(uint8_t zone)
+{
+	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
+		const ActiveDeviceInfo *m = &g_active_devices[i];
+		if (!m->online || ((m->dev.zone & 0x7Fu) != (zone & 0x7Fu))) {
+			continue;
+		}
+		for (uint8_t j = 0u; j < m->vdev_count; j++) {
+			const ActiveDeviceInfo::s_active_vdev *v = &m->vdevs[j];
+			if (!v->online || v->v_d_type != DEVICE_LSWITCH_TYPE) {
+				continue;
+			}
+			if (v->line_state == DeviceDPTLineState_Press ||
+			    v->status_cmd == DeviceDPTStatus_Warning) {
+				return 1u;
+			}
+		}
+	}
+	return 0u;
+}
+
+static int8_t RelayAuto_FindTrack(uint8_t zone, uint8_t h_adr, uint8_t l_adr)
+{
+	for (uint8_t i = 0u; i < RELAY_AUTO_MAX_TRACK; i++) {
+		if (g_relay_auto_track[i].valid == 0u) {
+			continue;
+		}
+		if (g_relay_auto_track[i].zone == zone &&
+		    g_relay_auto_track[i].h_adr == h_adr &&
+		    g_relay_auto_track[i].l_adr == l_adr) {
+			return (int8_t)i;
+		}
+	}
+	return -1;
+}
+
+static int8_t RelayAuto_AllocTrack(void)
+{
+	for (uint8_t i = 0u; i < RELAY_AUTO_MAX_TRACK; i++) {
+		if (g_relay_auto_track[i].valid == 0u) {
+			return (int8_t)i;
+		}
+	}
+	return -1;
+}
+
+static void RelayAuto_SendTarget(uint8_t zone, uint8_t h_adr, uint8_t l_adr, uint8_t target_state)
+{
+	can_ext_id_t can_id;
+	uint8_t data[8] = {0u};
+	can_id.ID = 0u;
+	can_id.field.dir = 0u;
+	can_id.field.d_type = DEVICE_RELAY_TYPE;
+	can_id.field.h_adr = h_adr;
+	can_id.field.l_adr = (uint8_t)(l_adr & 0x3Fu);
+	can_id.field.zone = (uint8_t)(zone & 0x7Fu);
+	data[0] = 10u;
+	data[1] = (target_state != 0u) ? 1u : 0u;
+	SendMessageFull(can_id, data, SEND_NOW, BUS_CAN12);
+}
+
+static void RelayAuto_Process(void)
+{
+	for (uint8_t mi = 0u; mi < 32u; mi++) {
+		const MKUCfg *m = &PPKYConfig.CfgDevices[mi];
+		const Device *mdev = &m->UId.devId;
+		if (mdev->d_type == 0u) {
+			continue;
+		}
+		const uint8_t zone = (uint8_t)(mdev->zone & 0x7Fu);
+		const uint8_t h_adr = (uint8_t)mdev->h_adr;
+		for (uint8_t slot = 0u; slot < NUM_DEV_IN_MCU; slot++) {
+			if ((uint8_t)m->VDtype[slot] != DEVICE_RELAY_TYPE) {
+				continue;
+			}
+			const DeviceRelayConfig *cfg = (const DeviceRelayConfig*)m->Devices[slot].reserv;
+			const uint8_t mode = cfg->mode;
+			if (mode == 0u || mode > 3u) {
+				continue;
+			}
+
+			uint8_t trigger = 0u;
+			if (mode == 1u) {
+				trigger = RelayAuto_IsFireTriggerInZone(zone);
+			} else if (mode == 2u) {
+				trigger = RelayAuto_IsFaultTriggerInZone(zone);
+			} else {
+				trigger = RelayAuto_IsLswitchOpenTriggerInZone(zone);
+			}
+
+			uint8_t target_state = (cfg->initial_state != 0u) ? 1u : 0u;
+			if (trigger != 0u) {
+				target_state = (target_state == 0u) ? 1u : 0u;
+			}
+
+			const uint8_t l_adr = (uint8_t)((slot + 1u) & 0x3Fu);
+			int8_t track_idx = RelayAuto_FindTrack(zone, h_adr, l_adr);
+			if (track_idx < 0) {
+				track_idx = RelayAuto_AllocTrack();
+				if (track_idx >= 0) {
+					g_relay_auto_track[(uint8_t)track_idx].valid = 1u;
+					g_relay_auto_track[(uint8_t)track_idx].zone = zone;
+					g_relay_auto_track[(uint8_t)track_idx].h_adr = h_adr;
+					g_relay_auto_track[(uint8_t)track_idx].l_adr = l_adr;
+					g_relay_auto_track[(uint8_t)track_idx].target_state = (uint8_t)(target_state ^ 1u);
+				}
+			}
+
+			if (track_idx >= 0) {
+				RelayAutoTrack *tr = &g_relay_auto_track[(uint8_t)track_idx];
+				if (tr->target_state != target_state) {
+					RelayAuto_SendTarget(zone, h_adr, l_adr, target_state);
+					tr->target_state = target_state;
+				}
+			}
+		}
+	}
 }
 
 static void UpdateMcuCanStatus(uint32_t MsgID, uint8_t *MsgData) {
@@ -759,6 +962,7 @@ void AppTimer1ms() {
 	AppProcess(now);
 	RefreshActiveDevices(now);
 	CheckMkuConfigMismatch();
+	RelayAuto_Process();
 	App_UpdatePowerFaultIndication(now);
 	Fire_Timer1ms();
 
@@ -856,6 +1060,7 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData) {
 
 	uint8_t Command = MsgData[0];
 	if(Command >= ServiceCmd_Fire_SetStatusFire && Command <= ServiceCmd_Fire_SetReplyResumeExtinguishmentTimer) {
+		RelayAuto_OnFireServiceCmd(MsgID, Command);
 		if(Command == ServiceCmd_Fire_SetStatusFire) {
 			Fire_OnStatusFire(MsgID);
 		} else if (Command == ServiceCmd_Fire_ReplyStatusFire) {

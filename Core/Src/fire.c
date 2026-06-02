@@ -32,6 +32,8 @@ extern uint8_t g_active_devices_count;
 #define FIRE_CMD_RETRY_TIMEOUT_STOP_RETRY_S	10
 #define FIRE_CMD_RETRY_MAX_ATTEMPTS          (FIRE_CMD_RETRY_TIMEOUT_STOP_RETRY_S * 1000 / FIRE_CMD_RETRY_TIMEOUT_MS)//    10u
 #define FIRE_CMD_RETRY_MAX_ITEMS             64u
+#define FIRE_EXT_RETRY_MAX_ATTEMPTS          5u
+#define FIRE_EXT_RETRY_INTERVAL_MS           2000u
 /* Спецрежим: в ручном выборе пожара кнопки ПУСК СП/СТОП действуют только на выбранную зону. */
 #define FIRE_SELECTED_ZONE_BUTTONS_ENABLE    1u
 #define FIRE_MAX_SOURCES_PER_ZONE            8u
@@ -66,8 +68,11 @@ typedef struct {
 	uint8_t  active;
 	uint8_t  phase2_sent;
 	uint8_t  fire1_waiting;
+	uint8_t  ext_retry_attempts;
+	uint8_t  ext_retry_failed;
 	uint8_t  source_count;
 	uint32_t phase2_deadline_ms;
+	uint32_t ext_retry_next_ms;
 	uint32_t paused_remaining_ms;
 	uint32_t source_keys[FIRE_MAX_SOURCES_PER_ZONE];
 } FireZoneSlot;
@@ -145,9 +150,11 @@ static void Fire_SendStopAllMcus(void);
 /* Отправляет фазу 1 запуска по конкретной зоне. */
 static void Fire_SendPhase1Zone(uint8_t zone);
 /* Отправляет фазу 2 запуска по конкретной зоне. */
-static void Fire_SendPhase2Zone(uint8_t zone);
+static uint8_t Fire_SendPhase2Zone(uint8_t zone);
+static uint8_t Fire_SendPhase2ZonePending(uint8_t zone);
 /* Запускает фазу 2 по всем слотам, где она ещё не отправлялась. */
 static void Fire_Phase2AllPending(void);
+static void Fire_MarkSlotPhase2Sent(FireZoneSlot *slot, uint32_t now_ms);
 /* Полностью очищает слоты пожара и флаги остановки таймеров. */
 static void Fire_ClearAllSlots(void);
 /* Синхронизирует состояние FSM исходя из состояния слотов/фаз. */
@@ -192,6 +199,9 @@ static uint8_t Fire_StartAllExistingZonesAndMarkSlots(void);
 static uint8_t Fire_ZoneAllIgnitersEndAck(uint8_t zone);
 /* Возвращает 1, если все активные пожарные зоны завершили тушение (end_ack). */
 static uint8_t Fire_AllActiveZonesEndAck(void);
+static uint8_t Fire_AllActiveZonesTerminal(void);
+static uint8_t Fire_HasExtinguishFailure(void);
+static void Fire_ProcessExtinguishRetries(uint32_t now_ms);
 /* Формирует список имён зон для UI (уникальные, отсортированные). */
 static void Fire_FillZoneNamesForUi(char (*out_names)[FIRE_UI_NAME_LEN], uint8_t *out_n);
 /* Формирует список zone CAN (по тем же правилам, что и Fire_FillZoneNamesForUi). */
@@ -207,7 +217,6 @@ static void Fire_SendStartToIgniterAddr(const FireIgniterAddr *addr, uint8_t zd_
 static void Fire_SendStopToIgniterAddr(const FireIgniterAddr *addr);
 static void Fire_SendPauseToIgniterAddr(const FireIgniterAddr *addr);
 static void Fire_SendResumeToIgniterAddr(const FireIgniterAddr *addr);
-static void Fire_SendTemporaryRelayToggleByZone(uint8_t zone);
 /* Ретрай-пул команд старта/остановки спичек. */
 static void Fire_RetryQueueStart(const FireIgniterAddr *addr, uint8_t zd_sec, uint8_t md_sec, uint32_t now_ms);
 static void Fire_RetryQueueStop(const FireIgniterAddr *addr, uint32_t now_ms);
@@ -735,7 +744,7 @@ static void Fire_SendPhase1Zone(uint8_t zone)
 	}
 }
 
-static void Fire_SendPhase2Zone(uint8_t zone)
+static uint8_t Fire_SendPhase2Zone(uint8_t zone)
 {
 	/* Фаза 2: немедленный старт (zone_delay=0), учитываем только module_delay. */
 	FireIgniterAddr ign[16];
@@ -746,6 +755,51 @@ static void Fire_SendPhase2Zone(uint8_t zone)
 		uint8_t md = (i == 0u) ? m0 : m1;
 		Fire_RetryQueueStart(&ign[i], 0u, md, HAL_GetTick());
 	}
+	return (n > 0u) ? 1u : 0u;
+}
+
+static uint8_t Fire_SendPhase2ZonePending(uint8_t zone)
+{
+	uint8_t sent = 0u;
+	uint8_t seq = 0u;
+	uint8_t m0, m1;
+	Fire_GetModuleDelays(zone, &m0, &m1);
+	for (uint8_t mi = 0u; mi < g_active_devices_count; mi++) {
+		ActiveDeviceInfo *m = &g_active_devices[mi];
+		if (!m->online || ((m->dev.zone & 0x7Fu) != (zone & 0x7Fu))) {
+			continue;
+		}
+		for (uint8_t vi = 0u; vi < m->vdev_count; vi++) {
+			if (!m->vdevs[vi].online || m->vdevs[vi].v_d_type != DEVICE_IGNITER_TYPE) {
+				continue;
+			}
+			if ((m->vdevs[vi].ack_flags & FIRE_IGNITER_END_ACK_MASK) != 0u) {
+				continue;
+			}
+			FireIgniterAddr addr;
+			addr.d_type = DEVICE_IGNITER_TYPE;
+			addr.h_adr = m->dev.h_adr;
+			addr.l_adr = m->vdevs[vi].v_l_adr & 0x3Fu;
+			addr.zone = m->dev.zone & 0x7Fu;
+			uint8_t md = (seq == 0u) ? m0 : m1;
+			Fire_RetryQueueStart(&addr, 0u, md, HAL_GetTick());
+			seq++;
+			sent = 1u;
+		}
+	}
+	return sent;
+}
+
+static void Fire_MarkSlotPhase2Sent(FireZoneSlot *slot, uint32_t now_ms)
+{
+	if (slot == NULL) {
+		return;
+	}
+	slot->phase2_sent = 1u;
+	slot->fire1_waiting = 0u;
+	slot->ext_retry_attempts = 0u;
+	slot->ext_retry_failed = 0u;
+	slot->ext_retry_next_ms = now_ms + FIRE_EXT_RETRY_INTERVAL_MS;
 }
 
 static void Fire_SendStopAllMcus(void)
@@ -804,36 +858,6 @@ static void Fire_ResumeCountdownAndDispatch(uint32_t now_ms)
 		}
 	}
 	g_fire.zone_countdown_paused = 0u;
-}
-
-static void Fire_SendTemporaryRelayToggleByZone(uint8_t zone)
-{
-	/* Временная логика: при новом пожаре зоны инвертируем реле этой зоны (cmd=10 без параметра). */
-	for (uint8_t mi = 0u; mi < 32u; mi++) {
-		const MKUCfg *m = &PPKYConfig.CfgDevices[mi];
-		const Device *mdev = &m->UId.devId;
-		if (mdev->d_type == 0u) {
-			continue;
-		}
-		if ((mdev->zone & 0x7Fu) != (zone & 0x7Fu)) {
-			continue;
-		}
-		for (uint8_t slot = 0u; slot < NUM_DEV_IN_MCU; slot++) {
-			if ((uint8_t)m->VDtype[slot] != DEVICE_RELAY_TYPE) {
-				continue;
-			}
-			can_ext_id_t can_id;
-			uint8_t data[8] = {0};
-			can_id.ID = 0u;
-			can_id.field.dir = 0u;
-			can_id.field.d_type = DEVICE_RELAY_TYPE;
-			can_id.field.h_adr = mdev->h_adr;
-			can_id.field.l_adr = (uint8_t)((slot + 1u) & 0x3Fu);
-			can_id.field.zone = mdev->zone & 0x7Fu;
-			data[0] = 10u; /* DeviceRelay::CommandCB toggle */
-			SendMessageFull(can_id, data, 0u, BUS_CAN12);
-		}
-	}
 }
 
 static int8_t Fire_FindSlotZone(uint8_t zone)
@@ -1154,9 +1178,10 @@ static uint8_t Fire_ProcessAutoDeadlines(uint32_t now_ms)
 			continue;
 		}
 		if (now_ms >= g_fire.slots[i].phase2_deadline_ms) {
-			Fire_SendPhase2Zone(g_fire.slots[i].zone);
-			g_fire.slots[i].phase2_sent = 1u;
-			any_started = 1u;
+			if (Fire_SendPhase2Zone(g_fire.slots[i].zone)) {
+				Fire_MarkSlotPhase2Sent(&g_fire.slots[i], now_ms);
+				any_started = 1u;
+			}
 		}
 	}
 	return any_started;
@@ -1168,8 +1193,9 @@ static void Fire_Phase2AllPending(void)
 		if (!g_fire.slots[i].active || g_fire.slots[i].phase2_sent || g_fire.slots[i].fire1_waiting) {
 			continue;
 		}
-		Fire_SendPhase2Zone(g_fire.slots[i].zone);
-		g_fire.slots[i].phase2_sent = 1u;
+		if (Fire_SendPhase2Zone(g_fire.slots[i].zone)) {
+			Fire_MarkSlotPhase2Sent(&g_fire.slots[i], HAL_GetTick());
+		}
 	}
 }
 
@@ -1183,9 +1209,10 @@ static uint8_t Fire_Phase2SelectedPending(uint8_t zone)
 		if ((g_fire.slots[i].zone & 0x7Fu) != (zone & 0x7Fu)) {
 			continue;
 		}
-		Fire_SendPhase2Zone(g_fire.slots[i].zone);
-		g_fire.slots[i].phase2_sent = 1u;
-		started = 1u;
+		if (Fire_SendPhase2Zone(g_fire.slots[i].zone)) {
+			Fire_MarkSlotPhase2Sent(&g_fire.slots[i], HAL_GetTick());
+			started = 1u;
+		}
 	}
 	return started;
 }
@@ -1205,6 +1232,9 @@ static void Fire_SendStopZone(uint8_t zone)
 		if ((g_fire.slots[i].zone & 0x7Fu) == (zone & 0x7Fu)) {
 			g_fire.slots[i].phase2_sent = 1u;
 			g_fire.slots[i].fire1_waiting = 0u;
+			g_fire.slots[i].ext_retry_attempts = 0u;
+			g_fire.slots[i].ext_retry_failed = 0u;
+			g_fire.slots[i].ext_retry_next_ms = 0u;
 		}
 	}
 }
@@ -1239,9 +1269,10 @@ static uint8_t Fire_StartAllExistingZonesAndMarkSlots(void)
 		if (zone_sent[z]) {
 			continue;
 		}
-		zone_sent[z] = 1u;
-		Fire_SendPhase2Zone(z);
-		any_started = 1u;
+		if (Fire_SendPhase2Zone(z)) {
+			zone_sent[z] = 1u;
+			any_started = 1u;
+		}
 	}
 
 	/* Для слотов пожара помечаем отправку фазы 2 только в реально запущенные зоны */
@@ -1250,8 +1281,7 @@ static uint8_t Fire_StartAllExistingZonesAndMarkSlots(void)
 			continue;
 		}
 		if (zone_sent[g_fire.slots[i].zone & 0x7Fu]) {
-			g_fire.slots[i].phase2_sent = 1u;
-			g_fire.slots[i].fire1_waiting = 0u;
+			Fire_MarkSlotPhase2Sent(&g_fire.slots[i], now_ms);
 		}
 	}
 
@@ -1272,7 +1302,7 @@ static uint8_t Fire_StartAllExistingZonesAndMarkSlots(void)
 		memset(s, 0, sizeof(*s));
 		s->active = 1u;
 		s->zone = z;
-		s->phase2_sent = 1u;
+		Fire_MarkSlotPhase2Sent(s, now_ms);
 		s->phase2_deadline_ms = now_ms;
 	}
 
@@ -1313,6 +1343,66 @@ static uint8_t Fire_AllActiveZonesEndAck(void)
 		}
 	}
 	return any_zone;
+}
+
+static uint8_t Fire_AllActiveZonesTerminal(void)
+{
+	uint8_t any_zone = 0u;
+	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
+		const FireZoneSlot *s = &g_fire.slots[i];
+		if (!s->active) {
+			continue;
+		}
+		any_zone = 1u;
+		if (!s->phase2_sent) {
+			return 0u;
+		}
+		if (!Fire_ZoneAllIgnitersEndAck(s->zone) && s->ext_retry_failed == 0u) {
+			return 0u;
+		}
+	}
+	return any_zone;
+}
+
+static uint8_t Fire_HasExtinguishFailure(void)
+{
+	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
+		const FireZoneSlot *s = &g_fire.slots[i];
+		if (s->active && s->phase2_sent && s->ext_retry_failed != 0u) {
+			return 1u;
+		}
+	}
+	return 0u;
+}
+
+static void Fire_ProcessExtinguishRetries(uint32_t now_ms)
+{
+	if (g_fire.state != FIRE_STATE_EXTINGUISHING) {
+		return;
+	}
+	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
+		FireZoneSlot *s = &g_fire.slots[i];
+		if (!s->active || !s->phase2_sent || s->ext_retry_failed != 0u) {
+			continue;
+		}
+		if (Fire_ZoneAllIgnitersEndAck(s->zone)) {
+			continue;
+		}
+		if ((int32_t)(now_ms - s->ext_retry_next_ms) < 0) {
+			continue;
+		}
+		if (s->ext_retry_attempts >= FIRE_EXT_RETRY_MAX_ATTEMPTS) {
+			s->ext_retry_failed = 1u;
+			continue;
+		}
+		(void)Fire_SendPhase2ZonePending(s->zone);
+		s->ext_retry_attempts++;
+		s->ext_retry_next_ms = now_ms + FIRE_EXT_RETRY_INTERVAL_MS;
+		if (s->ext_retry_attempts >= FIRE_EXT_RETRY_MAX_ATTEMPTS &&
+		    !Fire_ZoneAllIgnitersEndAck(s->zone)) {
+			s->ext_retry_failed = 1u;
+		}
+	}
 }
 
 static void Fire_SyncStateFromSlots(void)
@@ -1728,6 +1818,7 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		fire_processed = 1u;
 		start_processed = 1u;
 	}
+	Fire_ProcessExtinguishRetries(now_ms);
 	Fire_SyncStateFromSlots();
 	/* Пока решение не принято (до ПУСК/СТОП/автопуска), удерживаем тревожный звук активным.
 	 * Это защищает от внешних пересечений индикации, которые могут сбросить звук. */
@@ -1792,6 +1883,8 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		ui_mode = 2u; /* ТУШЕНИЕ */
 		if (Fire_AllActiveZonesEndAck()) {
 			ui_mode = 3u; /* ТУШЕНИЕ ПРОИЗВЕДЕНО */
+		} else if (Fire_AllActiveZonesTerminal() && Fire_HasExtinguishFailure()) {
+			ui_mode = 7u; /* ТУШЕНИЕ НЕ ВЫПОЛНЕНО */
 		}
 	}
 
@@ -1947,7 +2040,6 @@ void Fire_OnStatusFire(uint32_t msg_id)
 	uint32_t now = HAL_GetTick();
 	uint8_t res = Fire_TryAddNewFireZone(zone, source_key, and_effective, now);
 	if (res == 1u) {
-		Fire_SendTemporaryRelayToggleByZone(zone);
 		/* Новая зона: слот, фаза 1, затем FSM — UI видит все активные зоны */
 		Fire_Transition(FIRE_EVENT_STATUS_FIRE, now);
 	} else if (res == 2u) {
