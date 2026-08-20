@@ -1060,7 +1060,7 @@ static void MX_GPIO_Init(void)
 uint8_t SetUpdateWord(uint32_t num, uint32_t word)
 { return 0;}
 
-#define APP_VERSION_U32 2u
+#define APP_VERSION_U32 3u
 
 const char *GetAppVersion(void)
 {
