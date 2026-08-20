@@ -9,7 +9,9 @@
 #include "beeper.h"
 #include "can_bus.h"
 #include "device_config.h"
+#include "config_monitor.h"
 #include "device_dpt.hpp"
+#include "gost_mode.h"
 #include "sound_profiles.h"
 
 #define WARN_TITLE_LEN 24
@@ -34,6 +36,8 @@ enum AttentionSoundPhase : uint8_t {
 };
 static uint8_t g_power_fault_mask = 0u;
 static uint8_t g_ppku_input_fault_mask = 0u;
+static uint32_t g_position_fault_mask = 0u;
+static uint8_t g_panel_journal_fault_mask = 0u;
 static FaultSoundPhase g_fault_sound_phase = FAULT_SOUND_IDLE;
 static uint32_t g_fault_sound_deadline_ms = 0u;
 static AttentionSoundPhase g_attention_sound_phase = ATTN_SOUND_IDLE;
@@ -50,6 +54,10 @@ constexpr uint8_t WARN_KIND_MCU_CAN_FAULT = 1u;
 constexpr uint8_t WARN_KIND_PPKU_CAN_FAULT = 2u;
 constexpr uint8_t WARN_KIND_LSWITCH_OPEN_ATTN = 3u;
 constexpr uint8_t WARN_KIND_DPT_WARNING_ATTN = 4u;
+constexpr uint8_t WARN_KIND_MCU_POSITION_FAULT = 5u;
+constexpr uint8_t WARN_KIND_DEVICE_MISSING = 6u;
+constexpr uint8_t WARN_KIND_DEVICE_FOUND = 7u;
+constexpr uint8_t WARN_KIND_CONFIG_MISMATCH = 8u;
 constexpr uint8_t WARN_TITLE_MARK_ATTN = 0x01u;
 
 struct WarningItem {
@@ -74,8 +82,6 @@ static uint8_t g_last_count = 0xFFu;
 static char g_last_big[WARN_MAX_ITEMS][WARN_TITLE_LEN];
 static char g_last_details[WARN_MAX_ITEMS][ZONE_NAME_SIZE + 1];
 static uint8_t g_led_err_on = 0u;
-static uint8_t g_led_err_blink_phase = 0u;
-static uint32_t g_led_err_blink_toggle_ms = 0u;
 static uint8_t g_prev_active_fault_count = 0u;
 static uint8_t g_prev_sound_fault_count = 0u;
 static uint8_t g_prev_sound_attention_count = 0u;
@@ -134,11 +140,49 @@ static void Warning_GetZoneName(const WarningItem& it, char *out, size_t out_sz)
 	}
 }
 
-/* Заглушка под будущий реальный S/N: *ТИП**H_ADR**2026* */
+/* S/N:
+ * - сначала пробуем локальный PPKYConfig
+ * - затем remote-UID из ConfigMonitor
+ * - иначе "S/N:---"
+ */
 static void Warning_GetSerialPlaceholder(const WarningItem& it, char *out, size_t out_sz)
 {
-	snprintf(out, out_sz, "S/N:%s%u2026",
-		 Warning_McuTypeSerialToken(it.mcu_d_type), (unsigned)it.h_adr);
+	if (out_sz == 0u) {
+		return;
+	}
+
+	/* 1) локальная конфигурация */
+	for (uint8_t i = 0u; i < 32u; i++) {
+		if ((it.h_adr == PPKYConfig.CfgDevices[i].UId.devId.h_adr) &&
+		    (it.mcu_d_type == PPKYConfig.CfgDevices[i].UId.devId.d_type)) {
+			snprintf(out, out_sz, "S/N:%08lX:%08lX:%08lX",
+				 (unsigned long)PPKYConfig.CfgDevices[i].UId.UId0,
+				 (unsigned long)PPKYConfig.CfgDevices[i].UId.UId1,
+				 (unsigned long)PPKYConfig.CfgDevices[i].UId.UId2);
+			return;
+		}
+	}
+
+	/* 2) remote-UID */
+	Device dev = {};
+	dev.zone  = it.zone;
+	dev.h_adr = it.h_adr;
+	dev.l_adr = 0u;
+	dev.d_type = it.mcu_d_type;
+
+	uint8_t remote_valid = 0u;
+	const uint8_t *remote = ConfigMonitor_GetRemoteSerial(&dev, &remote_valid);
+	if (remote_valid != 0u && remote != nullptr) {
+		const uint32_t *uid = (const uint32_t *)remote;
+		snprintf(out, out_sz, "S/N:%08lX:%08lX:%08lX",
+			 (unsigned long)uid[0],
+			 (unsigned long)uid[1],
+			 (unsigned long)uid[2]);
+		return;
+	}
+
+	/* 3) нет данных */
+	snprintf(out, out_sz, "S/N:---");
 }
 
 static void Warning_FormatMkuAndSerial(char *out, size_t out_sz, const WarningItem& it)
@@ -170,11 +214,25 @@ static uint8_t IsAttentionKind(uint8_t kind)
 	return (kind == WARN_KIND_LSWITCH_OPEN_ATTN || kind == WARN_KIND_DPT_WARNING_ATTN) ? 1u : 0u;
 }
 
+/* В ГОСТ режим ВНИМАНИЕ (концевик/ДПТ Warning) не используем. */
+static uint8_t AttentionEventsEnabled(void)
+{
+#if GOST_MODE
+	return 0u;
+#else
+	return 1u;
+#endif
+}
+
 static uint8_t IsFaultKind(uint8_t kind)
 {
 	return (kind == WARN_KIND_VDEV_FAULT ||
 		kind == WARN_KIND_MCU_CAN_FAULT ||
-		kind == WARN_KIND_PPKU_CAN_FAULT) ? 1u : 0u;
+		kind == WARN_KIND_PPKU_CAN_FAULT ||
+		kind == WARN_KIND_MCU_POSITION_FAULT ||
+		kind == WARN_KIND_DEVICE_MISSING ||
+		kind == WARN_KIND_DEVICE_FOUND ||
+		kind == WARN_KIND_CONFIG_MISMATCH) ? 1u : 0u;
 }
 
 /* Поиск записи неисправности по ключу устройства/канала. */
@@ -305,6 +363,20 @@ static uint8_t IsItemStillFaulty(const WarningItem& it)
 	if (it.kind == WARN_KIND_PPKU_CAN_FAULT) {
 		return ((can_bus_error_flags & (1u << (it.can_idx - 1u))) != 0u) ? 1u : 0u;
 	}
+
+	if (it.kind == WARN_KIND_MCU_POSITION_FAULT) {
+		uint8_t ha = it.h_adr;
+		if (ha == 0u || ha > 32u) {
+			return 0u;
+		}
+		return ((g_position_fault_mask & (1u << (ha - 1u))) != 0u) ? 1u : 0u;
+	}
+
+	if (it.kind == WARN_KIND_DEVICE_MISSING ||
+	    it.kind == WARN_KIND_DEVICE_FOUND ||
+	    it.kind == WARN_KIND_CONFIG_MISMATCH) {
+		return it.fault_now;
+	}
 	return 0u;
 }
 
@@ -364,6 +436,12 @@ static void PruneInactiveItems(uint32_t now_ms)
 {
 	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
 		if (!g_items[i].used) {
+			continue;
+		}
+
+		/* ГОСТ: ВНИМАНИЕ не ведём — вычищаем старые attention-записи сразу. */
+		if (AttentionEventsEnabled() == 0u && IsAttentionKind(g_items[i].kind) != 0u) {
+			RemoveItemAt(i);
 			continue;
 		}
 
@@ -473,6 +551,147 @@ static void SyncPpkuCanFaultItems(uint32_t now_ms)
 	}
 }
 
+/* Добавляет/снимает предупреждения о несоответствии физической позиции МКУ. */
+static void SyncMkuPositionFaultItems(uint32_t now_ms)
+{
+	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
+		if (!g_items[i].used || g_items[i].kind != WARN_KIND_MCU_POSITION_FAULT) {
+			continue;
+		}
+		uint8_t ha = g_items[i].h_adr;
+		if (ha == 0u || ha > 32u || ((g_position_fault_mask & (1u << (ha - 1u))) == 0u)) {
+			RemoveItemAt(i);
+		}
+	}
+
+	for (uint8_t ha = 1u; ha <= 32u; ha++) {
+		if ((g_position_fault_mask & (1u << (ha - 1u))) == 0u) {
+			continue;
+		}
+		UpsertItem(WARN_KIND_MCU_POSITION_FAULT,
+			   0u, /* zone */
+			   ha, /* h_adr */
+			   0u, /* v_l_adr */
+			   DEVICE_PPKY_TYPE, /* mcu_d_type */
+			   0u, /* v_d_type */
+			   0u, /* line_state */
+			   0u, /* can_idx */
+			   0u, /* extra */
+			   now_ms);
+	}
+}
+
+/* Синхронизация missing/found/config mismatch по данным ConfigMonitor. */
+static void SyncConfigMonitorItems(uint32_t now_ms)
+{
+	for (uint8_t slot = 0u; slot < 32u; slot++) {
+		const Device *dev = ConfigMonitor_GetCfgDevice(slot);
+		if (dev == nullptr || dev->d_type == 0u) {
+			continue;
+		}
+
+		if (ConfigMonitor_IsMcuMissingLatched(slot) != 0u) {
+			UpsertItem(WARN_KIND_DEVICE_MISSING,
+				   dev->zone, dev->h_adr,
+				   0u, /* v_l_adr */
+				   dev->d_type, 0u, /* v_d_type */
+				   0u, /* line_state */
+				   0u, /* can_idx */
+				   0u, /* extra */
+				   now_ms);
+		} else {
+			int idx = FindItem(WARN_KIND_DEVICE_MISSING,
+					   dev->zone, dev->h_adr,
+					   0u, /* v_l_adr */
+					   dev->d_type, 0u,
+					   0u /* can_idx */);
+			if (idx >= 0 && g_items[(uint8_t)idx].fault_now != 0u) {
+				MarkRecovered(WARN_KIND_DEVICE_MISSING,
+					      dev->zone, dev->h_adr,
+					      0u, /* v_l_adr */
+					      dev->d_type, 0u,
+					      0u /* can_idx */,
+					      now_ms);
+			}
+		}
+
+		if (ConfigMonitor_IsCrcFaultLatched(slot) != 0u) {
+			UpsertItem(WARN_KIND_CONFIG_MISMATCH,
+				   dev->zone, dev->h_adr,
+				   0u, /* v_l_adr */
+				   dev->d_type, 0u, /* v_d_type */
+				   0u, /* line_state */
+				   0u, /* can_idx */
+				   0u, /* extra */
+				   now_ms);
+		} else {
+			int idx = FindItem(WARN_KIND_CONFIG_MISMATCH,
+					   dev->zone, dev->h_adr,
+					   0u, /* v_l_adr */
+					   dev->d_type, 0u,
+					   0u /* can_idx */);
+			if (idx >= 0 && g_items[(uint8_t)idx].fault_now != 0u) {
+				MarkRecovered(WARN_KIND_CONFIG_MISMATCH,
+					      dev->zone, dev->h_adr,
+					      0u, /* v_l_adr */
+					      dev->d_type, 0u,
+					      0u /* can_idx */,
+					      now_ms);
+			}
+		}
+	}
+
+	uint8_t found_n = ConfigMonitor_GetFoundLatchedCount();
+	for (uint8_t fi = 0u; fi < found_n; fi++) {
+		Device mcu = {};
+		uint8_t v_l_adr = 0u;
+		uint8_t v_d_type = 0u;
+		if (!ConfigMonitor_GetFoundLatchedKey(fi, &mcu, &v_l_adr, &v_d_type)) {
+			continue;
+		}
+		UpsertItem(WARN_KIND_DEVICE_FOUND,
+			   mcu.zone, mcu.h_adr,
+			   v_l_adr,
+			   mcu.d_type, v_d_type,
+			   0u, /* line_state */
+			   0u, /* can_idx */
+			   0u, /* extra */
+			   now_ms);
+	}
+
+	/* Оставляем запись DEVICE_FOUND только пока ключ остаётся latched. */
+	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
+		if (!g_items[i].used || g_items[i].kind != WARN_KIND_DEVICE_FOUND || !g_items[i].fault_now) {
+			continue;
+		}
+		uint8_t still = 0u;
+		for (uint8_t fi = 0u; fi < found_n; fi++) {
+			Device mcu = {};
+			uint8_t v_l_adr = 0u;
+			uint8_t v_d_type = 0u;
+			if (!ConfigMonitor_GetFoundLatchedKey(fi, &mcu, &v_l_adr, &v_d_type)) {
+				continue;
+			}
+			if (g_items[i].zone == mcu.zone &&
+			    g_items[i].h_adr == mcu.h_adr &&
+			    g_items[i].mcu_d_type == mcu.d_type &&
+			    g_items[i].v_l_adr == v_l_adr &&
+			    g_items[i].v_d_type == v_d_type) {
+				still = 1u;
+				break;
+			}
+		}
+		if (!still) {
+			MarkRecovered(WARN_KIND_DEVICE_FOUND,
+				      g_items[i].zone, g_items[i].h_adr,
+				      g_items[i].v_l_adr,
+				      g_items[i].mcu_d_type, g_items[i].v_d_type,
+				      0u /* can_idx */,
+				      now_ms);
+		}
+	}
+}
+
 /* Формирует отсортированный набор строк для UI (большое/малое поле). */
 static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details)[ZONE_NAME_SIZE + 1])
 {
@@ -518,6 +737,9 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 		if (!IsAttentionKind(it.kind)) {
 			continue;
 		}
+		if (AttentionEventsEnabled() == 0u) {
+			break;
+		}
 		if (it.kind == WARN_KIND_LSWITCH_OPEN_ATTN) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "%cОТКРЫТИЕ", (char)WARN_TITLE_MARK_ATTN);
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
@@ -539,7 +761,11 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 		} else {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ВЫХОД %u", (unsigned)(ch + 1u));
 		}
-		snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N 123456789");
+		snprintf(details[count], ZONE_NAME_SIZE + 1,
+			 "ППКУ S/N:%08lX:%08lX:%08lX",
+			 (unsigned long)PPKYConfig.UId.UId0,
+			 (unsigned long)PPKYConfig.UId.UId1,
+			 (unsigned long)PPKYConfig.UId.UId2);
 		count++;
 	}
 	for (uint8_t ch = 0u; ch < 2u && count < WARN_MAX_ITEMS; ch++) {
@@ -547,7 +773,20 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 			continue;
 		}
 		snprintf(big_titles[count], WARN_TITLE_LEN, "ПИТАНИЕ %u", (unsigned)(ch + 1u));
-		snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N 123456789");
+		snprintf(details[count], ZONE_NAME_SIZE + 1,
+			 "ППКУ S/N:%08lX:%08lX:%08lX",
+			 (unsigned long)PPKYConfig.UId.UId0,
+			 (unsigned long)PPKYConfig.UId.UId1,
+			 (unsigned long)PPKYConfig.UId.UId2);
+		count++;
+	}
+
+	for (uint8_t panel = 0u; panel < 8u && count < WARN_MAX_ITEMS; panel++) {
+		if ((g_panel_journal_fault_mask & (1u << panel)) == 0u) {
+			continue;
+		}
+		snprintf(big_titles[count], WARN_TITLE_LEN, "ЖУРНАЛ RS");
+		snprintf(details[count], ZONE_NAME_SIZE + 1, "ПАНЕЛЬ %u ACK TIMEOUT", (unsigned)(panel + 1u));
 		count++;
 	}
 
@@ -567,11 +806,29 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 			const char* fault = (it.line_state == 2u) ? "КЗ" : "ОБРЫВ";
 			snprintf(big_titles[count], WARN_TITLE_LEN, "%s CAN%u", fault, (unsigned)it.can_idx);
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
-		} else {
+		} else if (it.kind == WARN_KIND_PPKU_CAN_FAULT) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ОБРЫВ CAN%u", (unsigned)it.can_idx);
 
-			//Warning_GetSerialPlaceholder(it, serial, sizeof(serial));
-			snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N 123456789");
+			snprintf(details[count], ZONE_NAME_SIZE + 1,
+				 "ППКУ S/N:%08lX:%08lX:%08lX",
+				 (unsigned long)PPKYConfig.UId.UId0,
+				 (unsigned long)PPKYConfig.UId.UId1,
+				 (unsigned long)PPKYConfig.UId.UId2);
+		} else if (it.kind == WARN_KIND_MCU_POSITION_FAULT) {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ПОЗИЦИЯ");
+			snprintf(details[count], ZONE_NAME_SIZE + 1, "МКУ %u", (unsigned)it.h_adr);
+		} else if (it.kind == WARN_KIND_DEVICE_MISSING) {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ОТСУСТВ.");
+			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
+		} else if (it.kind == WARN_KIND_DEVICE_FOUND) {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "НОВОЕ");
+			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
+		} else if (it.kind == WARN_KIND_CONFIG_MISMATCH) {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ОШ. КОНФ.");
+			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
+		} else {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ОШИБКА");
+			snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N:---");
 		}
 		count++;
 	}
@@ -582,6 +839,9 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 static uint8_t HasActiveFaultNow(void)
 {
 	if (g_power_fault_mask != 0u || g_ppku_input_fault_mask != 0u) {
+		return 1u;
+	}
+	if (g_panel_journal_fault_mask != 0u) {
 		return 1u;
 	}
 	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
@@ -609,6 +869,13 @@ static uint8_t CountActiveFaultNow(void)
 			}
 		}
 	}
+	if (g_panel_journal_fault_mask != 0u) {
+		for (uint8_t i = 0u; i < 8u; i++) {
+			if ((g_panel_journal_fault_mask & (1u << i)) != 0u) {
+				count++;
+			}
+		}
+	}
 	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
 		if (g_items[i].used && g_items[i].fault_now && IsFaultKind(g_items[i].kind) && count < 0xFFu) {
 			count++;
@@ -619,6 +886,9 @@ static uint8_t CountActiveFaultNow(void)
 
 static uint8_t CountActiveAttentionNow(void)
 {
+	if (AttentionEventsEnabled() == 0u) {
+		return 0u;
+	}
 	uint8_t count = 0u;
 	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
 		if (g_items[i].used && g_items[i].fault_now && IsAttentionKind(g_items[i].kind) && count < 0xFFu) {
@@ -709,39 +979,29 @@ static void UpdateFaultSound(uint32_t now_ms)
 	}
 }
 
-/* Управляет LED_ERR: мгновенное включение и мгновенное отключение. */
+/* Управляет LED_ERR: только НЕИСПРАВНОСТЬ (attention не мигает LED_ERR). */
 static void UpdateErrorLed(uint32_t now_ms)
 {
 	uint8_t fault_count = CountActiveFaultNow();
 	uint8_t attention_count = CountActiveAttentionNow();
-	if ((fault_count + attention_count) > g_prev_active_fault_count) {
+
+	uint8_t active_count = (uint8_t)(fault_count + attention_count);
+	if (active_count > g_prev_active_fault_count && fault_count > 0u) {
 		Led_ForceStatusBright(LED_ERR);
 	}
-	g_prev_active_fault_count = (uint8_t)(fault_count + attention_count);
+	g_prev_active_fault_count = active_count;
 
-	if (attention_count > 0u) {
-		/* При наличии ВНИМАНИЯ индикатор НЕИСПР. должен мигать (0.5с). */
-		if ((now_ms - g_led_err_blink_toggle_ms) >= 500u) {
-			g_led_err_blink_toggle_ms = now_ms;
-			g_led_err_blink_phase = (uint8_t)!g_led_err_blink_phase;
-		}
-		Led_Set(LED_ERR, g_led_err_blink_phase);
-		g_led_err_on = g_led_err_blink_phase;
-		return;
-	}
-
-	if (fault_count > 0u) {
+	if (fault_count > 0u || Fire_HasExtinguishIncomplete()) {
 		Led_Set(LED_ERR, 1u);
 		g_led_err_on = 1u;
 		return;
 	}
 
-	if (g_led_err_on) {
+	if (g_led_err_on != 0u) {
 		Led_Set(LED_ERR, 0u);
 		g_led_err_on = 0u;
 	}
-	g_led_err_blink_phase = 0u;
-	g_led_err_blink_toggle_ms = now_ms;
+	(void)now_ms;
 }
 
 /* Пушит данные в TouchGFX только при реальном изменении (анти-спам). */
@@ -783,6 +1043,8 @@ void WarningProcess1ms(void)
 	SyncMissingFaultItems(now_ms);
 	SyncMkuCanFaultItems(now_ms);
 	SyncPpkuCanFaultItems(now_ms);
+	SyncMkuPositionFaultItems(now_ms);
+	SyncConfigMonitorItems(now_ms);
 	PruneInactiveItems(now_ms);
 	UpdateErrorLed(now_ms);
 	UpdateFaultSound(now_ms);
@@ -807,7 +1069,22 @@ extern "C" void Warning_SetPpkuInputFaultMask(uint8_t mask)
 	g_ppku_input_fault_mask = (uint8_t)(mask & 0x03u);
 }
 
+extern "C" void Warning_SetMkuPositionFaultMask(uint32_t mask)
+{
+	g_position_fault_mask = mask;
+}
+
+extern "C" void Warning_SetPanelJournalFaultMask(uint8_t mask)
+{
+	g_panel_journal_fault_mask = mask;
+}
+
 extern "C" uint8_t Warning_HasActiveFault(void)
 {
-	return HasActiveFaultNow();
+	return (HasActiveFaultNow() || Fire_HasExtinguishIncomplete()) ? 1u : 0u;
+}
+
+extern "C" uint8_t Warning_HasActiveAttention(void)
+{
+	return CountActiveAttentionNow() > 0u ? 1u : 0u;
 }

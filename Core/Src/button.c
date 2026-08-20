@@ -16,6 +16,14 @@ struct Button Buttons[NUM_BUTTON];
 
 static uint8_t s_btn_i2c_recovery_tick = BUTTON_I2C_RECOVERY_RETRY_TICKS;
 
+__attribute__((weak)) uint8_t Button_FetchRemotePressedMask(uint8_t *mask_out)
+{
+	if (mask_out != 0) {
+		*mask_out = 0u;
+	}
+	return 1u;
+}
+
 static void Button_SetAllError(void)
 {
 	for(uint8_t i = 0; i < NUM_BUTTON; i++) {
@@ -96,7 +104,14 @@ ButtonState Button_GetState(uint8_t but) {
 }
 
 void Button_ReadPin() {
-	HAL_StatusTypeDef st = HAL_ERROR;
-	uint8_t but = 0xFF;
+	uint8_t mask = 0u;
+	uint8_t ok = Button_FetchRemotePressedMask(&mask);
+	if (ok == 0u) {
+		Button_SetAllError();
+		return;
+	}
 
+	for (uint8_t i = 0u; i < NUM_BUTTON; i++) {
+		Buttons[i].ispress = (uint8_t)((mask >> i) & 0x01u);
+	}
 }

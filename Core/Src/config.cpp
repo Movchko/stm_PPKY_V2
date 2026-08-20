@@ -3,6 +3,7 @@
 #include "device.hpp"
 #include "device_cfg_common.h"
 #include "backend.h"
+#include "menu_ui.h"
 
 extern struct PPKYCfg PPKYConfig;       // локальная (рабочая) конфигурация
 extern struct PPKYCfg SavedPPKYConfig; // копия сохранённой конфигурации из Flash
@@ -46,6 +47,7 @@ void ReadSavedConfig() {
 void SaveConfig() {
 	uint32_t size = GetConfigSize();
 	FlashWriteData((uint8_t *)&PPKYConfig, size);
+	MenuConfig_OnSaveCompleted();
 
 	// Читаем обратно из Flash в SavedPPKYConfig — проверяем, что запись прошла
 	uint32_t cfg_addr = SPIF_SectorToAddress(FLASH_CFG_START_SECTOR);
@@ -76,6 +78,7 @@ void SetConfigWord(uint16_t num, uint32_t word) { // set 4 bytes
 	p[byte_index + 1] = (uint8_t)((word >> 16) & 0xFF);
 	p[byte_index + 2] = (uint8_t)((word >> 8)  & 0xFF);
 	p[byte_index + 3] = (uint8_t)((word >> 0)  & 0xFF);
+	MenuConfig_OnWordReceived(num);
 }
 
 // Размер конфигурации (в байтах)

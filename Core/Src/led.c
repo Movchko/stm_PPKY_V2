@@ -287,4 +287,20 @@ void Led_ForceStatusBright(uint8_t led)
 	Led_SetBrightness(led, LED_STATUS_MAX_BRIGHTNESS);
 }
 
+uint8_t Led_GetState(uint8_t led)
+{
+	if (led >= NUM_LED) {
+		return 0u;
+	}
+	return cur_led_state[led];
+}
+
+uint8_t Led_GetBrightness(uint8_t led)
+{
+	if (led >= NUM_LED) {
+		return 0u;
+	}
+	return cur_led_power[led];
+}
+
 

@@ -9,11 +9,16 @@
 #include "config_sync.hpp"
 #include "device_dpt.hpp"
 #include "device_igniter.hpp"
-#include "gui/common/FrontendHeap.hpp"
+#include "menu_ui.h"
+#include "rtc_cache.h"
+#include "event_log.h"
+#include "log_transport.h"
+#include "esp_manager.h"
+#include "rs_panel_proto.h"
 #include "fire.h"
 #include "warning.h"
 
-
+#define WARNING_TITLE_LEN 24
 
 struct PPKYCfg PPKYConfig;       // локальная (рабочая) конфигурация
 struct PPKYCfg SavedPPKYConfig; // копия сохранённой конфигурации из Flash
@@ -30,6 +35,7 @@ uint8_t g_mku_mismatch_flag = 0;
 static uint8_t g_cfg_crc_mismatch_flag = 0u;
 static constexpr uint8_t RELAY_AUTO_MAX_TRACK = 64u;
 static uint8_t g_relay_fire_zone_active[ZONE_NUMBER];
+static uint8_t g_relay_start_zone_active[ZONE_NUMBER];
 
 typedef struct {
 	uint8_t valid;
@@ -70,7 +76,30 @@ uint8_t status_sec_cnt = 0;
 
 uint8_t uart_send_buf[32] = {0};
 
+extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
+static RsPanelMaster g_rs_panel_master;
+
+extern "C" __attribute__((weak)) void App_OnFireUiUpdate(uint8_t active, uint8_t mode,
+							      uint8_t remaining_s, uint8_t n_zones,
+							      char (*zone_names)[ZONE_NAME_SIZE + 1])
+{
+	(void)active;
+	(void)mode;
+	(void)remaining_s;
+	(void)n_zones;
+	(void)zone_names;
+}
+
+extern "C" __attribute__((weak)) void App_OnWarningUiUpdate(uint8_t active, uint8_t n_items,
+								 char (*big_titles)[WARNING_TITLE_LEN],
+								 char (*details)[ZONE_NAME_SIZE + 1])
+{
+	(void)active;
+	(void)n_items;
+	(void)big_titles;
+	(void)details;
+}
 
 RTC_TimeTypeDef cur_time = {0};
 RTC_DateTypeDef cur_date;
@@ -79,6 +108,7 @@ static void AddrAuto_ClearActiveDevices(void) {
 	memset(g_active_devices, 0, sizeof(g_active_devices));
 	memset(g_relay_auto_track, 0, sizeof(g_relay_auto_track));
 	memset(g_relay_fire_zone_active, 0, sizeof(g_relay_fire_zone_active));
+	memset(g_relay_start_zone_active, 0, sizeof(g_relay_start_zone_active));
 	g_active_devices_count = 0;
 	g_mku_mismatch_flag = 0;
 }
@@ -138,6 +168,89 @@ static void AddrAuto_Process(uint32_t now_ms) {
 	}
 }
 
+
+typedef enum {
+	MKU_RESET_IDLE = 0,
+	MKU_RESET_WAIT_DELAY,
+	MKU_RESET_WAIT_POWERON
+} MkuResetState;
+
+static MkuResetState g_mku_reset_state = MKU_RESET_IDLE;
+static uint32_t g_mku_reset_deadline_ms = 0u;
+static constexpr uint32_t MKU_RESET_AFTER_APPLY_DELAY_MS = 5000u;
+static constexpr uint32_t MKU_RESET_POWER_OFF_HOLD_MS = 1000u;
+static uint8_t g_mku_reset_prev_enable[POWER_NUM_MKU_CH] = {0u};
+static uint8_t g_mku_reset_prev_valid = 0u;
+
+static void MkuHardReset_StartNow(uint32_t now_ms)
+{
+	/* Замораживаем желаемое состояние выходов, чтобы PControl::Process()
+	 * не включил питание обратно раньше окончания окна OFF. */
+	for (uint8_t i = 0u; i < POWER_NUM_MKU_CH; i++) {
+		if (Power[i] != nullptr) {
+			g_mku_reset_prev_enable[i] = Power[i]->GetEnable() ? 1u : 0u;
+			Power[i]->SetEnable(false);
+		} else {
+			g_mku_reset_prev_enable[i] = 0u;
+		}
+	}
+	g_mku_reset_prev_valid = 1u;
+
+	for (uint8_t i = 0u; i < POWER_NUM_MKU_CH; i++) {
+		if (Power[i] != nullptr) {
+			Power[i]->PControlSetOut(i, false);
+		}
+	}
+	g_mku_reset_state = MKU_RESET_WAIT_POWERON;
+	g_mku_reset_deadline_ms = now_ms + MKU_RESET_POWER_OFF_HOLD_MS;
+}
+
+static void MkuHardReset_ScheduleAfterApply(void)
+{
+	g_mku_reset_state = MKU_RESET_WAIT_DELAY;
+	g_mku_reset_deadline_ms = HAL_GetTick() + MKU_RESET_AFTER_APPLY_DELAY_MS;
+}
+
+static void MkuHardReset_Process(uint32_t now_ms)
+{
+	switch (g_mku_reset_state) {
+	case MKU_RESET_IDLE:
+		break;
+	case MKU_RESET_WAIT_DELAY:
+		if ((int32_t)(now_ms - g_mku_reset_deadline_ms) >= 0) {
+			MkuHardReset_StartNow(now_ms);
+		}
+		break;
+	case MKU_RESET_WAIT_POWERON:
+		if ((int32_t)(now_ms - g_mku_reset_deadline_ms) >= 0) {
+			if (g_mku_reset_prev_valid != 0u) {
+				for (uint8_t i = 0u; i < POWER_NUM_MKU_CH; i++) {
+					if (Power[i] != nullptr) {
+						Power[i]->SetEnable(g_mku_reset_prev_enable[i] != 0u);
+					}
+				}
+			}
+			for (uint8_t i = 0u; i < POWER_NUM_MKU_CH; i++) {
+				if (Power[i] != nullptr) {
+					Power[i]->PControlSetOut(i, true);
+				}
+			}
+			g_mku_reset_prev_valid = 0u;
+			g_mku_reset_state = MKU_RESET_IDLE;
+		}
+		break;
+	default:
+		g_mku_reset_state = MKU_RESET_IDLE;
+		break;
+	}
+}
+
+extern "C" void App_OnConfigApplySuccess(void)
+{
+	/* Headless-friendly: без вызова TouchGFX UI. */
+	MenuConfig_OnApplySuccess();
+	MkuHardReset_ScheduleAfterApply();
+}
 
 void USBSendData(uint8_t *Buf) {};
 
@@ -342,6 +455,7 @@ static void UpdateActiveDeviceList(uint32_t msg_id, uint32_t now_ms) {
 		g_active_devices[g_active_devices_count].can_state_mask = 0u;
 		g_active_devices[g_active_devices_count].can_status_valid = 0u;
 		g_active_devices[g_active_devices_count].u24_01v = 0u;
+		memset(g_active_devices[g_active_devices_count].mcu_status_data, 0, sizeof(g_active_devices[g_active_devices_count].mcu_status_data));
 		g_active_devices[g_active_devices_count].vdev_count = 0u;
 		/* vdevs[] уже обнулены при memset в AddrAuto_ClearActiveDevices() */
 		g_active_devices_count++;
@@ -357,6 +471,7 @@ static void RefreshActiveDevices(uint32_t now_ms) {
 			g_active_devices[i].can_state_mask = 0u;
 			g_active_devices[i].can_status_valid = 0u;
 			g_active_devices[i].u24_01v = 0u;
+			memset(g_active_devices[i].mcu_status_data, 0, sizeof(g_active_devices[i].mcu_status_data));
 			g_active_devices[i].vdev_count = 0u;
 			memset(g_active_devices[i].vdevs, 0, sizeof(g_active_devices[i].vdevs));
 		}
@@ -399,6 +514,50 @@ static uint8_t RelayAuto_IsFireTriggerInZone(uint8_t zone)
 		}
 	}
 	return 0u;
+}
+
+static uint8_t RelayAuto_IsFireTriggerAnyZone(void)
+{
+	for (uint8_t zi = 0u; zi < ZONE_NUMBER; zi++) {
+		if (g_relay_fire_zone_active[zi] != 0u) {
+			return 1u;
+		}
+	}
+	return 0u;
+}
+
+static uint8_t RelayAuto_IsStartTriggerInZone(uint8_t zone)
+{
+	uint8_t z_can = (uint8_t)(zone & 0x7Fu);
+	if (z_can >= 1u && z_can <= ZONE_NUMBER) {
+		uint8_t zi = (uint8_t)(z_can - 1u);
+		if (g_relay_start_zone_active[zi] != 0u) {
+			return 1u;
+		}
+	}
+	return 0u;
+}
+
+static uint8_t RelayAuto_IsStartTriggerAnyZone(void)
+{
+	for (uint8_t zi = 0u; zi < ZONE_NUMBER; zi++) {
+		if (g_relay_start_zone_active[zi] != 0u) {
+			return 1u;
+		}
+	}
+	return 0u;
+}
+
+extern "C" void RelayAuto_NotifyStartExtinguish(uint8_t zone_can)
+{
+	uint8_t z = (uint8_t)(zone_can & 0x7Fu);
+	if (z == 0u) {
+		memset(g_relay_start_zone_active, 1, sizeof(g_relay_start_zone_active));
+		return;
+	}
+	if (z >= 1u && z <= ZONE_NUMBER) {
+		g_relay_start_zone_active[z - 1u] = 1u;
+	}
 }
 
 static void RelayAuto_OnFireServiceCmd(uint32_t MsgID, uint8_t command)
@@ -534,7 +693,7 @@ static void RelayAuto_Process(void)
 			}
 			const DeviceRelayConfig *cfg = (const DeviceRelayConfig*)m->Devices[slot].reserv;
 			const uint8_t mode = cfg->mode;
-			if (mode == 0u || mode > 3u) {
+			if (mode == 0u || mode > 6u) {
 				continue;
 			}
 
@@ -543,8 +702,14 @@ static void RelayAuto_Process(void)
 				trigger = RelayAuto_IsFireTriggerInZone(zone);
 			} else if (mode == 2u) {
 				trigger = RelayAuto_IsFaultTriggerInZone(zone);
-			} else {
+			} else if (mode == 3u) {
 				trigger = RelayAuto_IsLswitchOpenTriggerInZone(zone);
+			} else if (mode == 4u) {
+				trigger = RelayAuto_IsFireTriggerAnyZone();
+			} else if (mode == 5u) {
+				trigger = RelayAuto_IsStartTriggerInZone(zone);
+			} else {
+				trigger = RelayAuto_IsStartTriggerAnyZone();
 			}
 
 			uint8_t target_state = (cfg->initial_state != 0u) ? 1u : 0u;
@@ -613,6 +778,7 @@ static void UpdateMcuCanStatus(uint32_t MsgID, uint8_t *MsgData) {
 	g_active_devices[idx].can_state_mask = MsgData[7];
 	g_active_devices[idx].can_status_valid = 1u;
 	g_active_devices[idx].u24_01v = MsgData[6];
+	memcpy(g_active_devices[idx].mcu_status_data, MsgData, sizeof(g_active_devices[idx].mcu_status_data));
 }
 
 static void UpdateActiveVirtualDevices(uint32_t MsgID, uint8_t *MsgData, uint32_t now_ms) {
@@ -840,7 +1006,13 @@ void AppInit() {
 
 	// Передаём указатели в backend (для сервисных команд работы с конфигурацией)
 	SetConfigPtr((uint8_t *)&SavedPPKYConfig, (uint8_t *)&PPKYConfig);
-	ConfigSync_Init(&PPKYConfig, g_active_devices, &g_active_devices_count, SaveConfig, &g_cfg_crc_mismatch_flag);
+	ConfigSync_Init(&PPKYConfig, g_active_devices, &g_active_devices_count, SaveConfig, App_OnConfigApplySuccess, &g_cfg_crc_mismatch_flag);
+	RtcCache_Refresh();
+	(void)EventLog_Init(&hFlash);
+	EventLog_LogMasterBoot();
+	LogTransport_Init();
+	EspManager_Init();
+	Esp32_SetEnabled(1u);
 
 	// Список устройств по аналогии с МКУ: 0-й элемент — сама плата ППКУ
 	extern Device BoardDevicesList[];
@@ -856,9 +1028,6 @@ void AppInit() {
 
 	Button_Init();
 	Beeper_Init();
-
-	// Сообщаем модели, какую функцию вызывать при смене состояния звука
-	FrontendHeap::getInstance().model.setSoundToggledCallback(Beeper_SoundOnOff);
 
 	for (uint8_t i = 0; i < POWER_NUM_CHANNELS; i++) {
 		Power[i] = new PControl(i);
@@ -879,6 +1048,7 @@ void AppInit() {
 
 	/* Инициализация FSM пожара */
 	Fire_Init();
+	RsPanelMaster_Init(&g_rs_panel_master, &huart1, BRP_485_EN_GPIO_Port, BRP_485_EN_Pin);
 
 
 
@@ -906,6 +1076,9 @@ void AppProcess(uint32_t now_ms) {
 	}
 	// Неблокирующая машина состояний автозадания адресов по команде 10
 	AddrAuto_Process(now_ms);
+
+	/* Отложенный hard reset после APPLY/Sync-операций config_sync. */
+	MkuHardReset_Process(now_ms);
 }
 
 uint32_t counter1s = 0;
@@ -976,12 +1149,14 @@ void AppTimer1ms() {
 
 	if(counter1s >= 1000) {
 		counter1s = 0;
+		RtcCache_Tick1s();
 		AppSetStatus();
 		status_sec_cnt++;
 	}
 }
 
 void AppTimer10ms() {
+	uint32_t now = HAL_GetTick();
 	/* Чтение кнопок делаем реже, чтобы не перегружать I2C.
 	 * Теперь Button_Process вызывается раз в ~с (при шаге AppTimer10ms ~10 мс). */
 	static uint8_t button_acc = 0;
@@ -990,9 +1165,13 @@ void AppTimer10ms() {
 		button_acc = 0;
 		Button_Process();
 	}
+	EventLog_ProcessTelemetrySample(now);
+	EspManager_Process(now);
+	LogTransport_Process();
 	Fire_Timer10ms();
 	Beeper_Process();
 	Led_Process();
+	RsPanelMaster_Process10ms(&g_rs_panel_master, HAL_GetTick());
 	//for(uint8_t i = 0; i < 2; i++) {
 	//st[i] = Power[i]->PControlGetST(i);
 	//}
@@ -1032,6 +1211,7 @@ void RcvSetSystemTime(uint8_t *MsgData) {
 		return;
 	}
 	HAL_RTC_SetDate(&hrtc, &d, RTC_FORMAT_BCD);
+	RtcCache_Refresh();
 }
 /*
 uint32_t GetID() {
@@ -1062,7 +1242,7 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData) {
 	if(Command >= ServiceCmd_Fire_SetStatusFire && Command <= ServiceCmd_Fire_SetReplyResumeExtinguishmentTimer) {
 		RelayAuto_OnFireServiceCmd(MsgID, Command);
 		if(Command == ServiceCmd_Fire_SetStatusFire) {
-			Fire_OnStatusFire(MsgID);
+			Fire_OnStatusFire(MsgID, MsgData);
 		} else if (Command == ServiceCmd_Fire_ReplyStatusFire) {
 			Fire_OnReplyStatusFire(MsgID);
 		} else if (Command == ServiceCmd_Fire_StopExtinguishment) {
@@ -1085,15 +1265,13 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData) {
 
 extern "C" void Fire_UiUpdate(uint8_t active, uint8_t mode, uint8_t remaining_s, uint8_t n_zones,
 			      char (*zone_names)[ZONE_NAME_SIZE + 1]) {
-	FrontendHeap::getInstance().model.setFireStatusFromApp(
-		active != 0, mode, 0xFFu, remaining_s, n_zones, zone_names);
+	App_OnFireUiUpdate(active, mode, remaining_s, n_zones, zone_names);
 }
 
 extern "C" void Warning_UiUpdate(uint8_t active, uint8_t n_items,
 				 char (*big_titles)[WARNING_TITLE_LEN],
 				 char (*details)[ZONE_NAME_SIZE + 1]) {
-	FrontendHeap::getInstance().model.setWarningStatusFromApp(
-		active != 0, n_items, big_titles, details);
+	App_OnWarningUiUpdate(active, n_items, big_titles, details);
 }
 
 

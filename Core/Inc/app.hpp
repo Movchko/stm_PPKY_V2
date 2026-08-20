@@ -9,11 +9,47 @@
 #define INC_APP_HPP_
 
 #include "main.h"
+#include "spif.h"
+#include "device_config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define FLASH_CFG_START_SECTOR 0
+#define FLASH_CFG_START_BLOCK FLASH_CFG_START_SECTOR / (SPIF_BLOCK_SIZE / SPIF_SECTOR_SIZE)
 
 #define FLASH_CFG_SECTORS_USED  24
+#define FLASH_CFG_BLOCK_USED  FLASH_CFG_SECTORS_USED / (SPIF_BLOCK_SIZE / SPIF_SECTOR_SIZE)
 #define NUM_ACTIVE_DEVICE 32
+
+/* Область SPI Flash под конфигурацию ППКУ (секторы 0 .. FLASH_CFG_SECTORS_USED-1). */
+#define FLASH_CFG_BYTES_ALLOCATED   (FLASH_CFG_SECTORS_USED * SPIF_SECTOR_SIZE)
+#define FLASH_CFG_RESERVE_PERCENT   10u
+#define FLASH_CFG_MAX_USABLE_BYTES  ((FLASH_CFG_BYTES_ALLOCATED * (100u - FLASH_CFG_RESERVE_PERCENT)) / 100u)
+#define FLASH_CFG_STORED_BYTES      (sizeof(PPKYConfigHeader) + sizeof(PPKYCfg))
+
+/* Область журналов после конфигурации. */
+#define SPI_FLASH_SECTOR_COUNT      4096u
+#define FLASH_LOG_START_SECTOR      (FLASH_CFG_START_SECTOR + FLASH_CFG_SECTORS_USED)
+#define FLASH_LOG_TOTAL_SECTORS     (SPI_FLASH_SECTOR_COUNT - FLASH_LOG_START_SECTOR)
+
+#define EVENT_LOG_RECORD_SIZE_BYTES   32u
+#define EVENT_LOG_RECORDS_PER_SECTOR  (SPIF_SECTOR_SIZE / EVENT_LOG_RECORD_SIZE_BYTES)
+
+#define FLASH_LOG_CRITICAL_MIN_RECORDS   50000u
+#define FLASH_LOG_CRITICAL_SECTORS       400u
+#define FLASH_LOG_CRITICAL_RECORDS       (FLASH_LOG_CRITICAL_SECTORS * EVENT_LOG_RECORDS_PER_SECTOR)
+
+#define FLASH_LOG_CRITICAL_START_SECTOR  FLASH_LOG_START_SECTOR
+#define FLASH_LOG_CRITICAL_END_SECTOR    (FLASH_LOG_CRITICAL_START_SECTOR + FLASH_LOG_CRITICAL_SECTORS - 1u)
+
+#define FLASH_LOG_GENERAL_SECTORS        (FLASH_LOG_TOTAL_SECTORS - FLASH_LOG_CRITICAL_SECTORS)
+#define FLASH_LOG_GENERAL_START_SECTOR   (FLASH_LOG_CRITICAL_END_SECTOR + 1u)
+#define FLASH_LOG_GENERAL_END_SECTOR     (FLASH_LOG_GENERAL_START_SECTOR + FLASH_LOG_GENERAL_SECTORS - 1u)
+#define FLASH_LOG_GENERAL_RECORDS        (FLASH_LOG_GENERAL_SECTORS * EVENT_LOG_RECORDS_PER_SECTOR)
+
+#define FLASH_LOG_UNUSED_TAIL_SECTORS    0u
 
 #define RTC_PING_PERIOD_S 60000u
 
@@ -36,6 +72,7 @@ typedef struct {
 	uint8_t can_state_mask;  /* bits[1:0]=CAN0 state, bits[3:2]=CAN1 state */
 	uint8_t can_status_valid; /* 1 после первого валидного статуса МКУ cmd=0 */
 	uint8_t u24_01v;         /* измеренное U24 (1V), из статуса МКУ cmd=0 */
+	uint8_t mcu_status_data[8]; /* последний полный статус МКУ (cmd=0), MsgData[0..7] */
 
 	/* Виртуальные устройства, которые находятся "внутри" данного МКУ */
 	uint8_t vdev_count;
@@ -64,5 +101,11 @@ typedef struct {
 		uint8_t ack_flags;     /* для IGNITER */
 	} vdevs[PPKY_MAX_ACTIVE_VDEVS_PER_MCU];
 } ActiveDeviceInfo;
+
+void RelayAuto_NotifyStartExtinguish(uint8_t zone_can);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* INC_APP_HPP_ */

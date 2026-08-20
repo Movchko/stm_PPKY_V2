@@ -60,6 +60,21 @@ void App_CanTxProcess(void);
   */
 void CANSendData(uint8_t *Buf);
 
+/** Остановить UART-мост ESP32 (при выключении модуля). */
+void UartBridge_Stop(void);
+/** Отправить BSU-кадр на ESP32 (type 3 - команды ESP и др.). */
+uint8_t UartBridge_SendBsuPacket(uint16_t pkt_type, uint16_t seq, const uint8_t *payload, uint16_t payload_len);
+/** UART2 свободен для передачи лога (очередь CAN-моста пуста и TX не занят). */
+uint8_t UartBridge_IsTxIdle(void);
+
+/**
+ * Целостность CAN-кольца по статусам МКУ.
+ * @return 1 - кольцо целое (или нет online МКУ с валидным статусом,
+ *            или ещё не прошло окно устаканивания после старта питания);
+ *         0 - у какого-то МКУ КЗ/обрыв по CAN0 или CAN1.
+ */
+uint8_t CanRingIsIntact(void);
+
 /** Глобальные флаги ошибки шин: бит 0 = CAN1 (нет приёма), бит 1 = CAN2 */
 extern uint8_t can_bus_error_flags;
 
@@ -68,6 +83,12 @@ extern uint8_t can_bus_error_flags;
   * бит 1 = ожидаемый дубликат с CAN2 не пришёл. Индекс = CAN_DEVICE_INDEX(can_id).
   */
 extern uint8_t device_can_error[CAN_MAX_DEVICES];
+
+/**
+ * Учёт веса позиции МКУ с указанием шины CAN (реализация в app.cpp).
+ * Вызывается для каждого принятого кадра, в т.ч. дубликата со второй шины.
+ */
+void App_PositionRxFromCan(uint32_t msg_id, const uint8_t *msg_data, uint8_t can_bus, uint32_t now_ms);
 
 #ifdef __cplusplus
 }

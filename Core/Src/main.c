@@ -18,11 +18,9 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "app_touchgfx.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "Display/display.h"
 #include "stdlib.h"
 #include "app.hpp"
 #include "led.h"
@@ -153,7 +151,6 @@ int main(void)
   MX_ICACHE_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
-  MX_TouchGFX_Init();
   /* USER CODE BEGIN 2 */
   // must have for esp32
   HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_SET);
@@ -173,15 +170,7 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  InitDisplay();
   Led_Init();
-
-  // ниже принудительно запускаем touch gfx, чтобы загрузить лого на экран.
-  MX_TouchGFX_Process();
-  TGFX_SignalVSync();
-  Display_Enable(true);
-  MX_TouchGFX_Process();
-  TGFX_SignalVSync();
 
   if(isFlash == true) {
 	  AppInit();
@@ -196,7 +185,6 @@ int main(void)
 
 //  HAL_UART_Receive_DMA(&huart2, uart_buf, 2);
 
-  uint32_t gfx_tick = HAL_GetTick();
   uint32_t led_tick = HAL_GetTick();
   uint32_t last_rtc_bkp_tick = HAL_GetTick();
   while (1)
@@ -209,15 +197,6 @@ int main(void)
 		  /*
 		   * end test
 		   */
-	  }
-
-	 if((cur_tick - gfx_tick) >= GFX_RATIO_MS) { // условие чтобы MX_TouchGFX_Process не спамилось слишком часто
-    /* USER CODE END WHILE */
-
-  MX_TouchGFX_Process();
-    /* USER CODE BEGIN 3 */
-  	  	  TGFX_SignalVSync();
-  	  	  gfx_tick = cur_tick;
 	  }
 
 	 if(is1ms) {
@@ -686,10 +665,7 @@ static void MX_RTC_Init(void)
 {
 
   /* USER CODE BEGIN RTC_Init 0 */
-	//TODO:: DELETE!!!
-	return;
-
-	  HAL_PWR_EnableBkUpAccess();//+
+  HAL_PWR_EnableBkUpAccess();
   /* USER CODE END RTC_Init 0 */
 
   RTC_PrivilegeStateTypeDef privilegeState = {0};
@@ -917,7 +893,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 460800;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -1083,9 +1059,15 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 uint8_t SetUpdateWord(uint32_t num, uint32_t word)
 { return 0;}
-uint32_t GetAppVersion(void)
+
+#define APP_VERSION_U32 2u
+
+const char *GetAppVersion(void)
 {
-    return 1;
+    static char ver_buf[64];
+    /* fw: версия прошивки (пока константа) */
+    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия аппаратной части %u", (unsigned)APP_VERSION_U32);
+    return ver_buf;
 }
 
 uint8_t FinishUpdateTransmit(void) {

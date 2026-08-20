@@ -24,9 +24,11 @@ void Fire_Timer1ms(void);
 void Fire_Timer10ms(void);
 
 /* События от протокола backend (вызывать из ListenerCommandCB) */
-void Fire_OnStatusFire(uint32_t msg_id);
+void Fire_OnStatusFire(uint32_t msg_id, const uint8_t *msg_data);
 void Fire_OnReplyStatusFire(uint32_t msg_id);
 void Fire_OnStopExtinguishment(uint32_t msg_id);
+void Fire_OnBusStartSpButton(uint32_t msg_id);
+void Fire_OnStartExtinguishment(uint32_t msg_id, const uint8_t *msg_data);
 void Fire_OnReplyStartExtinguishment(uint32_t msg_id);
 void Fire_OnReplyStopExtinguishment(uint32_t msg_id);
 void Fire_OnPauseExtinguishmentTimer(uint32_t msg_id);
@@ -37,8 +39,17 @@ void Fire_OnReplyResumeExtinguishmentTimer(uint32_t msg_id);
 /* Текущий статус сценария пожара (для подавления вторичных индикаций). */
 uint8_t Fire_IsActive(void);
 
+/* Есть активный слот с неуспешным тушением (ТУШ.ОШ.) - для LED_ERR. */
+uint8_t Fire_HasExtinguishIncomplete(void);
+
+/* Идёт удержание ПУСК ОБЩИЙ (3с) - нужен главный экран со счётчиком. */
+uint8_t Fire_IsStartAllHoldActive(void);
+
 /* Ручной выбор пожара на главном экране (индекс в текущем UI-списке). */
 void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index);
+
+/* Смена zone_fire_mode[] (меню РЕЖИМ ЗОН) - обновить LED_AUTO_OFF. */
+void Fire_NotifyZoneModeChanged(void);
 
 #ifdef __cplusplus
 }

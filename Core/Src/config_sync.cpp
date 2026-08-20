@@ -7,6 +7,8 @@ extern "C" {
 #include "service.h"
 }
 
+#if 0
+
 typedef enum {
 	CFGSYNC_OP_NONE = 0,
 	CFGSYNC_OP_READ_ALL,
@@ -478,3 +480,7 @@ extern "C" void ConfigSync_StartApply(void) {
 extern "C" uint8_t ConfigSync_IsBusy(void) {
 	return g_cfg_sync.busy ? 1u : 0u;
 }
+
+#endif
+
+#include "config_sync_v1_impl.inc"

@@ -53,6 +53,8 @@ void Led_TestToogle();
 void Led_Process();
 void Led_SetBrightness(uint8_t led, uint8_t power);
 void Led_ForceStatusBright(uint8_t led);
+uint8_t Led_GetState(uint8_t led);
+uint8_t Led_GetBrightness(uint8_t led);
 
 #ifdef __cplusplus
 }

@@ -42,6 +42,9 @@ static uint8_t pattern_pulses_total = 0;
 static uint8_t pattern_pulses_left = 0;
 static uint8_t pattern_sound_phase = 0;
 
+/* UI/конфиг: синхронизация ВКЛ/ВЫКЛ звука (опционально, может быть не задана). */
+static Beeper_SoundStateUiCallback g_sound_state_ui_cb = 0;
+
 typedef struct
 {
 	uint8_t valid;
@@ -448,4 +451,52 @@ void Beeper_Process(void)
 
 void Beeper_SoundOnOff(bool soundOn) {
 	beep_sound = soundOn;
+	if (g_sound_state_ui_cb != 0) {
+		g_sound_state_ui_cb(soundOn);
+	}
+}
+
+uint8_t Beeper_GetStateCode(void)
+{
+	return (uint8_t)beeper_state;
+}
+
+uint8_t Beeper_IsSoundEnabled(void)
+{
+	return beep_sound;
+}
+
+uint16_t Beeper_GetPatternOnMs(void)
+{
+	return (uint16_t)(pattern_on_ticks * 10u);
+}
+
+uint16_t Beeper_GetPatternOffMs(void)
+{
+	return (uint16_t)(pattern_off_ticks * 10u);
+}
+
+uint16_t Beeper_GetPatternRepeatMs(void)
+{
+	return (uint16_t)(pattern_repeat_ticks * 10u);
+}
+
+uint8_t Beeper_GetPatternPulses(void)
+{
+	return pattern_pulses_total;
+}
+
+void Beeper_PlayIndicationTest(void)
+{
+	/* Тест звуковой индикации в текущей V2-версии не реализован. */
+}
+
+void Beeper_ResumeSoundOnNewEvent(void)
+{
+	/* В V2-реализации флагов ресьюма может не быть — оставляем no-op. */
+}
+
+void Beeper_SetSoundStateUiCallback(Beeper_SoundStateUiCallback cb)
+{
+	g_sound_state_ui_cb = cb;
 }

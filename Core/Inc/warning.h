@@ -13,7 +13,12 @@ void WarningProcess1ms(void);
 void Warning_SetPowerFaultMask(uint8_t mask);
 /* Ошибки входов питания ППКУ: bits0..1 => ПИТАНИЕ1/2 */
 void Warning_SetPpkuInputFaultMask(uint8_t mask);
+/* Ошибки несоответствия физической позиции МКУ (бит h_adr-1 => МКУ с адресом h_adr). */
+void Warning_SetMkuPositionFaultMask(uint32_t mask);
+/* Ошибка доставки журнала на панели (бит panel_addr-1 => панель addr 1..8). */
+void Warning_SetPanelJournalFaultMask(uint8_t mask);
 uint8_t Warning_HasActiveFault(void);
+uint8_t Warning_HasActiveAttention(void);
 
 #ifdef __cplusplus
 }

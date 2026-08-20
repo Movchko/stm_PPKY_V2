@@ -104,10 +104,33 @@ void Beeper_StartPulseTrain(uint16_t pulse_on_ms, uint16_t pulse_off_ms, uint8_t
 void Beeper_ButtonAcknowledge(void);
 
 /**
+ * @brief Тест звуковой индикации (меню ТЕСТ): блокирующий профиль SOUND_TEST_*.
+ * После завершения восстанавливает фоновый паттерн, если был.
+ */
+void Beeper_PlayIndicationTest(void);
+
+/**
  * @brief Функция установки параметра звука ВКЛ/ВЫКЛ
  * Параметр сохраняемый в настройках
  */
 void Beeper_SoundOnOff(bool soundOn);
+/**
+ * @brief GOST: возобновить звук при новом извещении, если был вручную выключен.
+ * Вне GOST_MODE - no-op.
+ */
+void Beeper_ResumeSoundOnNewEvent(void);
+/**
+ * @brief Колбэк синхронизации UI/конфига при автовозобновлении звука (из AppInit).
+ */
+typedef void (*Beeper_SoundStateUiCallback)(bool soundOn);
+void Beeper_SetSoundStateUiCallback(Beeper_SoundStateUiCallback cb);
+
+uint8_t Beeper_GetStateCode(void);
+uint8_t Beeper_IsSoundEnabled(void);
+uint16_t Beeper_GetPatternOnMs(void);
+uint16_t Beeper_GetPatternOffMs(void);
+uint16_t Beeper_GetPatternRepeatMs(void);
+uint8_t Beeper_GetPatternPulses(void);
 
 #ifdef __cplusplus
 }
