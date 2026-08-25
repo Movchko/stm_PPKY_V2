@@ -13,6 +13,8 @@
 #include "event_log_ui.h"
 #include "menu_ui.h"
 #include "esp_manager.h"
+#include "esp_protocol.h"
+#include "can_bus.h"
 #include "led.h"
 #include "beeper.h"
 #include "warning.h"
@@ -21,6 +23,7 @@ extern PPKYCfg PPKYConfig;
 extern void SaveConfig(void);
 
 static RsPanelMaster *g_active_master = 0;
+static uint16_t g_esp_uart_fwd_seq = 1u;
 static uint8_t g_rs_frag_id = 1u;
 static uint32_t g_journal_total = 0u;
 static uint32_t g_journal_selected = 0u;
@@ -1709,6 +1712,37 @@ uint8_t RsPanel_DecodeCaps(const uint8_t *src, uint16_t src_len, RsPanelCaps *ou
     return 1u;
 }
 
+uint16_t RsPanel_EncodeActivity(uint8_t *dst, uint16_t dst_size, const RsPanelActivity *act)
+{
+    uint16_t pos = 0u;
+
+    if (dst == 0 || act == 0 || dst_size < RS_PANEL_ACTIVITY_PAYLOAD_SIZE) {
+        return 0u;
+    }
+    dst[pos++] = act->dev_type;
+    pos = (uint16_t)(pos + rs_put_u16le(&dst[pos], act->fw_ver));
+    pos = (uint16_t)(pos + rs_put_u16le(&dst[pos], act->hw_id));
+    dst[pos++] = act->status;
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], act->uptime_sec));
+    return pos;
+}
+
+uint8_t RsPanel_DecodeActivity(const uint8_t *src, uint16_t src_len, RsPanelActivity *out_act)
+{
+    if (src == 0 || out_act == 0 || src_len < RS_PANEL_ACTIVITY_PAYLOAD_SIZE) {
+        return 0u;
+    }
+    out_act->dev_type = src[0];
+    out_act->fw_ver = rs_get_u16le(&src[1]);
+    out_act->hw_id = rs_get_u16le(&src[3]);
+    out_act->status = src[5];
+    out_act->uptime_sec = (uint32_t)src[6] |
+                          ((uint32_t)src[7] << 8) |
+                          ((uint32_t)src[8] << 16) |
+                          ((uint32_t)src[9] << 24);
+    return 1u;
+}
+
 uint16_t RsPanel_EncodeLedCmd(uint8_t *dst, uint16_t dst_size, const RsPanelLedCmd *cmd)
 {
     uint16_t pos = 0u;
@@ -1885,6 +1919,45 @@ uint8_t RsPanel_DecodeProfileSetCmd(const uint8_t *src, uint16_t src_len, RsPane
     return 1u;
 }
 
+static uint8_t rs_panel_should_forward_to_host(const RsBusFrameView *frame)
+{
+    if (frame == 0) {
+        return 0u;
+    }
+    if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
+        return 1u;
+    }
+    if (frame->cmd == RS_PANEL_CMD_BOOT_RESET_MCU ||
+        frame->cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD ||
+        frame->cmd == RS_PANEL_CMD_BOOT_UPD_TRANSMIT ||
+        frame->cmd == RS_PANEL_CMD_BOOT_GET_VERSION) {
+        return 1u;
+    }
+    return 0u;
+}
+
+static void rs_panel_forward_frame_to_esp(const RsBusFrameView *frame)
+{
+    uint8_t raw[ESP_UART_BODY_MAX];
+    uint16_t len;
+
+    if (frame == 0 || Esp32_IsEnabled() == 0u) {
+        return;
+    }
+    len = RsBus_FrameEncode(raw,
+                            (uint16_t)sizeof(raw),
+                            frame->addr,
+                            frame->seq,
+                            frame->flags,
+                            frame->cmd,
+                            frame->payload,
+                            frame->payload_len);
+    if (len == 0u || len > ESP_UART_BODY_MAX) {
+        return;
+    }
+    (void)UartBridge_SendBsuPacket(BSU_PKT_TYPE_ESP_UART, g_esp_uart_fwd_seq++, raw, len);
+}
+
 static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
 {
     RsPanelMaster *master = (RsPanelMaster *)ctx;
@@ -1892,6 +1965,11 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
 
     if (master == 0 || frame == 0 || (frame->flags & RS_BUS_FLAG_DIR) == 0u) {
         return;
+    }
+
+    /* Прокидка в WiFi/ПО: activity + ответы boot-команд (тот же addr панели). */
+    if (rs_panel_should_forward_to_host(frame) != 0u) {
+        rs_panel_forward_frame_to_esp(frame);
     }
 
     for (i = 0u; i < master->panel_count; i++) {
@@ -1927,6 +2005,9 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                 PanelState_OnPollRsp(panel, &rsp, HAL_GetTick());
                 rs_panel_master_handle_ui_events(master, panel, &rsp);
             }
+        } else if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
+            /* Presence для ПО уже прокинута выше; локально только фиксируем RX. */
+            panel->last_rx_ms = HAL_GetTick();
         }
         break;
     }
@@ -2069,6 +2150,27 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
                           RS_PANEL_CMD_POLL,
                           payload,
                           payload_len);
+}
+
+uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
+{
+    RsBusFrameView view;
+    uint16_t consumed = 0u;
+
+    if (g_active_master == 0 || frame == 0 || frame_len == 0u) {
+        return 0u;
+    }
+    if (RsBus_FrameDecode(frame, frame_len, &view, &consumed) == 0u) {
+        return 0u;
+    }
+    /* Только master→slave (DIR=0): команды ПО на панель/бутлоадер. */
+    if ((view.flags & RS_BUS_FLAG_DIR) != 0u) {
+        return 0u;
+    }
+    if (RsBus_SendRaw(&g_active_master->bus, frame, frame_len) != HAL_OK) {
+        return 0u;
+    }
+    return 1u;
 }
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)

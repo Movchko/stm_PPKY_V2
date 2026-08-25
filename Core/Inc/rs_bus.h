@@ -35,6 +35,7 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
                                   uint8_t cmd,
                                   const uint8_t *payload,
                                   uint16_t payload_len);
+HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_t frame_len);
 
 #ifdef __cplusplus
 }

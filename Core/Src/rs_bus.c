@@ -213,3 +213,23 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
     }
     return HAL_OK;
 }
+
+HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_t frame_len)
+{
+    if (ctx == 0 || ctx->uart == 0 || frame == 0 || frame_len == 0u) {
+        return HAL_ERROR;
+    }
+    if (ctx->de_port != 0) {
+        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_SET);
+    }
+    if (HAL_UART_Transmit(ctx->uart, (uint8_t *)frame, frame_len, 50u) != HAL_OK) {
+        if (ctx->de_port != 0) {
+            HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
+        }
+        return HAL_ERROR;
+    }
+    if (ctx->de_port != 0) {
+        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
+    }
+    return HAL_OK;
+}

@@ -14,6 +14,7 @@
 #include "esp_protocol.h"
 #include "log_transport.h"
 #include "menu_ui.h"
+#include "rs_panel_proto.h"
 #include "app.hpp"
 #include "stm32h5xx_hal.h"
 #include <string.h>
@@ -365,6 +366,9 @@ static void uart_bridge_on_rx_byte(uint8_t b)
 				LogTransport_OnUart2LogRequest(uart_pkt_seq, uart_body_buf, uart_body_total);
 			} else if (uart_pkt_type == BSU_PKT_TYPE_ESP_ACTIVITY) {
 				EspManager_OnActivity(uart_body_buf, uart_body_total);
+			} else if (uart_pkt_type == BSU_PKT_TYPE_ESP_UART) {
+				/* ПО → ESP → ППКУ → RS485 (панель / бутлоадер). */
+				(void)RsPanelMaster_InjectRawRsFrame(uart_body_buf, uart_body_total);
 			}
 		}
 		uart_rx_reset();

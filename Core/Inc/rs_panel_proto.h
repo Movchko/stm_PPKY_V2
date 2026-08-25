@@ -23,6 +23,8 @@ void RsPanelMaster_Init(RsPanelMaster *master,
 void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms);
 void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_t len);
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
+/* Прокидка сырого RS-кадра с WiFi/ПО (BSU_PKT_TYPE_ESP_UART) на шину панелей. */
+uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len);
 
 #ifdef __cplusplus
 }
