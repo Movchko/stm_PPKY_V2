@@ -1012,6 +1012,7 @@ void AppInit() {
 	EventLog_LogMasterBoot();
 	LogTransport_Init();
 	EspManager_Init();
+	/* ESP32 включён при старте; WiFi — только из меню «Связь → WIFI». */
 	Esp32_SetEnabled(1u);
 
 	// Список устройств по аналогии с МКУ: 0-й элемент — сама плата ППКУ
