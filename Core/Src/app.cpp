@@ -1119,7 +1119,7 @@ static void App_UpdatePowerFaultIndication(uint32_t now_ms)
 	Warning_SetPpkuInputFaultMask(ppku_input_fault_mask);
 
 	/* При отсутствии основного ввода индикатор питания должен гаснуть. */
-	Led_Set(LED_POWER, ((ppku_input_fault_mask & 0x01u) != 0u) ? 0u : 1u);
+	Led_Set(LED_POWER, ((ppku_input_fault_mask & 0x01u) != 2u) ? 0u : 1u);
 
 	uint8_t has_fault = (power_fault_mask != 0u || ppku_input_fault_mask != 0u) ? 1u : Warning_HasActiveFault();
 	Led_Set(LED_ERR, has_fault ? 1u : 0u);
