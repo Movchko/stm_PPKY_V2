@@ -90,6 +90,9 @@ extern uint8_t device_can_error[CAN_MAX_DEVICES];
  */
 void App_PositionRxFromCan(uint32_t msg_id, const uint8_t *msg_data, uint8_t can_bus, uint32_t now_ms);
 
+void Position_EvaluateMismatch(uint32_t now_ms);
+uint32_t Position_GetFaultMask(void);
+
 #ifdef __cplusplus
 }
 #endif

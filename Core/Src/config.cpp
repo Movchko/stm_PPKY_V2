@@ -65,6 +65,10 @@ void SaveConfig() {
 
 // Запись 4-байтового слова в локальную конфигурацию (big-endian)
 void SetConfigWord(uint16_t num, uint32_t word) { // set 4 bytes
+	if (!MenuUi_IsConfigSessionActive()) {
+		MenuUi_SetConfigSession(1u);
+		MenuConfig_Reset();
+	}
 	uint32_t byte_index = (uint32_t)num * 4U;
 	uint32_t cfg_size = GetConfigSize();
 

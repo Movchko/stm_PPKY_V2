@@ -7,6 +7,8 @@
 
 extern "C" {
 #include "backend.h"
+#include "config_crc.h"
+#include "menu_ui.h"
 #include "service.h"
 #include "event_log.h"
 }
@@ -503,7 +505,7 @@ static void CfgSync_HandleCfgSizeReply(const uint8_t *MsgData, uint32_t now_ms) 
 	}
 
 	if (g_cfg_sync.op == CFGSYNC_OP_VERIFY_CRC || g_cfg_sync.op == CFGSYNC_OP_PERIODIC_VERIFY) {
-		g_cfg_sync.expected_crc = crc32(POLYNOM, &g_cfg->CfgDevices[g_cfg_sync.current_slot], sizeof(MKUCfg));
+		g_cfg_sync.expected_crc = MkuCfg_ComputeCrc(&g_cfg->CfgDevices[g_cfg_sync.current_slot]);
 		uint8_t p[7] = {0u}; /* saved config crc */
 		CfgSync_SendReq(&g_cfg_sync.current_dev, ServiceCmd_GetConfigCRC, p, now_ms);
 		g_cfg_sync.step = CFGSYNC_STEP_WAIT_CFG_CRC;
@@ -665,7 +667,7 @@ static void CfgSync_HandleSaveReply(uint32_t now_ms)
 	/* После Save МКУ применяет zone из образа (AplyConfig после ACK).
 	 * Дальнейший CRC/команды шлём уже на целевой адрес из конфиг-образа. */
 	g_cfg_sync.current_dev = g_cfg->CfgDevices[g_cfg_sync.current_slot].UId.devId;
-	g_cfg_sync.expected_crc = crc32(POLYNOM, &g_cfg->CfgDevices[g_cfg_sync.current_slot], sizeof(MKUCfg));
+	g_cfg_sync.expected_crc = MkuCfg_ComputeCrc(&g_cfg->CfgDevices[g_cfg_sync.current_slot]);
 	uint8_t p_crc[7] = {0u};
 	CfgSync_SendReq(&g_cfg_sync.current_dev, ServiceCmd_GetConfigCRC, p_crc, now_ms);
 	g_cfg_sync.step = CFGSYNC_STEP_WAIT_SAVE_AND_READBACK_CRC;
@@ -775,6 +777,7 @@ extern "C" void ConfigSync_StartVerify(void) {
 }
 
 extern "C" void ConfigSync_StartApply(void) {
+	MenuConfig_OnApplyStarted();
 	CfgSync_StartCommon(CFGSYNC_OP_APPLY_ALL, 0u, -1);
 }
 
@@ -821,5 +824,38 @@ extern "C" void ConfigSync_StartIgnBlockSync(void) {
 
 extern "C" uint8_t ConfigSync_IsBusy(void) {
 	return g_cfg_sync.busy ? 1u : 0u;
+}
+
+extern "C" uint8_t ConfigSync_GetApplyPercent(void) {
+	if (g_cfg_sync.busy == 0u || g_cfg_sync.op != CFGSYNC_OP_APPLY_ALL) {
+		return 0u;
+	}
+	if (g_cfg_sync.target_count == 0u) {
+		return 100u;
+	}
+
+	const uint32_t words_per =
+		(g_cfg_sync.total_words != 0u)
+			? (uint32_t)g_cfg_sync.total_words
+			: (uint32_t)(sizeof(MKUCfg) / 4u);
+	const uint32_t total =
+		(uint32_t)g_cfg_sync.target_count * words_per;
+	if (total == 0u) {
+		return 0u;
+	}
+
+	uint32_t done = (uint32_t)g_cfg_sync.target_pos * words_per;
+	if (g_cfg_sync.target_pos < g_cfg_sync.target_count) {
+		uint32_t cur = (uint32_t)g_cfg_sync.word_index;
+		if (cur > words_per) {
+			cur = words_per;
+		}
+		done += cur;
+	}
+	if (done > total) {
+		done = total;
+	}
+	uint32_t pct = (done * 100u) / total;
+	return (pct > 100u) ? 100u : (uint8_t)pct;
 }
 

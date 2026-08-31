@@ -7,6 +7,10 @@
 #include "backend.h"
 #include "service.h"
 #include "config_sync.hpp"
+#include "config_monitor.h"
+#include "config_ign_block_sync.h"
+#include "can_bus.h"
+#include "tick_time.h"
 #include "device_dpt.hpp"
 #include "device_igniter.hpp"
 #include "menu_ui.h"
@@ -33,6 +37,7 @@ ActiveDeviceInfo g_active_devices[NUM_ACTIVE_DEVICE];
 uint8_t g_active_devices_count = 0;
 uint8_t g_mku_mismatch_flag = 0;
 static uint8_t g_cfg_crc_mismatch_flag = 0u;
+static uint32_t g_position_fault_mask = 0u;
 static constexpr uint8_t RELAY_AUTO_MAX_TRACK = 64u;
 static uint8_t g_relay_fire_zone_active[ZONE_NUMBER];
 static uint8_t g_relay_start_zone_active[ZONE_NUMBER];
@@ -1007,6 +1012,8 @@ void AppInit() {
 	// Передаём указатели в backend (для сервисных команд работы с конфигурацией)
 	SetConfigPtr((uint8_t *)&SavedPPKYConfig, (uint8_t *)&PPKYConfig);
 	ConfigSync_Init(&PPKYConfig, g_active_devices, &g_active_devices_count, SaveConfig, App_OnConfigApplySuccess, &g_cfg_crc_mismatch_flag);
+	ConfigMonitor_Init(HAL_GetTick());
+	ConfigIgnBlockSync_Init();
 	RtcCache_Refresh();
 	(void)EventLog_Init(&hFlash);
 	EventLog_LogMasterBoot();
@@ -1084,45 +1091,102 @@ void AppProcess(uint32_t now_ms) {
 
 uint32_t counter1s = 0;
 
-uint32_t warning_process_delay = 5000;
+uint32_t warning_process_delay = 10000;
+
+uint32_t led_power_toogle_cnt = 0;
+uint8_t led_power_is_toogle = 0;
+
+/* Гистерезис порогов входа питания: ширина зоны возврата (~2% номинала, не меньше 300 мВ).
+ * Без него на границе enter-порога ADC даёт частые set/clear → спам EventLog. */
+static constexpr uint32_t PPKU_POWER_HYST_PCT = 2u;
+static constexpr uint32_t PPKU_POWER_HYST_MIN_MV = 300u;
+static uint8_t s_ppku_input_fault_latched = 0u;
+
+static uint8_t App_PpkuInputFaultHyst(uint32_t mv_mV, uint8_t prev_fault,
+				      uint32_t low_enter_mv, uint32_t high_enter_mv,
+				      uint32_t low_exit_mv, uint32_t high_exit_mv)
+{
+	if (prev_fault != 0u) {
+		/* Сброс только когда напряжение уверенно внутри рабочей полосы. */
+		return (mv_mV >= low_exit_mv && mv_mV <= high_exit_mv) ? 0u : 1u;
+	}
+	/* Установка при выходе за enter-пороги. */
+	return (mv_mV < low_enter_mv || mv_mV > high_enter_mv) ? 1u : 0u;
+}
 
 static void App_UpdatePowerFaultIndication(uint32_t now_ms)
 {
-	static uint8_t prev_power_fault_mask = 0u;
 	uint8_t power_fault_mask = 0u;       /* Ошибки выходов power-модуля (внешнее питание МКУ). */
 	uint8_t ppku_input_fault_mask = 0u;  /* Ошибки входов питания ППКУ. */
+	(void)now_ms;
 
-	/* Для "пропадания питания" используем порог присутствия 20% от номинала. */
+	/* Для "пропадания питания" используем порог присутствия 15%/10% от номинала + гистерезис. */
 	uint32_t nominal_mv = ((PPKYConfig.power_value != 0u) ? (uint32_t)PPKYConfig.power_value : 24u) * 1000u;
-	uint32_t present_threshold_mv = nominal_mv / 5;
+	uint32_t lov_present_threshold_mv = (nominal_mv * 15u) / 100u;
+	uint32_t high_present_threshold_mv = nominal_mv / 10u;
+	uint32_t hyst_mv = (nominal_mv * PPKU_POWER_HYST_PCT) / 100u;
+	if (hyst_mv < PPKU_POWER_HYST_MIN_MV) {
+		hyst_mv = PPKU_POWER_HYST_MIN_MV;
+	}
+	uint32_t low_enter_mv = (nominal_mv > lov_present_threshold_mv) ?
+				(nominal_mv - lov_present_threshold_mv) : 0u;
+	uint32_t high_enter_mv = nominal_mv + high_present_threshold_mv;
+	uint32_t low_exit_mv = low_enter_mv + hyst_mv;
+	uint32_t high_exit_mv = (high_enter_mv > hyst_mv) ? (high_enter_mv - hyst_mv) : high_enter_mv;
+	if (low_exit_mv > high_exit_mv) {
+		low_exit_mv = high_exit_mv;
+	}
+
 	uint32_t main_mv = (CHANNEL_VAL[4] > 0) ? (uint32_t)CHANNEL_VAL[4] : 0u; /* Основной ввод */
 	uint32_t reserve_mv = (CHANNEL_VAL[0] > 0) ? (uint32_t)CHANNEL_VAL[0] : 0u; /* Резервный ввод */
-	uint8_t reserve_required = (PPKYConfig.power_input == 0u) ? 1u : 0u; /* 0 = используем оба ввода */
+	uint8_t reserve_required = (PPKYConfig.power_input == 2u) ? 1u : 0u; /* 2 = используем оба ввода */
 
-	if (main_mv < present_threshold_mv) {
+	if (App_PpkuInputFaultHyst(main_mv, (uint8_t)(s_ppku_input_fault_latched & 0x01u),
+				   low_enter_mv, high_enter_mv, low_exit_mv, high_exit_mv) != 0u) {
 		ppku_input_fault_mask |= 0x01u; /* ПИТАНИЕ 1 */
 	}
-	if (reserve_required && reserve_mv < present_threshold_mv) {
-		ppku_input_fault_mask |= 0x02u; /* ПИТАНИЕ 2 */
+	if (reserve_required) {
+		if (App_PpkuInputFaultHyst(reserve_mv, (uint8_t)((s_ppku_input_fault_latched >> 1) & 0x01u),
+					   low_enter_mv, high_enter_mv, low_exit_mv, high_exit_mv) != 0u) {
+			ppku_input_fault_mask |= 0x02u; /* ПИТАНИЕ 2 */
+		}
+	} else {
+		/* Резерв не используется — не удерживаем старую ошибку канала 2. */
+		ppku_input_fault_mask &= (uint8_t)~0x02u;
 	}
+	s_ppku_input_fault_latched = ppku_input_fault_mask;
 
 	for (uint8_t i = 0u; i < POWER_NUM_CHANNELS; i++) {
 		if (Power[i] != nullptr && Power[i]->IsError()) {
 			power_fault_mask |= (uint8_t)(1u << i);
 		}
 	}
-	if (power_fault_mask > prev_power_fault_mask) {
-		Led_ForceStatusBright(LED_ERR);
-	}
-	prev_power_fault_mask = power_fault_mask;
 	Warning_SetPowerFaultMask(power_fault_mask);
 	Warning_SetPpkuInputFaultMask(ppku_input_fault_mask);
 
-	/* При отсутствии основного ввода индикатор питания должен гаснуть. */
-	Led_Set(LED_POWER, ((ppku_input_fault_mask & 0x01u) != 2u) ? 0u : 1u);
+	if (ppku_input_fault_mask != 0u) {
+		led_power_is_toogle = 1;
+	} else {
+		Led_Set(LED_POWER, 1);
+		led_power_toogle_cnt = LED_POWER_TOOGLE_PERIOD_MS;
+		led_power_is_toogle = 0;
+	}
 
-	uint8_t has_fault = (power_fault_mask != 0u || ppku_input_fault_mask != 0u) ? 1u : Warning_HasActiveFault();
-	Led_Set(LED_ERR, has_fault ? 1u : 0u);
+	if (led_power_is_toogle) {
+		if (led_power_toogle_cnt) {
+			if (led_power_toogle_cnt == (LED_POWER_TOOGLE_PERIOD_MS / 2)) {
+				Led_Set(LED_POWER, 1);
+			}
+			led_power_toogle_cnt--;
+		} else {
+			Led_Set(LED_POWER, 0);
+			led_power_toogle_cnt = LED_POWER_TOOGLE_PERIOD_MS;
+		}
+	}
+
+	/* LED_ERR — только неисправность (WarningProcess1ms). ВНИМАНИЕ — на LED_FIRE. */
+	uint8_t has_fault = (power_fault_mask != 0u || ppku_input_fault_mask != 0u) ? 1u :
+			    (Warning_HasActiveFault() || Warning_HasActiveAttention()) ? 1u : 0u;
 	if (!has_fault && !Fire_IsActive()) {
 		Led_Set(LED_NORM, 1u);
 	} else {
@@ -1134,21 +1198,21 @@ void AppTimer1ms() {
 	uint32_t now = HAL_GetTick();
 	ConfigSync_Process1ms(now);
 	AppProcess(now);
-	RefreshActiveDevices(now);
-	CheckMkuConfigMismatch();
-	RelayAuto_Process();
-	App_UpdatePowerFaultIndication(now);
 	Fire_Timer1ms();
-
 	BackendProcess();
-	if(warning_process_delay)
+
+	/* Grace перед warning/relay/log: счётчик в мс остаётся здесь. */
+	if (warning_process_delay) {
 		warning_process_delay--;
-	else
-		WarningProcess1ms();
+	}
+
+	if (!MenuUi_IsConfigSessionActive()) {
+		CheckMkuConfigMismatch();
+	}
 
 	counter1s++;
 
-	if(counter1s >= 1000) {
+	if (counter1s >= 1000) {
 		counter1s = 0;
 		RtcCache_Tick1s();
 		AppSetStatus();
@@ -1158,6 +1222,7 @@ void AppTimer1ms() {
 
 void AppTimer10ms() {
 	uint32_t now = HAL_GetTick();
+
 	/* Чтение кнопок делаем реже, чтобы не перегружать I2C.
 	 * Теперь Button_Process вызывается раз в ~с (при шаге AppTimer10ms ~10 мс). */
 	static uint8_t button_acc = 0;
@@ -1166,17 +1231,34 @@ void AppTimer10ms() {
 		button_acc = 0;
 		Button_Process();
 	}
+
+	ConfigIgnBlockSync_Process1ms(now);
+	if (!MenuUi_IsConfigSessionActive()) {
+		ConfigMonitor_Process1ms(now);
+		Position_EvaluateMismatch(now);
+		g_position_fault_mask = Position_GetFaultMask();
+	}
+	RefreshActiveDevices(now);
+	if (!MenuUi_IsConfigSessionActive()) {
+		Warning_SetMkuPositionFaultMask(g_position_fault_mask);
+	}
+	App_UpdatePowerFaultIndication(now);
 	EventLog_ProcessTelemetrySample(now);
 	EspManager_Process(now);
-	LogTransport_Process();
+	MenuConfig_Process1ms(now);
+
+	if (warning_process_delay == 0) {
+		WarningProcess1ms();
+		RelayAuto_Process();
+		if (PPKYConfig.rs485_on != 0u) {
+			LogTransport_Process();
+		}
+	}
+
 	Fire_Timer10ms();
 	Beeper_Process();
 	Led_Process();
 	RsPanelMaster_Process10ms(&g_rs_panel_master, HAL_GetTick());
-	//for(uint8_t i = 0; i < 2; i++) {
-	//st[i] = Power[i]->PControlGetST(i);
-	//}
-
 }
 
 

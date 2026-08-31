@@ -26,6 +26,8 @@ void ConfigSync_StartReadMcuUid(const Device *dev);
 void ConfigSync_StartIgnBlockSync(void);
 
 uint8_t ConfigSync_IsBusy(void);
+/** Прогресс APPLY ко всем МКУ, 0..100. Вне APPLY — 0. */
+uint8_t ConfigSync_GetApplyPercent(void);
 
 #ifdef __cplusplus
 }

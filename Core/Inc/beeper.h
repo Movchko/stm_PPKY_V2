@@ -108,6 +108,7 @@ void Beeper_ButtonAcknowledge(void);
  * После завершения восстанавливает фоновый паттерн, если был.
  */
 void Beeper_PlayIndicationTest(void);
+void Beeper_PlayConfigSuccess(void);
 
 /**
  * @brief Функция установки параметра звука ВКЛ/ВЫКЛ

@@ -40,6 +40,8 @@
 /* Период синхронизации LED-состояний в I2C, в тиках Led_Process (10 мс) */
 #define LED_I2C_SYNC_PERIOD_TICKS   5u     /* 50 мс */
 
+#define LED_POWER_TOOGLE_PERIOD_MS 2000
+
 #ifdef __cplusplus
 extern "C" {
 #endif

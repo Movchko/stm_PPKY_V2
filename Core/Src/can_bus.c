@@ -10,6 +10,9 @@
 #include "can_bus.h"
 #include "main.h"
 #include "backend.h"
+#include "device_config.h"
+#include "service.h"
+#include "tick_time.h"
 #include "esp_manager.h"
 #include "esp_protocol.h"
 #include "log_transport.h"
@@ -124,6 +127,25 @@ typedef struct {
 } PositionRxInfo;
 
 static PositionRxInfo g_position_rx[POSITION_MAX_HADR + 1u];
+
+typedef struct {
+	uint32_t phase_since_ms;
+	uint32_t snap_can1_ms;
+	uint32_t snap_can2_ms;
+	uint8_t rx_can1_cnt;
+	uint8_t rx_can2_cnt;
+	uint8_t latched;
+} PositionFaultDebounce;
+
+static PositionFaultDebounce g_position_debounce[POSITION_MAX_HADR + 1u];
+static uint32_t g_position_fault_mask = 0u;
+
+#define POSITION_FAULT_CONFIRM_MS 3000u
+#define POSITION_FAULT_CONFIRM_RX 3u
+#define POSITION_FAULT_CLEAR_MS 1000u
+#define POSITION_FAULT_CLEAR_RX 2u
+
+extern struct PPKYCfg PPKYConfig;
 
 static void PositionRx_StoreWeight(uint8_t h_adr, uint8_t weight, uint8_t can_bus, uint32_t now_ms)
 {
@@ -762,6 +784,240 @@ void App_PositionRxFromCan(uint32_t msg_id, const uint8_t *msg_data, uint8_t can
 	}
 
 	PositionRx_StoreWeight(h_adr, msg_data[1], can_bus, now_ms);
+}
+
+static uint8_t Position_RxReady(const PositionRxInfo *rx, uint8_t can1_ok, uint8_t can2_ok, uint32_t now_ms)
+{
+	if (can1_ok && can2_ok) {
+		return (rx->has_can1 != 0u && rx->has_can2 != 0u &&
+			TickAgeWithinMs(now_ms, rx->last_can1_ms, POSITION_RX_TIMEOUT_MS) != 0u &&
+			TickAgeWithinMs(now_ms, rx->last_can2_ms, POSITION_RX_TIMEOUT_MS) != 0u) ? 1u : 0u;
+	}
+	if (can1_ok) {
+		return (rx->has_can1 != 0u &&
+			TickAgeWithinMs(now_ms, rx->last_can1_ms, POSITION_RX_TIMEOUT_MS) != 0u) ? 1u : 0u;
+	}
+	if (can2_ok) {
+		return (rx->has_can2 != 0u &&
+			TickAgeWithinMs(now_ms, rx->last_can2_ms, POSITION_RX_TIMEOUT_MS) != 0u) ? 1u : 0u;
+	}
+	return 0u;
+}
+
+static uint8_t Position_WeightsMatch(const PositionRxInfo *rx, uint8_t exp_a, uint8_t exp_b,
+				     uint8_t can1_ok, uint8_t can2_ok)
+{
+	if (can1_ok && can2_ok) {
+		return (rx->w_can1 == exp_a && rx->w_can2 == exp_b) ? 1u : 0u;
+	}
+	if (can1_ok) {
+		return (rx->w_can1 == exp_a) ? 1u : 0u;
+	}
+	if (can2_ok) {
+		return (rx->w_can2 == exp_b) ? 1u : 0u;
+	}
+	return 0u;
+}
+
+static uint8_t Position_IsOnlineMcuByHadr(uint8_t h_adr)
+{
+	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
+		const ActiveDeviceInfo *m = &g_active_devices[i];
+		if (!m->online) {
+			continue;
+		}
+		if (!IsMcuDType(m->dev.d_type)) {
+			continue;
+		}
+		if (m->dev.h_adr == h_adr) {
+			return 1u;
+		}
+	}
+	return 0u;
+}
+
+static uint8_t Position_CollectConfiguredHadr(uint8_t *out, uint8_t max_out)
+{
+	uint8_t n = 0u;
+	for (uint8_t i = 0u; i < 32u && n < max_out; i++) {
+		const Device *dv = &PPKYConfig.CfgDevices[i].UId.devId;
+		uint8_t d_type = (uint8_t)(dv->d_type & 0x7Fu);
+		if (!IsMcuDType(d_type)) {
+			continue;
+		}
+		uint8_t h_adr = (uint8_t)dv->h_adr;
+		if (h_adr == 0u || h_adr > POSITION_MAX_HADR) {
+			continue;
+		}
+		uint8_t exists = 0u;
+		for (uint8_t j = 0u; j < n; j++) {
+			if (out[j] == h_adr) {
+				exists = 1u;
+				break;
+			}
+		}
+		if (!exists) {
+			out[n++] = h_adr;
+		}
+	}
+	return n;
+}
+
+static uint8_t Position_IsCan1Healthy(void)
+{
+	return ((can_bus_error_flags & 0x01u) == 0u) ? 1u : 0u;
+}
+
+static uint8_t Position_IsCan2Healthy(void)
+{
+	return ((can_bus_error_flags & 0x02u) == 0u) ? 1u : 0u;
+}
+
+static void PositionDebounce_ResetPhase(PositionFaultDebounce *db)
+{
+	db->phase_since_ms = 0u;
+	db->rx_can1_cnt = 0u;
+	db->rx_can2_cnt = 0u;
+	db->snap_can1_ms = 0u;
+	db->snap_can2_ms = 0u;
+}
+
+static void PositionDebounce_StartPhase(PositionFaultDebounce *db, const PositionRxInfo *rx,
+					uint32_t now_ms, uint8_t can1_ok, uint8_t can2_ok)
+{
+	db->phase_since_ms = now_ms;
+	db->rx_can1_cnt = (can1_ok && rx->has_can1 != 0u) ? 1u : 0u;
+	db->rx_can2_cnt = (can2_ok && rx->has_can2 != 0u) ? 1u : 0u;
+	db->snap_can1_ms = rx->last_can1_ms;
+	db->snap_can2_ms = rx->last_can2_ms;
+}
+
+static void PositionDebounce_CountNewRx(PositionFaultDebounce *db, const PositionRxInfo *rx,
+					uint8_t can1_ok, uint8_t can2_ok)
+{
+	if (can1_ok && rx->has_can1 != 0u && rx->last_can1_ms != db->snap_can1_ms) {
+		db->snap_can1_ms = rx->last_can1_ms;
+		if (db->rx_can1_cnt < 255u) {
+			db->rx_can1_cnt++;
+		}
+	}
+	if (can2_ok && rx->has_can2 != 0u && rx->last_can2_ms != db->snap_can2_ms) {
+		db->snap_can2_ms = rx->last_can2_ms;
+		if (db->rx_can2_cnt < 255u) {
+			db->rx_can2_cnt++;
+		}
+	}
+}
+
+static uint8_t PositionDebounce_RxEnough(const PositionFaultDebounce *db, uint8_t can1_ok,
+					 uint8_t can2_ok, uint8_t need)
+{
+	if (can1_ok && can2_ok) {
+		return (db->rx_can1_cnt >= need && db->rx_can2_cnt >= need) ? 1u : 0u;
+	}
+	if (can1_ok) {
+		return (db->rx_can1_cnt >= need) ? 1u : 0u;
+	}
+	if (can2_ok) {
+		return (db->rx_can2_cnt >= need) ? 1u : 0u;
+	}
+	return 0u;
+}
+
+static uint8_t PositionDebounce_PhaseDone(const PositionFaultDebounce *db, uint32_t now_ms,
+					 uint32_t need_ms, uint8_t can1_ok, uint8_t can2_ok,
+					 uint8_t need_rx)
+{
+	if (db->phase_since_ms == 0u) {
+		return 0u;
+	}
+	if (!TickAgeExpiredMs(now_ms, db->phase_since_ms, need_ms)) {
+		return 0u;
+	}
+	return PositionDebounce_RxEnough(db, can1_ok, can2_ok, need_rx);
+}
+
+void Position_EvaluateMismatch(uint32_t now_ms)
+{
+	uint8_t hadrs[POSITION_MAX_HADR];
+	uint8_t n = Position_CollectConfiguredHadr(hadrs, POSITION_MAX_HADR);
+	uint8_t can1_ok = Position_IsCan1Healthy();
+	uint8_t can2_ok = Position_IsCan2Healthy();
+	uint32_t new_mask = 0u;
+
+	if (n == 0u || (!can1_ok && !can2_ok)) {
+		memset(g_position_debounce, 0, sizeof(g_position_debounce));
+		g_position_fault_mask = 0u;
+		return;
+	}
+
+	for (uint8_t i = 0u; i < n; i++) {
+		uint8_t h_adr = hadrs[i];
+		PositionFaultDebounce *db = &g_position_debounce[h_adr];
+
+		if (!Position_IsOnlineMcuByHadr(h_adr)) {
+			PositionDebounce_ResetPhase(db);
+			db->latched = 0u;
+			continue;
+		}
+
+		const PositionRxInfo *rx = &g_position_rx[h_adr];
+		if (!Position_RxReady(rx, can1_ok, can2_ok, now_ms)) {
+			if (db->latched != 0u) {
+				new_mask |= (1u << (h_adr - 1u));
+			}
+			continue;
+		}
+
+		uint8_t exp_a = i;
+		uint8_t exp_b = (uint8_t)(n - 1u - i);
+		uint8_t match = Position_WeightsMatch(rx, exp_a, exp_b, can1_ok, can2_ok);
+
+		if (match == 0u) {
+			if (db->latched == 0u) {
+				if (db->phase_since_ms == 0u) {
+					PositionDebounce_StartPhase(db, rx, now_ms, can1_ok, can2_ok);
+				} else {
+					PositionDebounce_CountNewRx(db, rx, can1_ok, can2_ok);
+				}
+				if (PositionDebounce_PhaseDone(db, now_ms, POSITION_FAULT_CONFIRM_MS,
+							       can1_ok, can2_ok,
+							       POSITION_FAULT_CONFIRM_RX) != 0u) {
+					db->latched = 1u;
+					PositionDebounce_ResetPhase(db);
+				}
+			} else {
+				PositionDebounce_ResetPhase(db);
+			}
+		} else {
+			if (db->latched != 0u) {
+				if (db->phase_since_ms == 0u) {
+					PositionDebounce_StartPhase(db, rx, now_ms, can1_ok, can2_ok);
+				} else {
+					PositionDebounce_CountNewRx(db, rx, can1_ok, can2_ok);
+				}
+				if (PositionDebounce_PhaseDone(db, now_ms, POSITION_FAULT_CLEAR_MS,
+							       can1_ok, can2_ok,
+							       POSITION_FAULT_CLEAR_RX) != 0u) {
+					db->latched = 0u;
+					PositionDebounce_ResetPhase(db);
+				}
+			} else {
+				PositionDebounce_ResetPhase(db);
+			}
+		}
+
+		if (db->latched != 0u) {
+			new_mask |= (1u << (h_adr - 1u));
+		}
+	}
+
+	g_position_fault_mask = new_mask;
+}
+
+uint32_t Position_GetFaultMask(void)
+{
+	return g_position_fault_mask;
 }
 
 void App_CanTxProcess(void)

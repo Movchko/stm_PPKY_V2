@@ -312,6 +312,31 @@ void Beeper_ButtonAcknowledge(void)
 	Beeper_ShortBeep();
 }
 
+void Beeper_PlayConfigSuccess(void)
+{
+	uint8_t i;
+	const uint8_t saved_mute = beep_sound;
+
+	if (!Beeper_IsOneShotState(beeper_state)) {
+		Beeper_CaptureResumeStateIfNeeded();
+	}
+	beep_sound = 1u;
+	beeper_state = BEEPER_STATE_IDLE;
+	Beeper_Off();
+
+	for (i = 0u; i < SOUND_CFG_SUCCESS_PULSES; i++) {
+		HAL_GPIO_WritePin(SOUND_GPIO_Port, SOUND_Pin, GPIO_PIN_SET);
+		HAL_Delay(SOUND_CFG_SUCCESS_ON_MS);
+		HAL_GPIO_WritePin(SOUND_GPIO_Port, SOUND_Pin, GPIO_PIN_RESET);
+		if ((uint8_t)(i + 1u) < SOUND_CFG_SUCCESS_PULSES) {
+			HAL_Delay(SOUND_CFG_SUCCESS_OFF_MS);
+		}
+	}
+
+	beep_sound = saved_mute;
+	Beeper_RestoreAfterOneShot();
+}
+
 /**
  * @brief Функция обработки состояния пищалки (вызывать каждые 10мс)
  * @note Должна вызываться из таймера или основного цикла с периодом 10мс

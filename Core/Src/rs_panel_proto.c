@@ -479,28 +479,22 @@ static void rs_panel_master_send_zone_mode_list_to_ready_panels(RsPanelMaster *m
                                                  pos);
 }
 
-static void rs_panel_master_maybe_enable_wifi(void)
-{
-    if (PPKYConfig.wifi_block != 0u || g_connection_selected != 0u) {
-        return;
-    }
-    EspManager_RequestWifiEnable();
-}
-
 static void rs_panel_master_send_connection_status_to_ready_panels(RsPanelMaster *master)
 {
     if (master == 0u) {
         return;
     }
 
-    /* [selected][wifi_block][esp_en][online][host][session] */
-    uint8_t payload[6u];
+    /* [selected][wifi_block][esp_en][online][host][session][wifi_on][rs485_on] */
+    uint8_t payload[8u];
     payload[0] = g_connection_selected;
     payload[1] = (PPKYConfig.wifi_block != 0u) ? 1u : 0u;
     payload[2] = (Esp32_IsEnabled() != 0u) ? 1u : 0u;
     payload[3] = (EspManager_IsOnline() != 0u) ? 1u : 0u;
     payload[4] = (EspManager_IsHostConnected() != 0u) ? 1u : 0u;
     payload[5] = (EspManager_IsWifiSessionActive() != 0u) ? 1u : 0u;
+    payload[6] = (EspManager_IsUserWifiOn() != 0u) ? 1u : 0u;
+    payload[7] = (PPKYConfig.rs485_on != 0u) ? 1u : 0u;
     rs_panel_master_send_ui_data_to_ready_panels(master,
                                                  RS_PANEL_UI_DATA_CONNECTION_STATUS,
                                                  payload,
@@ -1246,7 +1240,6 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                     g_connection_selected = 1u; /* только RS-485 */
                 } else {
                     g_connection_selected = (evt->p1 == 0u) ? 0u : 1u;
-                    rs_panel_master_maybe_enable_wifi();
                 }
                 rs_panel_master_send_connection_status_to_ready_panels(master);
                 break;
@@ -1284,6 +1277,8 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             if (g_ui_current_screen_id == RS_PANEL_SCREEN_MAIN) {
                 /* ENTER на главном экране → открыть MENU_ROOT и отправить MENU_LIST */
                 g_menu_selected = 0u;
+                MenuUi_SetMenuSelected(0u);
+                MenuUi_ResetMenuIndex();
 #if GOST_MODE
                 g_menu_n_items = 6u;
 #else
@@ -1325,17 +1320,21 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             }
 
             if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_CONNECTION) {
-                if (g_connection_selected == 0u && PPKYConfig.wifi_block != 0u) {
-                    rs_panel_master_send_connection_status_to_ready_panels(master);
-                    break;
+                if (g_connection_selected == 0u) {
+                    if (PPKYConfig.wifi_block != 0u) {
+                        rs_panel_master_send_connection_status_to_ready_panels(master);
+                        break;
+                    }
+                    if (EspManager_IsUserWifiOn() != 0u) {
+                        EspManager_RequestWifiDisable();
+                    } else {
+                        EspManager_RequestWifiEnable();
+                    }
+                } else {
+                    PPKYConfig.rs485_on = (PPKYConfig.rs485_on == 0u) ? 1u : 0u;
+                    SaveConfig();
                 }
-                MenuUi_SetConfigSession(1u);
-                MenuConfig_Reset();
-                rs_panel_master_maybe_enable_wifi();
-                rs_panel_master_send_ui_nav_to_ready_panels(master,
-                                                            RS_PANEL_SCREEN_MENU_CONFIG,
-                                                            RS_PANEL_UI_ACTION_REPLACE);
-                rs_panel_master_send_config_status_to_ready_panels(master);
+                rs_panel_master_send_connection_status_to_ready_panels(master);
                 break;
             }
 
@@ -1476,10 +1475,9 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                 } break;
 
                 case 2u: {
-                    /* СВЯЗЬ: WiFi только при выборе пункта WIFI (не wifi_block). */
+                    /* СВЯЗЬ */
                     g_journal_detail_open = 0u;
                     g_connection_selected = (PPKYConfig.wifi_block != 0u) ? 1u : 0u;
-                    rs_panel_master_maybe_enable_wifi();
                     rs_panel_master_send_ui_nav_to_ready_panels(master,
                                                                 RS_PANEL_SCREEN_MENU_CONNECTION,
                                                                 RS_PANEL_UI_ACTION_REPLACE);
@@ -2119,7 +2117,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         return;
     }
 
-    if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_CONFIG) {
+    if (MenuUi_IsConfigSessionActive()) {
         rs_panel_master_send_config_status_to_ready_panels(master);
     }
     {
