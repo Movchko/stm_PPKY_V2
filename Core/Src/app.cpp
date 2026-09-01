@@ -96,14 +96,15 @@ extern "C" __attribute__((weak)) void App_OnFireUiUpdate(uint8_t active, uint8_t
 	(void)zone_names;
 }
 
-extern "C" __attribute__((weak)) void App_OnWarningUiUpdate(uint8_t active, uint8_t n_items,
-								 char (*big_titles)[WARNING_TITLE_LEN],
-								 char (*details)[ZONE_NAME_SIZE + 1])
+extern "C" __attribute__((weak)) uint8_t App_OnWarningUiUpdate(uint8_t active, uint8_t n_items,
+								      char (*big_titles)[WARNING_TITLE_LEN],
+								      char (*details)[ZONE_NAME_SIZE + 1])
 {
 	(void)active;
 	(void)n_items;
 	(void)big_titles;
 	(void)details;
+	return 0u;
 }
 
 RTC_TimeTypeDef cur_time = {0};
@@ -1351,10 +1352,10 @@ extern "C" void Fire_UiUpdate(uint8_t active, uint8_t mode, uint8_t remaining_s,
 	App_OnFireUiUpdate(active, mode, remaining_s, n_zones, zone_names);
 }
 
-extern "C" void Warning_UiUpdate(uint8_t active, uint8_t n_items,
-				 char (*big_titles)[WARNING_TITLE_LEN],
-				 char (*details)[ZONE_NAME_SIZE + 1]) {
-	App_OnWarningUiUpdate(active, n_items, big_titles, details);
+extern "C" uint8_t Warning_UiUpdate(uint8_t active, uint8_t n_items,
+				    char (*big_titles)[WARNING_TITLE_LEN],
+				    char (*details)[ZONE_NAME_SIZE + 1]) {
+	return App_OnWarningUiUpdate(active, n_items, big_titles, details);
 }
 
 

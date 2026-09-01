@@ -16,7 +16,7 @@ typedef struct {
     uint16_t de_pin;
     RsBusFrameHandler handler;
     void *handler_ctx;
-    uint8_t rx_dma_buf[64];
+    uint8_t rx_dma_buf[RS_BUS_RX_DMA_SIZE];
     uint8_t rx_buf[RS_BUS_MAX_FRAME_SIZE];
     uint16_t rx_len;
 } RsBusContext;

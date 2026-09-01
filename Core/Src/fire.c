@@ -3664,3 +3664,11 @@ void Fire_NotifyZoneModeChanged(void)
 		Led_ForceStatusBright(LED_AUTO_OFF);
 	}
 }
+
+void Fire_ForceUiResync(void)
+{
+	g_fire.last_ui_active = 0xFFu;
+	g_fire.last_ui_mode = 0xFFu;
+	g_fire.last_ui_remaining = 0xFFu;
+	g_fire.last_ui_nzones = 0xFFu;
+}

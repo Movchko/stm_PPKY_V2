@@ -51,6 +51,9 @@ void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index);
 /* Смена zone_fire_mode[] (меню РЕЖИМ ЗОН) - обновить LED_AUTO_OFF. */
 void Fire_NotifyZoneModeChanged(void);
 
+/* Сбросить кэш UI пожара; следующий Fire_Timer10ms переотправит на панели. */
+void Fire_ForceUiResync(void);
+
 #ifdef __cplusplus
 }
 #endif

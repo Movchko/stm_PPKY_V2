@@ -1,4 +1,5 @@
 #include "rs_panel_proto.h"
+#include "rs_panel_master_debug.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include "led.h"
 #include "beeper.h"
 #include "warning.h"
+#include "fire.h"
 
 extern PPKYCfg PPKYConfig;
 extern void SaveConfig(void);
@@ -34,7 +36,11 @@ static uint8_t g_journal_detail_open = 0u;
 /* UI session state:
  * panel tells events via RSP_POLL.ui_events, master keeps which screen is active
  * (based on the last UI_NAV we sent). */
-static uint16_t g_ui_current_screen_id = RS_PANEL_SCREEN_MAIN;
+static uint16_t g_ui_current_screen_id = RS_PANEL_SCREEN_LOGO;
+/* Как в stm_PPKY v1 / панели: 400 тиков TouchGFX × GFX_RATIO_MS (10 мс) = 4000 мс. */
+#define RS_PANEL_LOGO_MAIN_DELAY_MS 4000u
+static uint32_t s_logo_main_nav_deadline_ms = 0u;
+static uint8_t s_panel_ui_resync_pending = 0u;
 
 static uint16_t g_menu_selected = 0u;
 #if GOST_MODE
@@ -43,6 +49,9 @@ static uint8_t g_menu_n_items = 6u;
 static uint8_t g_menu_n_items = 7u;
 #endif
 static uint8_t g_device_selected_slot = 0xFFu;
+
+#define RS_PANEL_CAPS_RETRY_MS 50u
+static uint32_t s_last_caps_req_ms = 0u;
 static uint8_t g_block_zone_selected = 0u;
 static uint8_t g_connection_selected = 0u;
 
@@ -126,7 +135,7 @@ static void rs_panel_master_send_stream_to_panel(RsPanelMaster *master,
         return;
     }
 
-    if (force_frag == 0u && stream_len <= RS_BUS_MAX_PAYLOAD) {
+    if (force_frag == 0u && stream_len <= RS_BUS_MAX_WIRE_PAYLOAD) {
         uint8_t seq = master->next_seq++;
         uint8_t flags = request_ack ? RS_BUS_FLAG_ACK_REQ : 0u;
         (void)RsBus_SendFrame(&master->bus,
@@ -149,7 +158,7 @@ static void rs_panel_master_send_stream_to_panel(RsPanelMaster *master,
 
     {
         uint8_t frag_id = g_rs_frag_id++;
-        uint16_t frag_data_capacity = (uint16_t)(RS_BUS_MAX_PAYLOAD - 3u);
+        uint16_t frag_data_capacity = (uint16_t)(RS_BUS_MAX_WIRE_PAYLOAD - 3u);
         uint8_t frag_total = (uint8_t)((stream_len + frag_data_capacity - 1u) / frag_data_capacity);
         uint16_t stream_off = 0u;
         uint8_t last_seq = 0u;
@@ -234,8 +243,22 @@ static void rs_panel_master_send_ui_nav_to_ready_panels(RsPanelMaster *master,
     }
 }
 
+/* Не шлём UI_NAV на MAIN, если мастер уже считает экран главным — иначе панель
+ * каждый раз переинициализирует mainscreen (мигает время и баннеры).
+ * Пока идёт логотип — не перебиваем его NAV. */
+static void rs_panel_master_ensure_main_screen(RsPanelMaster *master)
+{
+    if (master == 0u || s_logo_main_nav_deadline_ms != 0u ||
+        g_ui_current_screen_id == RS_PANEL_SCREEN_MAIN) {
+        return;
+    }
+    rs_panel_master_send_ui_nav_to_ready_panels(master,
+                                                RS_PANEL_SCREEN_MAIN,
+                                                RS_PANEL_UI_ACTION_REPLACE);
+}
+
 /* forward decl: используется внутри MENU_LIST */
-static void rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *master,
+static uint8_t rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *master,
                                                            uint8_t sub_id,
                                                            const uint8_t *data,
                                                            uint16_t data_len);
@@ -516,18 +539,24 @@ static void rs_panel_master_send_config_status_to_ready_panels(RsPanelMaster *ma
                                                  sizeof(payload));
 }
 
-static void rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *master,
+static uint8_t rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *master,
                                                            uint8_t sub_id,
                                                            const uint8_t *data,
                                                            uint16_t data_len)
 {
+    uint8_t delivered = 0u;
+
     if (master == 0u || data == 0u || data_len == 0u) {
-        return;
+        return 0u;
     }
 
     for (uint8_t i = 0u; i < master->panel_count; i++) {
         PanelState *panel = &master->panels[i];
         if (panel->cfg.enabled == 0u || PanelState_IsReady(panel) == 0u) {
+            continue;
+        }
+        /* Не слать WARN/FIRE поверх кадра, который ещё ждёт ACK — иначе CRC на панели. */
+        if (panel->ack_wait_active != 0u) {
             continue;
         }
 
@@ -550,7 +579,10 @@ static void rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *master,
                                              stream_len,
                                              force_frag,
                                              request_ack);
+        delivered = 1u;
     }
+
+    return delivered;
 }
 
 static uint8_t rs_panel_master_pick_common_journal_lines(const RsPanelMaster *master)
@@ -994,6 +1026,19 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
     }
 }
 
+static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
+{
+    if (master == 0u) {
+        return;
+    }
+
+    g_ui_current_screen_id = RS_PANEL_SCREEN_LOGO;
+    s_logo_main_nav_deadline_ms = HAL_GetTick() + RS_PANEL_LOGO_MAIN_DELAY_MS;
+    s_panel_ui_resync_pending = 1u;
+    /* UI_NAV/WARN/FIRE не из обработчика RX CAPS: UART half-duplex, плюс логотип
+     * на панели сам переходит на MAIN через 400 тиков. Снимок отправим после лого. */
+}
+
 void App_OnFireUiUpdate(uint8_t active,
                           uint8_t mode,
                           uint8_t remaining_s,
@@ -1043,7 +1088,7 @@ void App_OnFireUiUpdate(uint8_t active,
     }
 
     /* Как в stm_PPKY v1: если пришёл пожар — принудительно переводим UI панелей на MAIN. */
-    rs_panel_master_send_ui_nav_to_ready_panels(master, RS_PANEL_SCREEN_MAIN, RS_PANEL_UI_ACTION_REPLACE);
+    rs_panel_master_ensure_main_screen(master);
     rs_panel_master_send_ui_data_to_ready_panels(master, RS_PANEL_UI_DATA_MAIN_FIRE, ui_payload, pos);
 
     rs_panel_master_send_leds_to_ready_panels(master);
@@ -1053,14 +1098,16 @@ void App_OnFireUiUpdate(uint8_t active,
     rs_panel_master_send_journal_list_to_ready_panels(master);
 }
 
-void App_OnWarningUiUpdate(uint8_t active,
+uint8_t App_OnWarningUiUpdate(uint8_t active,
                             uint8_t n_items,
                             char (*big_titles)[WARNING_TITLE_LEN],
                             char (*details)[ZONE_NAME_SIZE + 1])
 {
     RsPanelMaster *master = g_active_master;
+    uint8_t delivered;
+
     if (master == 0u || big_titles == 0u || details == 0u) {
-        return;
+        return 0u;
     }
 
     if (n_items > 4u) {
@@ -1077,15 +1124,16 @@ void App_OnWarningUiUpdate(uint8_t active,
     ui_payload[pos++] = 0u; /* ver */
     ui_payload[pos++] = 0u; /* crc16 lo */
     ui_payload[pos++] = 0u; /* crc16 hi */
-    ui_payload[pos++] = n_items;
+    pos++; /* n_items: заполним после упаковки */
+    uint8_t packed_items = 0u;
 
     for (uint8_t i = 0u; i < n_items; i++) {
         uint8_t title_len = (uint8_t)strnlen(big_titles[i], 23u);
-        uint8_t detail_len = (uint8_t)strnlen(details[i], ZONE_NAME_SIZE);
+        /* Detail режем, чтобы весь WARN (sub_id + payload) влез в 1 кадр ≤251 байт. */
+        uint8_t detail_len = (uint8_t)strnlen(details[i], 32u);
 
-        /* Не выходим за RS_BUS_MAX_PAYLOAD. */
         uint16_t need = (uint16_t)(1u /*flags*/ + 1u + title_len + 1u + detail_len);
-        if ((uint16_t)(pos + need) > RS_BUS_MAX_PAYLOAD) {
+        if ((uint16_t)(pos + need) > (uint16_t)(RS_BUS_MAX_WIRE_PAYLOAD - 1u)) {
             break;
         }
 
@@ -1101,16 +1149,27 @@ void App_OnWarningUiUpdate(uint8_t active,
             memcpy(&ui_payload[pos], details[i], detail_len);
             pos = (uint16_t)(pos + detail_len);
         }
+        packed_items++;
+    }
+    ui_payload[4] = packed_items;
+
+    /* Как в stm_PPKY v1: если пришло warning — переводим на MAIN только если не там. */
+    rs_panel_master_ensure_main_screen(master);
+    delivered = rs_panel_master_send_ui_data_to_ready_panels(master,
+                                                             RS_PANEL_UI_DATA_MAIN_WARN,
+                                                             ui_payload,
+                                                             pos);
+    if (delivered == 0u) {
+        return 0u;
     }
 
-    /* Как в stm_PPKY v1: если пришло warning — принудительно переводим UI панелей на MAIN. */
-    rs_panel_master_send_ui_nav_to_ready_panels(master, RS_PANEL_SCREEN_MAIN, RS_PANEL_UI_ACTION_REPLACE);
-    rs_panel_master_send_ui_data_to_ready_panels(master, RS_PANEL_UI_DATA_MAIN_WARN, ui_payload, pos);
+    g_rs_master_dbg.warn_ui_tx++;
+    g_rs_master_dbg.last_warn_active = (active != 0u) ? 1u : 0u;
+    g_rs_master_dbg.last_warn_n_items = packed_items;
 
     rs_panel_master_send_leds_to_ready_panels(master);
     rs_panel_master_send_sound_to_ready_panels(master);
-
-    rs_panel_master_send_journal_list_to_ready_panels(master);
+    return 1u;
 }
 
 static uint16_t rs_put_u16le(uint8_t *dst, uint16_t value)
@@ -1961,9 +2020,14 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
     RsPanelMaster *master = (RsPanelMaster *)ctx;
     uint8_t i;
 
-    if (master == 0 || frame == 0 || (frame->flags & RS_BUS_FLAG_DIR) == 0u) {
+    if (master == 0 || frame == 0) {
         return;
     }
+    if ((frame->flags & RS_BUS_FLAG_DIR) == 0u) {
+        g_rs_master_dbg.rx_frames_wrong_dir++;
+        return;
+    }
+    g_rs_master_dbg.rx_frames_ok++;
 
     /* Прокидка в WiFi/ПО: activity + ответы boot-команд (тот же addr панели). */
     if (rs_panel_should_forward_to_host(frame) != 0u) {
@@ -1973,13 +2037,23 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
     for (i = 0u; i < master->panel_count; i++) {
         PanelState *panel = &master->panels[i];
         if (panel->cfg.addr != frame->addr) {
+            g_rs_master_dbg.rx_frames_wrong_addr++;
             continue;
         }
 
         if (frame->cmd == RS_PANEL_RSP_CAPS) {
             RsPanelCaps caps;
             if (RsPanel_DecodeCaps(frame->payload, frame->payload_len, &caps)) {
+                uint8_t was_ready = PanelState_IsReady(panel);
+                g_rs_master_dbg.rsp_caps_rx++;
                 PanelState_OnCaps(panel, &caps, HAL_GetTick());
+                g_rs_master_dbg.panel_caps_valid = panel->caps_valid;
+                g_rs_master_dbg.panel_link_state = (uint8_t)panel->link_state;
+                if (was_ready == 0u && PanelState_IsReady(panel) != 0u) {
+                    rs_panel_master_on_panel_became_ready(master);
+                }
+            } else {
+                g_rs_master_dbg.rsp_caps_decode_fail++;
             }
         } else if (frame->cmd == RS_PANEL_RSP_ACK) {
             uint8_t ack_seq = 0u;
@@ -1999,6 +2073,7 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
             }
         } else if (frame->cmd == RS_PANEL_RSP_POLL) {
             RsPanelPollRsp rsp;
+            g_rs_master_dbg.rsp_poll_rx++;
             if (RsPanel_DecodePollRsp(frame->payload, frame->payload_len, &rsp)) {
                 PanelState_OnPollRsp(panel, &rsp, HAL_GetTick());
                 rs_panel_master_handle_ui_events(master, panel, &rsp);
@@ -2046,6 +2121,13 @@ void RsPanelMaster_Init(RsPanelMaster *master,
     g_active_master = master;
 }
 
+void RsPanelMaster_PushSound(void)
+{
+    if (g_active_master != 0) {
+        rs_panel_master_send_sound_to_ready_panels(g_active_master);
+    }
+}
+
 void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_t len)
 {
     if (master == 0) {
@@ -2065,6 +2147,45 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         return;
     }
 
+    RsPanelMasterDebug_Timer10ms();
+    g_rs_master_dbg.panel_caps_valid = master->panels[0].caps_valid;
+    g_rs_master_dbg.panel_link_state = (uint8_t)master->panels[0].link_state;
+
+    if (s_logo_main_nav_deadline_ms != 0u &&
+        PanelState_IsReady(&master->panels[0]) != 0u &&
+        (int32_t)(now_ms - s_logo_main_nav_deadline_ms) >= 0) {
+        s_logo_main_nav_deadline_ms = 0u;
+        /* Панель сама уходит с logo (400 тиков). Повторный UI_NAV сдвигает виджеты. */
+        g_ui_current_screen_id = RS_PANEL_SCREEN_MAIN;
+    }
+
+    if (s_panel_ui_resync_pending != 0u &&
+        PanelState_IsReady(&master->panels[0]) != 0u &&
+        s_logo_main_nav_deadline_ms == 0u &&
+        Warning_IsProcessDelayActive() == 0u &&
+        Warning_GetLastUiBuildCount() != 0u) {
+        s_panel_ui_resync_pending = 0u;
+        Warning_ResetPanelUiCache();
+        Warning_RepublishUiNow();
+        Fire_ForceUiResync();
+    }
+
+    /* Если панель READY, но кэш «отправлено» без реальной доставки — сброс раз в 1 с,
+     * следующий WarningProcess1ms переотправит через PushUiIfChanged. */
+    {
+        static uint32_t s_warn_cache_reset_ms = 0u;
+        if (PanelState_IsReady(&master->panels[0]) != 0u &&
+            Warning_IsProcessDelayActive() == 0u &&
+            Warning_GetLastUiBuildCount() != 0u) {
+            if (s_warn_cache_reset_ms == 0u || (now_ms - s_warn_cache_reset_ms) >= 1000u) {
+                s_warn_cache_reset_ms = now_ms;
+                Warning_ResetPanelUiCache();
+            }
+        } else {
+            s_warn_cache_reset_ms = 0u;
+        }
+    }
+
     panel = &master->panels[master->round_robin_idx % master->panel_count];
     master->round_robin_idx = (uint8_t)((master->round_robin_idx + 1u) % master->panel_count);
 
@@ -2078,6 +2199,11 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     }
 
     if (panel->link_state == PANEL_LINK_CAPS_PENDING || panel->caps_valid == 0u) {
+        if (s_last_caps_req_ms != 0u && (now_ms - s_last_caps_req_ms) < RS_PANEL_CAPS_RETRY_MS) {
+            return;
+        }
+        s_last_caps_req_ms = now_ms;
+        g_rs_master_dbg.caps_req_tx++;
         (void)RsBus_SendFrame(&master->bus,
                               panel->cfg.addr,
                               master->next_seq++,
@@ -2141,6 +2267,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
 
     panel->last_poll_ms = now_ms;
     panel->last_tx_seq = master->next_seq;
+    g_rs_master_dbg.poll_req_tx++;
     (void)RsBus_SendFrame(&master->bus,
                           panel->cfg.addr,
                           master->next_seq++,
@@ -2180,6 +2307,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
         return;
     }
 
+    RsPanelMasterDebug_OnRxDma(size);
     RsPanelMaster_OnRxBytes(g_active_master, g_active_master->bus.rx_dma_buf, size);
     (void)HAL_UARTEx_ReceiveToIdle_DMA(huart,
                                        g_active_master->bus.rx_dma_buf,

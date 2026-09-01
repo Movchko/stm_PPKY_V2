@@ -2,6 +2,39 @@
 
 #include <string.h>
 
+static void rs_bus_de_set(RsBusContext *ctx, GPIO_PinState level)
+{
+    if (ctx != 0 && ctx->de_port != 0) {
+        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, level);
+    }
+}
+
+static void rs_bus_wait_tx_complete(UART_HandleTypeDef *uart)
+{
+    uint32_t t0 = HAL_GetTick();
+
+    if (uart == 0) {
+        return;
+    }
+    while (__HAL_UART_GET_FLAG(uart, UART_FLAG_TC) == RESET) {
+        if ((HAL_GetTick() - t0) > 5u) {
+            break;
+        }
+    }
+}
+
+static void rs_bus_rx_arm(RsBusContext *ctx)
+{
+    if (ctx == 0 || ctx->uart == 0) {
+        return;
+    }
+    (void)HAL_UART_AbortReceive(ctx->uart);
+    (void)HAL_UARTEx_ReceiveToIdle_DMA(ctx->uart, ctx->rx_dma_buf, sizeof(ctx->rx_dma_buf));
+    if (ctx->uart->hdmarx != 0) {
+        __HAL_DMA_DISABLE_IT(ctx->uart->hdmarx, DMA_IT_HT);
+    }
+}
+
 uint16_t RsBus_Checksum16(const uint8_t *data, uint16_t len)
 {
     uint32_t sum = 0u;
@@ -31,7 +64,7 @@ uint16_t RsBus_FrameEncode(uint8_t *dst,
     uint16_t total_size;
     uint16_t crc;
 
-    if (dst == 0 || payload_len > RS_BUS_MAX_PAYLOAD) {
+    if (dst == 0 || payload_len > RS_BUS_MAX_WIRE_PAYLOAD) {
         return 0u;
     }
 
@@ -123,15 +156,8 @@ void RsBus_Init(RsBusContext *ctx,
     ctx->de_pin = de_pin;
     ctx->handler = handler;
     ctx->handler_ctx = handler_ctx;
-    if (ctx->de_port != 0) {
-        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
-    }
-    if (ctx->uart != 0) {
-        (void)HAL_UARTEx_ReceiveToIdle_DMA(ctx->uart, ctx->rx_dma_buf, sizeof(ctx->rx_dma_buf));
-        if (ctx->uart->hdmarx != 0) {
-            __HAL_DMA_DISABLE_IT(ctx->uart->hdmarx, DMA_IT_HT);
-        }
-    }
+    rs_bus_de_set(ctx, GPIO_PIN_RESET);
+    rs_bus_rx_arm(ctx);
 }
 
 void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len)
@@ -199,18 +225,17 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
         return HAL_ERROR;
     }
 
-    if (ctx->de_port != 0) {
-        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_SET);
-    }
+    (void)HAL_UART_AbortReceive(ctx->uart);
+    rs_bus_de_set(ctx, GPIO_PIN_SET);
     if (HAL_UART_Transmit(ctx->uart, frame, frame_len, 20u) != HAL_OK) {
-        if (ctx->de_port != 0) {
-            HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
-        }
+        rs_bus_wait_tx_complete(ctx->uart);
+        rs_bus_de_set(ctx, GPIO_PIN_RESET);
+        rs_bus_rx_arm(ctx);
         return HAL_ERROR;
     }
-    if (ctx->de_port != 0) {
-        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
-    }
+    rs_bus_wait_tx_complete(ctx->uart);
+    rs_bus_de_set(ctx, GPIO_PIN_RESET);
+    rs_bus_rx_arm(ctx);
     return HAL_OK;
 }
 
@@ -219,17 +244,16 @@ HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_
     if (ctx == 0 || ctx->uart == 0 || frame == 0 || frame_len == 0u) {
         return HAL_ERROR;
     }
-    if (ctx->de_port != 0) {
-        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_SET);
-    }
+    (void)HAL_UART_AbortReceive(ctx->uart);
+    rs_bus_de_set(ctx, GPIO_PIN_SET);
     if (HAL_UART_Transmit(ctx->uart, (uint8_t *)frame, frame_len, 50u) != HAL_OK) {
-        if (ctx->de_port != 0) {
-            HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
-        }
+        rs_bus_wait_tx_complete(ctx->uart);
+        rs_bus_de_set(ctx, GPIO_PIN_RESET);
+        rs_bus_rx_arm(ctx);
         return HAL_ERROR;
     }
-    if (ctx->de_port != 0) {
-        HAL_GPIO_WritePin(ctx->de_port, ctx->de_pin, GPIO_PIN_RESET);
-    }
+    rs_bus_wait_tx_complete(ctx->uart);
+    rs_bus_de_set(ctx, GPIO_PIN_RESET);
+    rs_bus_rx_arm(ctx);
     return HAL_OK;
 }

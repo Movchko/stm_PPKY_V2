@@ -164,8 +164,6 @@ void MenuConfig_Process1ms(uint32_t now_ms)
 	if (g_cfg_success_beep_done == 0u) {
 		Beeper_PlayConfigSuccess();
 		g_cfg_success_beep_done = 1u;
-		/* После блокирующего писка брать актуальный tick. */
-		now_ms = HAL_GetTick();
 	}
 	if (g_cfg_success_from_ms != 0u &&
 	    (int32_t)(now_ms - g_cfg_success_from_ms) >= (int32_t)MENU_CFG_SUCCESS_HOLD_MS) {

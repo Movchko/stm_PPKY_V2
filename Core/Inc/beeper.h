@@ -108,6 +108,9 @@ void Beeper_ButtonAcknowledge(void);
  * После завершения восстанавливает фоновый паттерн, если был.
  */
 void Beeper_PlayIndicationTest(void);
+/**
+ * @brief Успешная конфигурация: 4 импульса SOUND_CFG_SUCCESS_* на панелях (RS CMD_SOUND).
+ */
 void Beeper_PlayConfigSuccess(void);
 
 /**

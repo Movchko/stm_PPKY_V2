@@ -7,6 +7,7 @@
 
 #include "beeper.h"
 #include "main.h"
+#include "rs_panel_proto.h"
 
 /***********************************************************************************************************/
 /* Внутренние типы и переменные */
@@ -56,12 +57,20 @@ typedef struct
 } BeeperResumeCtx_t;
 
 static BeeperResumeCtx_t g_resume_ctx = {0};
+static uint8_t g_pattern_restore_mute = 0u;
+static uint8_t g_pattern_saved_mute = 0u;
 
 static uint16_t Beeper_MsToTicks(uint16_t duration_ms)
 {
 	uint16_t ticks = (uint16_t)((duration_ms + 9u) / 10u);
 	return (ticks == 0u) ? 1u : ticks;
 }
+
+static void Beeper_StartPulseTrainOverlay(uint16_t pulse_on_ms,
+                                          uint16_t pulse_off_ms,
+                                          uint8_t pulses,
+                                          uint16_t repeat_period_ms,
+                                          uint8_t overlay);
 
 /***********************************************************************************************************/
 /* Внутренние функции */
@@ -290,11 +299,22 @@ void Beeper_PlayOneShotMs(uint16_t duration_ms)
 
 void Beeper_StartPulseTrain(uint16_t pulse_on_ms, uint16_t pulse_off_ms, uint8_t pulses, uint16_t repeat_period_ms)
 {
+	Beeper_StartPulseTrainOverlay(pulse_on_ms, pulse_off_ms, pulses, repeat_period_ms, 0u);
+}
+
+static void Beeper_StartPulseTrainOverlay(uint16_t pulse_on_ms,
+                                          uint16_t pulse_off_ms,
+                                          uint8_t pulses,
+                                          uint16_t repeat_period_ms,
+                                          uint8_t overlay)
+{
 	if (pulses == 0u) {
 		Beeper_StopPattern();
 		return;
 	}
-	g_resume_ctx.valid = 0u;
+	if (overlay == 0u) {
+		g_resume_ctx.valid = 0u;
+	}
 	pattern_on_ticks = Beeper_MsToTicks(pulse_on_ms);
 	pattern_off_ticks = Beeper_MsToTicks(pulse_off_ms);
 	pattern_repeat_ticks = (repeat_period_ms == 0u) ? 0u : Beeper_MsToTicks(repeat_period_ms);
@@ -314,27 +334,19 @@ void Beeper_ButtonAcknowledge(void)
 
 void Beeper_PlayConfigSuccess(void)
 {
-	uint8_t i;
-	const uint8_t saved_mute = beep_sound;
-
 	if (!Beeper_IsOneShotState(beeper_state)) {
 		Beeper_CaptureResumeStateIfNeeded();
 	}
+	/* Профиль успешной конфигурации всегда слышен, даже если звук был выключен. */
+	g_pattern_saved_mute = beep_sound;
+	g_pattern_restore_mute = 1u;
 	beep_sound = 1u;
-	beeper_state = BEEPER_STATE_IDLE;
-	Beeper_Off();
-
-	for (i = 0u; i < SOUND_CFG_SUCCESS_PULSES; i++) {
-		HAL_GPIO_WritePin(SOUND_GPIO_Port, SOUND_Pin, GPIO_PIN_SET);
-		HAL_Delay(SOUND_CFG_SUCCESS_ON_MS);
-		HAL_GPIO_WritePin(SOUND_GPIO_Port, SOUND_Pin, GPIO_PIN_RESET);
-		if ((uint8_t)(i + 1u) < SOUND_CFG_SUCCESS_PULSES) {
-			HAL_Delay(SOUND_CFG_SUCCESS_OFF_MS);
-		}
-	}
-
-	beep_sound = saved_mute;
-	Beeper_RestoreAfterOneShot();
+	Beeper_StartPulseTrainOverlay(SOUND_CFG_SUCCESS_ON_MS,
+	                              SOUND_CFG_SUCCESS_OFF_MS,
+	                              SOUND_CFG_SUCCESS_PULSES,
+	                              0u,
+	                              1u);
+	RsPanelMaster_PushSound();
 }
 
 /**
@@ -448,8 +460,15 @@ void Beeper_Process(void)
 					pattern_counter = pattern_on_ticks;
 				} else {
 					if (pattern_repeat_ticks == 0u) {
-						beeper_state = BEEPER_STATE_IDLE;
-						Beeper_Off();
+						if (g_pattern_restore_mute != 0u) {
+							beep_sound = g_pattern_saved_mute;
+							g_pattern_restore_mute = 0u;
+							Beeper_RestoreAfterOneShot();
+							RsPanelMaster_PushSound();
+						} else {
+							beeper_state = BEEPER_STATE_IDLE;
+							Beeper_Off();
+						}
 						break;
 					}
 					if (pattern_repeat_counter < pattern_repeat_ticks) {

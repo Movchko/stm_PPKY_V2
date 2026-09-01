@@ -19,6 +19,14 @@ void Warning_SetMkuPositionFaultMask(uint32_t mask);
 void Warning_SetPanelJournalFaultMask(uint8_t mask);
 uint8_t Warning_HasActiveFault(void);
 uint8_t Warning_HasActiveAttention(void);
+/* Принудительно переотправить текущий список неисправностей на панели (после READY). */
+void Warning_RepublishUiNow(void);
+/* Сбросить кэш PushUiIfChanged (панель переподключилась / не приняла снимок). */
+void Warning_ResetPanelUiCache(void);
+/* Последний count из BuildUiPayload (Live Watch на ППКУ). */
+uint8_t Warning_GetLastUiBuildCount(void);
+/* 1, пока действует стартовая пауза warning_process_delay (список ещё не собран). */
+uint8_t Warning_IsProcessDelayActive(void);
 
 #ifdef __cplusplus
 }

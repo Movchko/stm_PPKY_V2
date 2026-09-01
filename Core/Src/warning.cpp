@@ -15,6 +15,7 @@
 #include "device_dpt.hpp"
 #include "sound_profiles.h"
 #include "menu_ui.h"
+#include "rs_panel_master_debug.h"
 
 #define WARN_TITLE_LEN 24
 
@@ -22,9 +23,9 @@ extern ActiveDeviceInfo g_active_devices[NUM_ACTIVE_DEVICE];
 extern uint8_t g_active_devices_count;
 extern PPKYCfg PPKYConfig;
 
-extern "C" void Warning_UiUpdate(uint8_t active, uint8_t n_items,
-				 char (*big_titles)[WARN_TITLE_LEN],
-				 char (*details)[ZONE_NAME_SIZE + 1]);
+extern "C" uint8_t Warning_UiUpdate(uint8_t active, uint8_t n_items,
+				    char (*big_titles)[WARN_TITLE_LEN],
+				    char (*details)[ZONE_NAME_SIZE + 1]);
 
 enum FaultSoundPhase : uint8_t {
 	FAULT_SOUND_IDLE = 0u,
@@ -65,6 +66,7 @@ constexpr uint8_t WARN_KIND_MCU_POSITION_FAULT = 5u;
 constexpr uint8_t WARN_KIND_DEVICE_MISSING = 6u;
 constexpr uint8_t WARN_KIND_DEVICE_FOUND = 7u;
 constexpr uint8_t WARN_KIND_CONFIG_MISMATCH = 8u;
+constexpr uint8_t WARN_KIND_PANEL_JOURNAL_FAULT = 9u;
 constexpr uint8_t WARN_TITLE_MARK_ATTN = 0x01u;
 
 struct WarningItem {
@@ -91,11 +93,13 @@ static uint8_t g_last_active = 0xFFu;
 static uint8_t g_last_count = 0xFFu;
 static char g_last_big[WARN_MAX_ITEMS][WARN_TITLE_LEN];
 static char g_last_details[WARN_MAX_ITEMS][ZONE_NAME_SIZE + 1];
+static uint8_t g_last_build_count = 0u;
 static uint8_t g_led_err_on = 0u;
 static uint8_t g_prev_active_fault_count = 0u;
 static uint8_t g_prev_sound_fault_count = 0u;
 static uint8_t g_prev_sound_attention_count = 0u;
 static uint32_t g_position_fault_mask = 0u;
+static uint8_t g_panel_journal_fault_mask = 0u;
 
 /* Текстовое имя типа МКУ для отображения в UI предупреждений. */
 static const char* McuTypeName(uint8_t d_type)
@@ -251,7 +255,8 @@ static uint8_t IsFaultKind(uint8_t kind)
 		kind == WARN_KIND_MCU_POSITION_FAULT ||
 		kind == WARN_KIND_DEVICE_MISSING ||
 		kind == WARN_KIND_DEVICE_FOUND ||
-		kind == WARN_KIND_CONFIG_MISMATCH) ? 1u : 0u;
+		kind == WARN_KIND_CONFIG_MISMATCH ||
+		kind == WARN_KIND_PANEL_JOURNAL_FAULT) ? 1u : 0u;
 }
 
 static uint32_t BuildFaultCanHeader(uint8_t d_type, uint8_t h_adr, uint8_t l_adr, uint8_t zone)
@@ -314,7 +319,7 @@ static void EventLog_PostDeviceFaultItem(const WarningItem& it, uint8_t cleared)
 {
 	EventLogPayload_t payload;
 
-	if (!IsFaultKind(it.kind)) {
+	if (!IsFaultKind(it.kind) || it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
 		return;
 	}
 
@@ -696,6 +701,13 @@ static uint8_t IsItemStillFaulty(const WarningItem& it)
 		}
 		return ((g_position_fault_mask & (1u << (ha - 1u))) != 0u) ? 1u : 0u;
 	}
+	if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
+		uint8_t pa = it.h_adr;
+		if (pa == 0u || pa > 8u) {
+			return 0u;
+		}
+		return ((g_panel_journal_fault_mask & (1u << (pa - 1u))) != 0u) ? 1u : 0u;
+	}
 	if (it.kind == WARN_KIND_DEVICE_MISSING ||
 	    it.kind == WARN_KIND_DEVICE_FOUND ||
 	    it.kind == WARN_KIND_CONFIG_MISMATCH) {
@@ -925,6 +937,27 @@ static void SyncMkuPositionFaultItems(uint32_t now_ms)
 	}
 }
 
+static void SyncPanelJournalFaultItems(uint32_t now_ms)
+{
+	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
+		if (!g_items[i].used || g_items[i].kind != WARN_KIND_PANEL_JOURNAL_FAULT) {
+			continue;
+		}
+		uint8_t pa = g_items[i].h_adr;
+		if (pa == 0u || pa > 8u || ((g_panel_journal_fault_mask & (1u << (pa - 1u))) == 0u)) {
+			RemoveItemAt(i);
+		}
+	}
+
+	for (uint8_t pa = 1u; pa <= 8u; pa++) {
+		if ((g_panel_journal_fault_mask & (1u << (pa - 1u))) == 0u) {
+			continue;
+		}
+		UpsertItem(WARN_KIND_PANEL_JOURNAL_FAULT, 0u, pa, 0u,
+			   DEVICE_PPKY_TYPE, 0u, 0u, 0u, 0u, now_ms);
+	}
+}
+
 static void SyncConfigMonitorItems(uint32_t now_ms)
 {
 	for (uint8_t slot = 0u; slot < 32u; slot++) {
@@ -1078,6 +1111,9 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 		} else if (it.kind == WARN_KIND_MCU_POSITION_FAULT) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ПОЗИЦИЯ");
 			snprintf(details[count], ZONE_NAME_SIZE + 1, "МКУ %u", (unsigned)it.h_adr);
+		} else if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
+			snprintf(big_titles[count], WARN_TITLE_LEN, "ЖУРНАЛ RS");
+			snprintf(details[count], ZONE_NAME_SIZE + 1, "ПАНЕЛЬ %u", (unsigned)it.h_adr);
 		} else if (it.kind == WARN_KIND_DEVICE_MISSING) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ОТСУСТВ.");
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
@@ -1275,6 +1311,20 @@ static void PushUiIfChanged(uint8_t active, uint8_t count,
 		}
 	}
 	if (same) {
+		g_rs_master_dbg.warn_push_skip_cache++;
+		return;
+	}
+
+	/* Пустой список до первой реальной неисправности не шлём: иначе панель
+	 * рисует «НОРМА» + заголовок «АВАРИЯ» из Designer и потом не обновляет центр. */
+	if (active == 0u && count == 0u && g_last_active == 0xFFu) {
+		g_last_active = 0u;
+		g_last_count = 0u;
+		return;
+	}
+
+	if (Warning_UiUpdate(active, count, big_titles, details) == 0u) {
+		g_rs_master_dbg.warn_ui_deliver_fail++;
 		return;
 	}
 
@@ -1286,7 +1336,35 @@ static void PushUiIfChanged(uint8_t active, uint8_t count,
 		memcpy(g_last_big, big_titles, sizeof(g_last_big));
 		memcpy(g_last_details, details, sizeof(g_last_details));
 	}
-	Warning_UiUpdate(active, count, big_titles, details);
+}
+
+static void RepublishUiNow(void)
+{
+	char big_titles[WARN_MAX_ITEMS][WARN_TITLE_LEN] = {{0}};
+	char details[WARN_MAX_ITEMS][ZONE_NAME_SIZE + 1] = {{0}};
+	uint8_t count = BuildUiPayload(big_titles, details);
+	uint8_t active = (count > 0u) ? 1u : 0u;
+
+	g_last_build_count = count;
+	g_rs_master_dbg.last_warn_build_count = count;
+
+	if (count == 0u) {
+		return;
+	}
+
+	if (Warning_UiUpdate(active, count, big_titles, details) == 0u) {
+		g_rs_master_dbg.warn_ui_deliver_fail++;
+		return;
+	}
+
+	g_last_active = active;
+	g_last_count = count;
+	memset(g_last_big, 0, sizeof(g_last_big));
+	memset(g_last_details, 0, sizeof(g_last_details));
+	if (active != 0u) {
+		memcpy(g_last_big, big_titles, sizeof(g_last_big));
+		memcpy(g_last_details, details, sizeof(g_last_details));
+	}
 }
 
 } // namespace
@@ -1307,6 +1385,7 @@ extern "C" void WarningProcess1ms(void)
 	SyncMkuCanFaultItems(now_ms);
 	SyncPpkuCanFaultItems(now_ms);
 	SyncMkuPositionFaultItems(now_ms);
+	SyncPanelJournalFaultItems(now_ms);
 	SyncConfigMonitorItems(now_ms);
 	UpdateDebouncedPowerFaults(now_ms);
 	ProcessPendingConfirmations(now_ms);
@@ -1317,6 +1396,8 @@ extern "C" void WarningProcess1ms(void)
 
 	/* Список поддерживаем всегда (в т.ч. во время пожара) — приоритет показа на UI. */
 	uint8_t count = BuildUiPayload(big_titles, details);
+	g_last_build_count = count;
+	g_rs_master_dbg.last_warn_build_count = count;
 	PushUiIfChanged((count > 0u) ? 1u : 0u, count, big_titles, details);
 }
 
@@ -1335,6 +1416,11 @@ extern "C" void Warning_SetMkuPositionFaultMask(uint32_t mask)
 	g_position_fault_mask = mask & 0xFFFFFFFFu;
 }
 
+extern "C" void Warning_SetPanelJournalFaultMask(uint8_t mask)
+{
+	g_panel_journal_fault_mask = mask;
+}
+
 extern "C" uint8_t Warning_HasActiveFault(void)
 {
 	return (HasActiveFaultNow() || Fire_HasExtinguishIncomplete()) ? 1u : 0u;
@@ -1343,4 +1429,29 @@ extern "C" uint8_t Warning_HasActiveFault(void)
 extern "C" uint8_t Warning_HasActiveAttention(void)
 {
 	return CountActiveAttentionNow() > 0u ? 1u : 0u;
+}
+
+extern "C" void Warning_ResetPanelUiCache(void)
+{
+	g_last_active = 0xFFu;
+	g_last_count = 0xFFu;
+	memset(g_last_big, 0, sizeof(g_last_big));
+	memset(g_last_details, 0, sizeof(g_last_details));
+}
+
+extern "C" uint8_t Warning_GetLastUiBuildCount(void)
+{
+	return g_last_build_count;
+}
+
+extern uint32_t warning_process_delay;
+
+extern "C" uint8_t Warning_IsProcessDelayActive(void)
+{
+	return (warning_process_delay != 0u) ? 1u : 0u;
+}
+
+extern "C" void Warning_RepublishUiNow(void)
+{
+	RepublishUiNow();
 }
