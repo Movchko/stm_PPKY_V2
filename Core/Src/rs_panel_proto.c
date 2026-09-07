@@ -37,7 +37,7 @@ static uint8_t g_journal_detail_open = 0u;
  * panel tells events via RSP_POLL.ui_events, master keeps which screen is active
  * (based on the last UI_NAV we sent). */
 static uint16_t g_ui_current_screen_id = RS_PANEL_SCREEN_LOGO;
-/* Как в stm_PPKY v1 / панели: 400 тиков TouchGFX × GFX_RATIO_MS (10 мс) = 4000 мс. */
+/* Как в stm_PPKY v1 / панели: 4000 мс (400×10 мс). */
 #define RS_PANEL_LOGO_MAIN_DELAY_MS 4000u
 static uint32_t s_logo_main_nav_deadline_ms = 0u;
 static uint8_t s_panel_ui_resync_pending = 0u;

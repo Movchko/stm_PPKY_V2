@@ -255,7 +255,7 @@ static void MkuHardReset_Process(uint32_t now_ms)
 
 extern "C" void App_OnConfigApplySuccess(void)
 {
-	/* Headless-friendly: без вызова TouchGFX UI. */
+	/* UI на RS-панели; локального дисплея нет. */
 	MenuConfig_OnApplySuccess();
 	MkuHardReset_ScheduleAfterApply();
 }

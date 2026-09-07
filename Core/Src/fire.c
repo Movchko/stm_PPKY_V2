@@ -2472,7 +2472,7 @@ static uint8_t Fire_BuildUiZoneList(uint8_t *zones, uint8_t max_out)
 
 static void Fire_FillZoneNamesForUi(char (*out_names)[FIRE_UI_NAME_LEN], uint8_t *out_n)
 {
-	/* Готовит уникальный отсортированный список имён зон для TouchGFX. */
+	/* Готовит уникальный отсортированный список имён зон для UI панели. */
 	uint8_t zones[FIRE_UI_MAX_ZONES];
 	uint8_t nz = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
 	*out_n = nz;
@@ -2545,7 +2545,7 @@ static void Fire_UpdateUiText(uint8_t active, uint8_t mode, uint8_t remaining_s,
 	}
 	/*
 	 * Раньше при n_zones==0 кэш считал одинаковым (active, remaining, 0) и годами не вызывал
-	 * Fire_UiUpdate, пока не сменится секунда таймера — имя зоны не доходило до TouchGFX.
+	 * Fire_UiUpdate, пока не сменится секунда таймера — имя зоны не доходило до UI панели.
 	 * При активных слотах список имён должен быть непуст: периодически пробиваем кэш.
 	 */
 	if (same && active && n_zones == 0u && Fire_AnyActiveSlot()) {

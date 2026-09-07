@@ -1299,7 +1299,7 @@ static void UpdateErrorLed(uint32_t now_ms)
 	}
 }
 
-/* Пушит данные в TouchGFX только при реальном изменении (анти-спам). */
+/* Пушит UI-данные на панель только при реальном изменении (анти-спам). */
 static void PushUiIfChanged(uint8_t active, uint8_t count,
 			    char (*big_titles)[WARN_TITLE_LEN], char (*details)[ZONE_NAME_SIZE + 1])
 {
