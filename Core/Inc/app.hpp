@@ -11,6 +11,7 @@
 #include "main.h"
 #include "spif.h"
 #include "device_config.h"
+#include "boot_layout.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,9 +30,7 @@ extern "C" {
 #define FLASH_CFG_MAX_USABLE_BYTES  ((FLASH_CFG_BYTES_ALLOCATED * (100u - FLASH_CFG_RESERVE_PERCENT)) / 100u)
 #define FLASH_CFG_STORED_BYTES      (sizeof(PPKYConfigHeader) + sizeof(PPKYCfg))
 
-/* Область журналов после конфигурации. */
-#define SPI_FLASH_SECTOR_COUNT      4096u
-#define FLASH_LOG_START_SECTOR      (FLASH_CFG_START_SECTOR + FLASH_CFG_SECTORS_USED)
+/* Область журналов после конфигурации, factory 0x020000 и update 0x0A0000 (слот 512 КБ, см. boot_layout.h). */
 #define FLASH_LOG_TOTAL_SECTORS     (SPI_FLASH_SECTOR_COUNT - FLASH_LOG_START_SECTOR)
 
 #define EVENT_LOG_RECORD_SIZE_BYTES   32u
