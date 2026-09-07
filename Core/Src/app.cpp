@@ -21,6 +21,7 @@
 #include "rs_panel_proto.h"
 #include "fire.h"
 #include "warning.h"
+#include "fw_update.h"
 
 #define WARNING_TITLE_LEN 24
 
@@ -28,6 +29,7 @@ struct PPKYCfg PPKYConfig;       // локальная (рабочая) конф
 struct PPKYCfg SavedPPKYConfig; // копия сохранённой конфигурации из Flash
 
 extern SPIF_HandleTypeDef hFlash;
+extern DTS_HandleTypeDef hdts;
 
 PControl *Power[POWER_NUM_CHANNELS];
 
@@ -387,13 +389,26 @@ void AppSetStatus() {
 	uint8_t Rpower = (uint8_t)rpower_v;
 	uint8_t current1 = (CHANNEL_VAL[1] / 50) & 0xFF; // шаг 50мА
 	uint8_t current2 = (CHANNEL_VAL[2] / 50) & 0xFF;
+
+	int32_t temperature;
+	  /* Get temperature in deg C */
+	if(HAL_DTS_GetTemperature(&hdts, &temperature)!= HAL_OK)
+	{
+	    /* DTS GetTemperature Error */
+	}
+
+	if(temperature > 128) temperature = 128;
+	if(temperature < -128) temperature = -128;
+
+	uint8_t temp = (uint8_t)temperature;
+
 	uint8_t status_data[7] = {
 			status_sec_cnt,
 			power,
 			Rpower,
 			current1,
 			current2,
-			0,
+			temp,
 			0
 	};
 	/* Dev=0 — сама плата ППКУ, отправляем через backend */
@@ -1223,6 +1238,8 @@ void AppTimer1ms() {
 
 void AppTimer10ms() {
 	uint32_t now = HAL_GetTick();
+	static uint16_t s_app_wd_ticks = 0u;
+	static uint8_t s_app_wd_done = 0u;
 
 	/* Чтение кнопок делаем реже, чтобы не перегружать I2C.
 	 * Теперь Button_Process вызывается раз в ~с (при шаге AppTimer10ms ~10 мс). */
@@ -1260,6 +1277,16 @@ void AppTimer10ms() {
 	Beeper_Process();
 	Led_Process();
 	RsPanelMaster_Process10ms(&g_rs_panel_master, HAL_GetTick());
+
+	/* 300 * 10 мс = 3 с после старта приложения — app WD для бутлоадера ППКУ. */
+	if (s_app_wd_done == 0u) {
+		if (s_app_wd_ticks < 300u) {
+			s_app_wd_ticks++;
+		} else {
+			s_app_wd_done = 1u;
+			Boot_WriteProgramWatchDog();
+		}
+	}
 }
 
 

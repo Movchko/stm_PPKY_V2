@@ -50,6 +50,8 @@ DMA_HandleTypeDef handle_GPDMA1_Channel0;
 
 CRC_HandleTypeDef hcrc;
 
+DTS_HandleTypeDef hdts;
+
 FDCAN_HandleTypeDef hfdcan1;
 FDCAN_HandleTypeDef hfdcan2;
 
@@ -80,6 +82,7 @@ static void MX_FDCAN2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_CRC_Init(void);
+static void MX_DTS_Init(void);
 static void MX_RTC_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_FLASH_Init(void);
@@ -152,6 +155,7 @@ int main(void)
   MX_ICACHE_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
+  MX_DTS_Init();
   /* USER CODE BEGIN 2 */
   // must have for esp32
   HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_SET);
@@ -166,6 +170,12 @@ int main(void)
    */
 
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)ADC_VAL, NUM_ADC_CHANNEL);
+
+  if (HAL_DTS_Start(&hdts) != HAL_OK)
+  {
+    /* DTS start Error */
+    Error_Handler();
+  }
 
   /* USER CODE END 2 */
 
@@ -430,6 +440,39 @@ static void MX_CRC_Init(void)
   /* USER CODE BEGIN CRC_Init 2 */
 
   /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
+  * @brief DTS Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DTS_Init(void)
+{
+
+  /* USER CODE BEGIN DTS_Init 0 */
+
+  /* USER CODE END DTS_Init 0 */
+
+  /* USER CODE BEGIN DTS_Init 1 */
+
+  /* USER CODE END DTS_Init 1 */
+  hdts.Instance = DTS;
+  hdts.Init.QuickMeasure = DTS_QUICKMEAS_DISABLE;
+  hdts.Init.RefClock = DTS_REFCLKSEL_LSE;
+  hdts.Init.TriggerInput = DTS_TRIGGER_HW_NONE;
+  hdts.Init.SamplingTime = DTS_SMP_TIME_15_CYCLE;
+  hdts.Init.Divider = 0;
+  hdts.Init.HighThreshold = 0x0;
+  hdts.Init.LowThreshold = 0x0;
+  if (HAL_DTS_Init(&hdts) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DTS_Init 2 */
+
+  /* USER CODE END DTS_Init 2 */
 
 }
 
@@ -1060,21 +1103,14 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-uint8_t SetUpdateWord(uint32_t num, uint32_t word)
-{ return 0;}
-
-#define APP_VERSION_U32 4u
+#define APP_VERSION_U32 9u
 
 const char *GetAppVersion(void)
 {
     static char ver_buf[64];
     /* fw: версия прошивки (пока константа) */
-    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия аппаратной части %u", (unsigned)APP_VERSION_U32);
+    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия программной части %u", (unsigned)APP_VERSION_U32);
     return ver_buf;
-}
-
-uint8_t FinishUpdateTransmit(void) {
-	return 0;
 }
 /* USER CODE END 4 */
 

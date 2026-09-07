@@ -20,9 +20,9 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32h5xx_it.h"
-#include "power_control.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "power_control.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -75,6 +75,7 @@ extern DMA_HandleTypeDef handle_GPDMA1_Channel1;
 extern DMA_HandleTypeDef handle_GPDMA1_Channel2;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
+extern DTS_HandleTypeDef hdts;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -400,6 +401,20 @@ void FDCAN2_IT0_IRQHandler(void)
   /* USER CODE BEGIN FDCAN2_IT0_IRQn 1 */
 
   /* USER CODE END FDCAN2_IT0_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DTS global interrupt.
+  */
+void DTS_IRQHandler(void)
+{
+  /* USER CODE BEGIN DTS_IRQn 0 */
+
+  /* USER CODE END DTS_IRQn 0 */
+  HAL_DTS_IRQHandler(&hdts);
+  /* USER CODE BEGIN DTS_IRQn 1 */
+
+  /* USER CODE END DTS_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */

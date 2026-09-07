@@ -1984,6 +1984,9 @@ static uint8_t rs_panel_should_forward_to_host(const RsBusFrameView *frame)
     if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
         return 1u;
     }
+    if (frame->cmd == RS_PANEL_RSP_ACK) {
+        return 1u;
+    }
     if (frame->cmd == RS_PANEL_CMD_BOOT_RESET_MCU ||
         frame->cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD ||
         frame->cmd == RS_PANEL_CMD_BOOT_UPD_TRANSMIT ||
