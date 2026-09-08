@@ -50,10 +50,126 @@ static uint8_t g_menu_n_items = 7u;
 #endif
 static uint8_t g_device_selected_slot = 0xFFu;
 
+static uint8_t rs_panel_master_is_menu_ui_screen(uint16_t screen_id)
+{
+    return (screen_id == RS_PANEL_SCREEN_MENU_ROOT ||
+            screen_id == RS_PANEL_SCREEN_MENU_SETTINGS ||
+            screen_id == RS_PANEL_SCREEN_MENU_DEVICES ||
+            screen_id == RS_PANEL_SCREEN_MENU_DEVICE_DETAIL ||
+            screen_id == RS_PANEL_SCREEN_MENU_CONFIG ||
+            screen_id == RS_PANEL_SCREEN_MENU_JOURNAL ||
+            screen_id == RS_PANEL_SCREEN_MENU_JOURNAL_DETAIL ||
+            screen_id == RS_PANEL_SCREEN_MENU_CONNECTION ||
+            screen_id == RS_PANEL_SCREEN_MENU_SOUND ||
+            screen_id == RS_PANEL_SCREEN_MENU_BLOCK_ZONE) ? 1u : 0u;
+}
+
+/* Панель уже в корневом меню, а мастер ещё держит LOGO/MAIN (дедлайн логотипа / reconnect). */
+static uint8_t rs_panel_master_is_menu_root_session(void)
+{
+    return (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_ROOT) ? 1u : 0u;
+}
+
+/* BACK/MENU_SELECT: принять и если мастер отстал на MAIN/LOGO после открытия меню панелью. */
+static uint8_t rs_panel_master_accept_menu_root_evt(void)
+{
+    return (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_ROOT ||
+            g_ui_current_screen_id == RS_PANEL_SCREEN_MAIN ||
+            g_ui_current_screen_id == RS_PANEL_SCREEN_LOGO) ? 1u : 0u;
+}
+
 #define RS_PANEL_CAPS_RETRY_MS 50u
 static uint32_t s_last_caps_req_ms = 0u;
 static uint8_t g_block_zone_selected = 0u;
 static uint8_t g_connection_selected = 0u;
+
+/* UI TX нельзя делать из HAL_UARTEx_RxEventCallback: AbortReceive+Transmit
+ * на half-duplex ломает DMA/RX. Очередь → Process10ms (main). */
+#define RS_PANEL_UI_EVT_Q_DEPTH 4u
+typedef struct {
+    uint8_t panel_idx;
+    RsPanelPollRsp rsp;
+} RsPanelUiEvtQItem;
+static RsPanelUiEvtQItem s_ui_evt_q[RS_PANEL_UI_EVT_Q_DEPTH];
+static volatile uint8_t s_ui_evt_q_head = 0u;
+static volatile uint8_t s_ui_evt_q_tail = 0u;
+static volatile uint8_t s_ui_evt_q_count = 0u;
+
+static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
+                                             PanelState *panel,
+                                             const RsPanelPollRsp *rsp);
+
+static uint8_t rs_panel_master_ui_evt_enqueue(uint8_t panel_idx, const RsPanelPollRsp *rsp)
+{
+    uint32_t primask;
+
+    if (rsp == 0) {
+        return 0u;
+    }
+    /* Пустой POLL и RELEASE без UI — не занимаем очередь (CONFIRM не должен вытесняться). */
+    if (rsp->ui_evt_count == 0u) {
+        uint8_t press = 0u;
+        uint8_t i;
+        for (i = 0u; i < rsp->evt_count && i < RS_PANEL_MAX_POLL_BTN_EVENTS; i++) {
+            if (rsp->btn_events[i].state == (uint8_t)RS_PANEL_BUTTON_PRESS) {
+                press = 1u;
+                break;
+            }
+        }
+        if (press == 0u) {
+            return 0u;
+        }
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_ui_evt_q_count >= RS_PANEL_UI_EVT_Q_DEPTH) {
+        __set_PRIMASK(primask);
+        g_rs_master_dbg.ui_evt_q_overflow++;
+        return 0u;
+    }
+    s_ui_evt_q[s_ui_evt_q_tail].panel_idx = panel_idx;
+    s_ui_evt_q[s_ui_evt_q_tail].rsp = *rsp;
+    s_ui_evt_q_tail = (uint8_t)((s_ui_evt_q_tail + 1u) % RS_PANEL_UI_EVT_Q_DEPTH);
+    s_ui_evt_q_count++;
+    __set_PRIMASK(primask);
+
+    g_rs_master_dbg.ui_evt_enqueued++;
+    if (rsp->ui_evt_count != 0u) {
+        g_rs_master_dbg.last_ui_evt_type = rsp->ui_events[0].evt_type;
+        g_rs_master_dbg.last_ui_evt_p1 = rsp->ui_events[0].p1;
+    }
+    return 1u;
+}
+
+static void rs_panel_master_ui_evt_process_pending(RsPanelMaster *master)
+{
+    while (1) {
+        RsPanelUiEvtQItem item;
+        uint32_t primask;
+        PanelState *panel;
+
+        primask = __get_PRIMASK();
+        __disable_irq();
+        if (s_ui_evt_q_count == 0u) {
+            __set_PRIMASK(primask);
+            break;
+        }
+        item = s_ui_evt_q[s_ui_evt_q_head];
+        s_ui_evt_q_head = (uint8_t)((s_ui_evt_q_head + 1u) % RS_PANEL_UI_EVT_Q_DEPTH);
+        s_ui_evt_q_count--;
+        __set_PRIMASK(primask);
+
+        if (master == 0 || item.panel_idx >= master->panel_count) {
+            continue;
+        }
+        panel = &master->panels[item.panel_idx];
+        rs_panel_master_handle_ui_events(master, panel, &item.rsp);
+        g_rs_master_dbg.ui_evt_handled++;
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+    }
+}
 
 static void rs_panel_master_update_journal_fault_mask(void)
 {
@@ -243,18 +359,17 @@ static void rs_panel_master_send_ui_nav_to_ready_panels(RsPanelMaster *master,
     }
 }
 
-/* Не шлём UI_NAV на MAIN, если мастер уже считает экран главным — иначе панель
- * каждый раз переинициализирует mainscreen (мигает время и баннеры).
- * Пока идёт логотип — не перебиваем его NAV. */
+/* WARN/FIRE не должны срывать меню. После логотипа панель сама уходит на MAIN;
+ * повторный UI_NAV MAIN сдвигает виджеты, поэтому здесь только синхронизируем
+ * локальный id. */
 static void rs_panel_master_ensure_main_screen(RsPanelMaster *master)
 {
-    if (master == 0u || s_logo_main_nav_deadline_ms != 0u ||
-        g_ui_current_screen_id == RS_PANEL_SCREEN_MAIN) {
+    if (master == 0u || s_logo_main_nav_deadline_ms != 0u) {
         return;
     }
-    rs_panel_master_send_ui_nav_to_ready_panels(master,
-                                                RS_PANEL_SCREEN_MAIN,
-                                                RS_PANEL_UI_ACTION_REPLACE);
+    if (g_ui_current_screen_id == RS_PANEL_SCREEN_LOGO) {
+        g_ui_current_screen_id = RS_PANEL_SCREEN_MAIN;
+    }
 }
 
 /* forward decl: используется внутри MENU_LIST */
@@ -293,6 +408,7 @@ static void rs_panel_master_send_menu_list_to_ready_panels(RsPanelMaster *master
                                                  RS_PANEL_UI_DATA_MENU_LIST,
                                                  payload,
                                                  pos);
+    g_rs_master_dbg.menu_list_tx++;
 }
 
 static void rs_panel_master_send_menu_state_to_ready_panels(RsPanelMaster *master)
@@ -1032,8 +1148,14 @@ static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
         return;
     }
 
-    g_ui_current_screen_id = RS_PANEL_SCREEN_LOGO;
-    s_logo_main_nav_deadline_ms = HAL_GetTick() + RS_PANEL_LOGO_MAIN_DELAY_MS;
+    /* Не сбрасывать MENU_* в LOGO: NAV на логотип не шлём, панель остаётся в меню,
+     * а мастер начинает игнорировать UP/DOWN/ESC. */
+    if (rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u) {
+        g_ui_current_screen_id = RS_PANEL_SCREEN_LOGO;
+        s_logo_main_nav_deadline_ms = HAL_GetTick() + RS_PANEL_LOGO_MAIN_DELAY_MS;
+    } else {
+        s_logo_main_nav_deadline_ms = 0u;
+    }
     s_panel_ui_resync_pending = 1u;
     /* UI_NAV/WARN/FIRE не из обработчика RX CAPS: UART half-duplex, плюс логотип
      * на панели сам переходит на MAIN через 400 тиков. Снимок отправим после лого. */
@@ -1107,6 +1229,10 @@ uint8_t App_OnWarningUiUpdate(uint8_t active,
     uint8_t delivered;
 
     if (master == 0u || big_titles == 0u || details == 0u) {
+        return 0u;
+    }
+    /* Не слать WARN в том же тике, что UI_NAV меню. */
+    if (s_ui_evt_q_count != 0u) {
         return 0u;
     }
 
@@ -1193,20 +1319,96 @@ static uint8_t rs_decode_ack(const uint8_t *src, uint16_t src_len, uint8_t *ack_
     return 1u;
 }
 
+/* Если панель по ошибке прислала btn_event вместо ui_event — всё равно
+ * обработать навигацию меню (только когда мастер точно в MENU_*). */
+static void rs_panel_master_synth_menu_ui_from_btns(RsPanelPollRsp *rsp)
+{
+    uint8_t i;
+    uint8_t n = 0u;
+
+    if (rsp == 0 || rsp->ui_evt_count != 0u || rsp->evt_count == 0u) {
+        return;
+    }
+    if (rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u) {
+        return;
+    }
+
+    for (i = 0u; i < rsp->evt_count && i < RS_PANEL_MAX_POLL_BTN_EVENTS; i++) {
+        const RsPanelButtonEvent *be = &rsp->btn_events[i];
+        RsPanelUiEvent *ue;
+
+        if (be->state != (uint8_t)RS_PANEL_BUTTON_PRESS) {
+            continue;
+        }
+        if (n >= RS_PANEL_MAX_POLL_UI_EVENTS) {
+            break;
+        }
+        ue = &rsp->ui_events[n];
+        memset(ue, 0, sizeof(*ue));
+
+        if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_ROOT) {
+            if (be->type == RS_PANEL_BTN_ESC) {
+                ue->evt_type = RS_PANEL_UI_EVT_BACK;
+            } else if (be->type == RS_PANEL_BTN_UP) {
+                ue->evt_type = RS_PANEL_UI_EVT_NAV;
+                ue->p1 = 0u;
+                ue->p2 = g_menu_selected;
+            } else if (be->type == RS_PANEL_BTN_DOWN) {
+                ue->evt_type = RS_PANEL_UI_EVT_NAV;
+                ue->p1 = 1u;
+                ue->p2 = g_menu_selected;
+            } else if (be->type == RS_PANEL_BTN_ENTER) {
+                ue->evt_type = RS_PANEL_UI_EVT_MENU_SELECT;
+                ue->p1 = g_menu_selected;
+            } else {
+                continue;
+            }
+        } else {
+            if (be->type == RS_PANEL_BTN_ESC) {
+                ue->evt_type = RS_PANEL_UI_EVT_BACK;
+            } else if (be->type == RS_PANEL_BTN_UP) {
+                ue->evt_type = RS_PANEL_UI_EVT_NAV;
+                ue->p1 = 0u;
+            } else if (be->type == RS_PANEL_BTN_DOWN) {
+                ue->evt_type = RS_PANEL_UI_EVT_NAV;
+                ue->p1 = 1u;
+            } else if (be->type == RS_PANEL_BTN_ENTER) {
+                ue->evt_type = RS_PANEL_UI_EVT_CONFIRM;
+            } else {
+                continue;
+            }
+        }
+        n++;
+    }
+    rsp->ui_evt_count = n;
+}
+
 static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                                              PanelState *panel,
                                              const RsPanelPollRsp *rsp)
 {
+    RsPanelPollRsp local;
+    const RsPanelPollRsp *use = rsp;
+
     if (master == 0 || rsp == 0) {
         return;
     }
 
-    for (uint8_t i = 0u; i < rsp->ui_evt_count && i < RS_PANEL_MAX_POLL_UI_EVENTS; i++) {
-        const RsPanelUiEvent *evt = &rsp->ui_events[i];
+    if (rsp->ui_evt_count == 0u && rsp->evt_count != 0u &&
+        rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) != 0u) {
+        local = *rsp;
+        rs_panel_master_synth_menu_ui_from_btns(&local);
+        use = &local;
+    }
+
+    for (uint8_t i = 0u; i < use->ui_evt_count && i < RS_PANEL_MAX_POLL_UI_EVENTS; i++) {
+        const RsPanelUiEvent *evt = &use->ui_events[i];
 
         switch (evt->evt_type) {
         case RS_PANEL_UI_EVT_NAV:
-            if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_ROOT) {
+            if (rs_panel_master_is_menu_root_session() != 0u) {
+                g_ui_current_screen_id = RS_PANEL_SCREEN_MENU_ROOT;
+                s_logo_main_nav_deadline_ms = 0u;
                 /* MENU_ROOT навигация */
                 if (g_menu_n_items == 0u) {
                     break;
@@ -1224,6 +1426,7 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                     g_menu_selected = (uint16_t)((g_menu_selected + 1u) % g_menu_n_items);
                 }
 
+                MenuUi_SetMenuSelected(g_menu_selected);
                 rs_panel_master_send_menu_list_to_ready_panels(master,
                                                                  g_menu_selected,
                                                                  g_menu_n_items);
@@ -1333,7 +1536,12 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             break;
 
         case RS_PANEL_UI_EVT_CONFIRM:
-            if (g_ui_current_screen_id == RS_PANEL_SCREEN_MAIN) {
+            /* Панель после logo сама на MAIN; мастер может ещё держать LOGO.
+             * Если UI_NAV меню не дошёл, мастер уже MENU_ROOT, а панель шлёт CONFIRM
+             * с главного — повторяем открытие, иначе ENTER «теряется». */
+            if (g_ui_current_screen_id == RS_PANEL_SCREEN_MAIN ||
+                g_ui_current_screen_id == RS_PANEL_SCREEN_LOGO ||
+                g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_ROOT) {
                 /* ENTER на главном экране → открыть MENU_ROOT и отправить MENU_LIST */
                 g_menu_selected = 0u;
                 MenuUi_SetMenuSelected(0u);
@@ -1350,6 +1558,7 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                                                                  g_menu_selected,
                                                                  g_menu_n_items);
                 rs_panel_master_send_menu_state_to_ready_panels(master);
+                s_logo_main_nav_deadline_ms = 0u;
                 break;
             }
 
@@ -1409,8 +1618,9 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             break;
 
         case RS_PANEL_UI_EVT_BACK:
-            if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_ROOT) {
-                /* ESC в меню → назад на MAIN */
+            if (rs_panel_master_accept_menu_root_evt() != 0u) {
+                /* ESC в меню → назад на MAIN (и если мастер ещё думал, что MAIN/LOGO). */
+                s_logo_main_nav_deadline_ms = 0u;
                 rs_panel_master_send_ui_nav_to_ready_panels(master,
                                                             RS_PANEL_SCREEN_MAIN,
                                                             RS_PANEL_UI_ACTION_REPLACE);
@@ -1470,9 +1680,11 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             break;
 
         case RS_PANEL_UI_EVT_MENU_SELECT:
-            if (g_ui_current_screen_id != RS_PANEL_SCREEN_MENU_ROOT) {
+            if (rs_panel_master_accept_menu_root_evt() == 0u) {
                 break;
             }
+            g_ui_current_screen_id = RS_PANEL_SCREEN_MENU_ROOT;
+            s_logo_main_nav_deadline_ms = 0u;
             if (panel == 0) {
                 break;
             }
@@ -2079,7 +2291,8 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
             g_rs_master_dbg.rsp_poll_rx++;
             if (RsPanel_DecodePollRsp(frame->payload, frame->payload_len, &rsp)) {
                 PanelState_OnPollRsp(panel, &rsp, HAL_GetTick());
-                rs_panel_master_handle_ui_events(master, panel, &rsp);
+                /* Не SendFrame из RX IRQ — только очередь. */
+                (void)rs_panel_master_ui_evt_enqueue(i, &rsp);
             }
         } else if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
             /* Presence для ПО уже прокинута выше; локально только фиксируем RX. */
@@ -2150,21 +2363,38 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         return;
     }
 
+    /* Сначала UI-ответы на кнопки (TX вне RX IRQ).
+     * В этом же тике не шлём POLL/WARN: иначе UI_NAV+MENU_LIST+POLL одним пакетом
+     * и панель часто теряет первый вход в меню. */
+    if (s_ui_evt_q_count != 0u) {
+        rs_panel_master_ui_evt_process_pending(master);
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        return;
+    }
+
     RsPanelMasterDebug_Timer10ms();
     g_rs_master_dbg.panel_caps_valid = master->panels[0].caps_valid;
     g_rs_master_dbg.panel_link_state = (uint8_t)master->panels[0].link_state;
+    g_rs_master_dbg.menu_selected = g_menu_selected;
+    g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
 
     if (s_logo_main_nav_deadline_ms != 0u &&
         PanelState_IsReady(&master->panels[0]) != 0u &&
         (int32_t)(now_ms - s_logo_main_nav_deadline_ms) >= 0) {
         s_logo_main_nav_deadline_ms = 0u;
-        /* Панель сама уходит с logo (400 тиков). Повторный UI_NAV сдвигает виджеты. */
-        g_ui_current_screen_id = RS_PANEL_SCREEN_MAIN;
+        /* Панель сама уходит с logo (400 тиков). Повторный UI_NAV сдвигает виджеты.
+         * Не затирать MENU_*: пользователь мог уже открыть меню. */
+        if (g_ui_current_screen_id == RS_PANEL_SCREEN_LOGO) {
+            g_ui_current_screen_id = RS_PANEL_SCREEN_MAIN;
+        }
     }
 
     if (s_panel_ui_resync_pending != 0u &&
         PanelState_IsReady(&master->panels[0]) != 0u &&
         s_logo_main_nav_deadline_ms == 0u &&
+        rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u &&
         Warning_IsProcessDelayActive() == 0u &&
         Warning_GetLastUiBuildCount() != 0u) {
         s_panel_ui_resync_pending = 0u;
@@ -2178,6 +2408,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     {
         static uint32_t s_warn_cache_reset_ms = 0u;
         if (PanelState_IsReady(&master->panels[0]) != 0u &&
+            rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u &&
             Warning_IsProcessDelayActive() == 0u &&
             Warning_GetLastUiBuildCount() != 0u) {
             if (s_warn_cache_reset_ms == 0u || (now_ms - s_warn_cache_reset_ms) >= 1000u) {

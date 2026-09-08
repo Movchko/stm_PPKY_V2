@@ -29,6 +29,15 @@ typedef struct {
     volatile uint8_t  panel_link_state;
     volatile uint8_t  uart_rx_state;
     volatile uint8_t  rx_arm_ok;
+    /* UI events: enqueue in RX IRQ, handle+TX in Process10ms */
+    volatile uint32_t ui_evt_enqueued;
+    volatile uint32_t ui_evt_handled;
+    volatile uint32_t ui_evt_q_overflow;
+    volatile uint8_t  last_ui_evt_type;
+    volatile uint16_t last_ui_evt_p1;
+    volatile uint16_t menu_selected;
+    volatile uint16_t ui_screen_id;
+    volatile uint32_t menu_list_tx;
 } RsPanelMasterDbg;
 
 extern volatile RsPanelMasterDbg g_rs_master_dbg;

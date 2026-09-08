@@ -11,15 +11,47 @@ static void rs_bus_de_set(RsBusContext *ctx, GPIO_PinState level)
 
 static void rs_bus_wait_tx_complete(UART_HandleTypeDef *uart)
 {
-    uint32_t t0 = HAL_GetTick();
+    uint32_t spins = 0u;
 
     if (uart == 0) {
         return;
     }
+    /* Не завязываемся на HAL_GetTick(): TX может идти с запрещённым UART IRQ,
+     * а раньше SysTick был ниже UART и тик замирал. */
     while (__HAL_UART_GET_FLAG(uart, UART_FLAG_TC) == RESET) {
-        if ((HAL_GetTick() - t0) > 5u) {
+        spins++;
+        if (spins > 2000000u) {
             break;
         }
+    }
+}
+
+/* RX IDLE/DMA IRQ не должен врываться в polling TX (re-arm DMA посреди кадра). */
+static void rs_bus_rx_irq_lock(UART_HandleTypeDef *uart)
+{
+    if (uart == 0) {
+        return;
+    }
+    if (uart->Instance == USART1) {
+        HAL_NVIC_DisableIRQ(USART1_IRQn);
+        HAL_NVIC_DisableIRQ(GPDMA1_Channel2_IRQn);
+    } else if (uart->Instance == USART2) {
+        HAL_NVIC_DisableIRQ(USART2_IRQn);
+        HAL_NVIC_DisableIRQ(GPDMA1_Channel1_IRQn);
+    }
+}
+
+static void rs_bus_rx_irq_unlock(UART_HandleTypeDef *uart)
+{
+    if (uart == 0) {
+        return;
+    }
+    if (uart->Instance == USART1) {
+        HAL_NVIC_EnableIRQ(GPDMA1_Channel2_IRQn);
+        HAL_NVIC_EnableIRQ(USART1_IRQn);
+    } else if (uart->Instance == USART2) {
+        HAL_NVIC_EnableIRQ(GPDMA1_Channel1_IRQn);
+        HAL_NVIC_EnableIRQ(USART2_IRQn);
     }
 }
 
@@ -225,16 +257,19 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
         return HAL_ERROR;
     }
 
+    rs_bus_rx_irq_lock(ctx->uart);
     (void)HAL_UART_AbortReceive(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_SET);
     if (HAL_UART_Transmit(ctx->uart, frame, frame_len, 20u) != HAL_OK) {
         rs_bus_wait_tx_complete(ctx->uart);
         rs_bus_de_set(ctx, GPIO_PIN_RESET);
+        rs_bus_rx_irq_unlock(ctx->uart);
         rs_bus_rx_arm(ctx);
         return HAL_ERROR;
     }
     rs_bus_wait_tx_complete(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_RESET);
+    rs_bus_rx_irq_unlock(ctx->uart);
     rs_bus_rx_arm(ctx);
     return HAL_OK;
 }
@@ -244,16 +279,19 @@ HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_
     if (ctx == 0 || ctx->uart == 0 || frame == 0 || frame_len == 0u) {
         return HAL_ERROR;
     }
+    rs_bus_rx_irq_lock(ctx->uart);
     (void)HAL_UART_AbortReceive(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_SET);
     if (HAL_UART_Transmit(ctx->uart, (uint8_t *)frame, frame_len, 50u) != HAL_OK) {
         rs_bus_wait_tx_complete(ctx->uart);
         rs_bus_de_set(ctx, GPIO_PIN_RESET);
+        rs_bus_rx_irq_unlock(ctx->uart);
         rs_bus_rx_arm(ctx);
         return HAL_ERROR;
     }
     rs_bus_wait_tx_complete(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_RESET);
+    rs_bus_rx_irq_unlock(ctx->uart);
     rs_bus_rx_arm(ctx);
     return HAL_OK;
 }

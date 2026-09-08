@@ -175,7 +175,9 @@
   */
 
 #define  VDD_VALUE                  3300UL /*!< Value of VDD in mv */
-#define  TICK_INT_PRIORITY          (15UL)  /*!< tick interrupt priority (lowest by default) */
+/* Должен быть выше USART1/2 (prio 11): иначе HAL_GetTick() не тикает внутри UART IRQ
+ * и blocking Transmit/wait_tx_complete могут зависнуть. Меньше число = выше приоритет. */
+#define  TICK_INT_PRIORITY          (10UL)
 #define  USE_RTOS                   0U
 #define  PREFETCH_ENABLE            0U               /*!< Enable prefetch */
 

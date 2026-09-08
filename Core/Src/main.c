@@ -95,6 +95,18 @@ uint8_t isMainInit = 0;
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
+#define APP_VERSION_U32 12u
+
+const char *GetAppVersion(void)
+{
+    static char ver_buf[64];
+    /* fw: версия прошивки (пока константа) */
+    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия программной части %u", (unsigned)APP_VERSION_U32);
+    return ver_buf;
+}
+
 uint32_t is1ms = 0;
 uint8_t is10ms = 0;
 
@@ -1103,15 +1115,7 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-#define APP_VERSION_U32 9u
 
-const char *GetAppVersion(void)
-{
-    static char ver_buf[64];
-    /* fw: версия прошивки (пока константа) */
-    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия программной части %u", (unsigned)APP_VERSION_U32);
-    return ver_buf;
-}
 /* USER CODE END 4 */
 
  /* MPU Configuration */
