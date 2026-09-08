@@ -32,6 +32,8 @@ static uint32_t g_journal_selected = 0u;
 static uint32_t g_journal_window_first = 0u;
 static uint8_t g_journal_window_size = 0u;
 static uint8_t g_journal_detail_open = 0u;
+/* 1 = при следующей отправке JOURNAL_LIST выбрать новейшую запись (вход / ENTER). */
+static uint8_t s_journal_jump_newest = 0u;
 
 /* UI session state:
  * panel tells events via RSP_POLL.ui_events, master keeps which screen is active
@@ -737,38 +739,54 @@ static uint8_t rs_panel_master_pick_common_journal_lines(const RsPanelMaster *ma
     return min_lines;
 }
 
-static void rs_panel_master_format_journal_short(const EventLogRecord_t *rec,
+/* OLED как ППКУ 1: одна запись = header + title + detail. Лимиты под кадр ≤251. */
+#define RS_JOURNAL_HDR_MAX     31u
+#define RS_JOURNAL_TITLE_MAX   23u
+#define RS_JOURNAL_DETAIL_MAX  120u
+
+static void rs_panel_master_format_journal_lines(const EventLogRecord_t *rec,
                                                  uint32_t rec_idx,
-                                                 char *dst,
-                                                 size_t dst_size)
+                                                 EventLogUiLines_t *out)
 {
-    EventLogUiLines_t lines;
-    if (dst == 0 || dst_size == 0u) {
+    if (out == 0) {
         return;
     }
     if (rec == 0) {
-        dst[0] = '\0';
+        EventLogUi_FormatEmpty(out);
         return;
     }
-    EventLogUi_FormatRecord(rec, rec_idx + 1u, g_journal_total, &lines);
-    (void)snprintf(dst, dst_size, "%s", lines.title);
+    EventLogUi_FormatRecord(rec, rec_idx + 1u, g_journal_total, out);
 }
 
-static void rs_panel_master_format_journal_detail(const EventLogRecord_t *rec,
-                                                  uint32_t rec_idx,
-                                                  char *dst,
-                                                  size_t dst_size)
+static uint16_t rs_journal_put_counted_str(uint8_t *dst,
+                                           uint16_t pos,
+                                           uint16_t dst_size,
+                                           const char *src,
+                                           uint8_t max_len)
 {
-    EventLogUiLines_t lines;
-    if (dst == 0 || dst_size == 0u) {
-        return;
+    uint8_t n;
+    uint8_t i;
+
+    if (dst == 0 || (uint16_t)(pos + 1u) > dst_size) {
+        return pos;
     }
-    if (rec == 0) {
-        dst[0] = '\0';
-        return;
+    n = 0u;
+    if (src != 0) {
+        while (n < max_len && src[n] != '\0') {
+            n++;
+        }
     }
-    EventLogUi_FormatRecord(rec, rec_idx + 1u, g_journal_total, &lines);
-    (void)snprintf(dst, dst_size, "%s | %s", lines.title, lines.detail);
+    if ((uint16_t)(pos + 1u + (uint16_t)n) > dst_size) {
+        if (dst_size <= (uint16_t)(pos + 1u)) {
+            return pos;
+        }
+        n = (uint8_t)(dst_size - pos - 1u);
+    }
+    dst[pos++] = n;
+    for (i = 0u; i < n; i++) {
+        dst[pos++] = (uint8_t)src[i];
+    }
+    return pos;
 }
 
 static void rs_panel_master_normalize_journal_window(uint32_t total, uint8_t window_size)
@@ -816,7 +834,11 @@ static void rs_panel_master_send_journal_detail_to_ready_panels(RsPanelMaster *m
         code = rec.event_code;
     }
 
-    rs_panel_master_format_journal_detail(rec_ptr, g_journal_selected, full_text, sizeof(full_text));
+    {
+        EventLogUiLines_t lines;
+        rs_panel_master_format_journal_lines(rec_ptr, g_journal_selected, &lines);
+        (void)snprintf(full_text, sizeof(full_text), "%s", lines.detail);
+    }
 
     uint8_t ui_payload[RS_BUS_MAX_PAYLOAD];
     uint16_t pos = 0u;
@@ -862,6 +884,8 @@ static void rs_panel_master_send_journal_list_to_ready_panels(RsPanelMaster *mas
     if (n_items == 0u) {
         return;
     }
+    /* Экран журнала OLED — одна запись за раз, как ППКУ 1. */
+    n_items = 1u;
 
     EventLogTierInfo_t info;
     if (EventLogReader_GetTierInfo(0u, &info) == false) {
@@ -871,6 +895,7 @@ static void rs_panel_master_send_journal_list_to_ready_panels(RsPanelMaster *mas
     uint32_t total = info.count;
     g_journal_total = total;
     if (total == 0u) {
+        s_journal_jump_newest = 0u;
         /* header только, items==0 → панель сбросит кэш. */
         uint8_t ui_payload[1u + 13u];
         uint16_t pos = 0u;
@@ -907,14 +932,24 @@ static void rs_panel_master_send_journal_list_to_ready_panels(RsPanelMaster *mas
     }
 
     g_journal_window_size = n_items;
-    if (g_journal_selected >= total) {
+    if (s_journal_jump_newest != 0u) {
+        s_journal_jump_newest = 0u;
+        g_journal_selected = total - 1u;
+    } else if (g_journal_selected >= total) {
         g_journal_selected = total - 1u;
     }
-    if (g_journal_window_first == 0u && g_journal_selected == 0u) {
+    if (g_journal_window_first == 0u && g_journal_selected == 0u && total > 1u) {
+        /* Первое открытие: как ППКУ 1 — новейшая запись. */
         g_journal_selected = total - 1u;
-        if (total > (uint32_t)n_items) {
-            g_journal_window_first = total - (uint32_t)n_items;
+    }
+    if (total > (uint32_t)n_items) {
+        if (g_journal_selected + 1u >= (uint32_t)n_items) {
+            g_journal_window_first = g_journal_selected + 1u - (uint32_t)n_items;
+        } else {
+            g_journal_window_first = 0u;
         }
+    } else {
+        g_journal_window_first = 0u;
     }
     rs_panel_master_normalize_journal_window(total, n_items);
 
@@ -954,16 +989,15 @@ static void rs_panel_master_send_journal_list_to_ready_panels(RsPanelMaster *mas
         }
 
         uint16_t code = rec.event_code;
-
-        /* ts сейчас отправляем 0: в первом шаге нужен UI-контур. */
         uint32_t ts = 0u;
+        EventLogUiLines_t lines;
+        uint16_t item_start;
+        uint16_t max_pos = (uint16_t)(RS_BUS_MAX_WIRE_PAYLOAD - 1u); /* UI_DATA sub_id */
 
-        char short_text[49];
-        rs_panel_master_format_journal_short(rec_ptr, rec_idx, short_text, sizeof(short_text));
-        uint8_t text_len = (uint8_t)strnlen(short_text, 48u);
+        rs_panel_master_format_journal_lines(rec_ptr, rec_idx, &lines);
 
-        uint16_t need = (uint16_t)(4u /*rec_idx*/ + 4u /*ts*/ + 2u /*code*/ + 1u /*text_len*/ + (uint16_t)text_len);
-        if ((uint16_t)(pos + need) > RS_BUS_MAX_PAYLOAD) {
+        item_start = pos;
+        if ((uint16_t)(pos + 4u + 4u + 2u + 3u) > max_pos) {
             break;
         }
 
@@ -983,11 +1017,10 @@ static void rs_panel_master_send_journal_list_to_ready_panels(RsPanelMaster *mas
         ui_payload[pos++] = (uint8_t)(code & 0xFFu);
         ui_payload[pos++] = (uint8_t)((code >> 8) & 0xFFu);
 
-        ui_payload[pos++] = text_len;
-        if (text_len != 0u) {
-            memcpy(&ui_payload[pos], short_text, text_len);
-            pos = (uint16_t)(pos + text_len);
-        }
+        pos = rs_journal_put_counted_str(ui_payload, pos, max_pos, lines.header, RS_JOURNAL_HDR_MAX);
+        pos = rs_journal_put_counted_str(ui_payload, pos, max_pos, lines.title, RS_JOURNAL_TITLE_MAX);
+        pos = rs_journal_put_counted_str(ui_payload, pos, max_pos, lines.detail, RS_JOURNAL_DETAIL_MAX);
+        (void)item_start;
     }
 
     rs_panel_master_send_ui_data_to_ready_panels(master,
@@ -1518,12 +1551,14 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             }
 
             if (evt->p1 == 0u) {
-                if (g_journal_selected > 0u) {
-                    g_journal_selected--;
-                }
-            } else if (evt->p1 == 1u) {
+                /* UP = новее (как ППКУ 1 nextRecord) */
                 if ((g_journal_selected + 1u) < g_journal_total) {
                     g_journal_selected++;
+                }
+            } else if (evt->p1 == 1u) {
+                /* DOWN = старее */
+                if (g_journal_selected > 0u) {
+                    g_journal_selected--;
                 }
             }
 
@@ -1606,15 +1641,20 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                 break;
             }
 
-            /* ЖУРНАЛ: ENTER → открыть JOURNAL_DETAIL */
-            if (g_ui_current_screen_id != RS_PANEL_SCREEN_MENU_JOURNAL) {
+            /* ЖУРНАЛ: ENTER → к новейшей записи (как ППКУ 1 jumpToNewest). */
+            if (g_ui_current_screen_id != RS_PANEL_SCREEN_MENU_JOURNAL &&
+                g_ui_current_screen_id != RS_PANEL_SCREEN_MENU_JOURNAL_DETAIL) {
                 break;
             }
             if (g_journal_total == 0u) {
                 break;
             }
-            g_journal_detail_open = 1u;
-            rs_panel_master_send_journal_detail_to_ready_panels(master);
+            g_journal_detail_open = 0u;
+            s_journal_jump_newest = 1u;
+            rs_panel_master_send_ui_nav_to_ready_panels(master,
+                                                        RS_PANEL_SCREEN_MENU_JOURNAL,
+                                                        RS_PANEL_UI_ACTION_REPLACE);
+            rs_panel_master_send_journal_list_to_ready_panels(master);
             break;
 
         case RS_PANEL_UI_EVT_BACK:
@@ -1630,21 +1670,14 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
             /* ЖУРНАЛ */
             if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_JOURNAL ||
                 g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_JOURNAL_DETAIL) {
-                if (g_journal_detail_open != 0u) {
-                    g_journal_detail_open = 0u;
-                    rs_panel_master_send_ui_nav_to_ready_panels(master,
-                                                                RS_PANEL_SCREEN_MENU_JOURNAL,
-                                                                RS_PANEL_UI_ACTION_REPLACE);
-                    rs_panel_master_send_journal_list_to_ready_panels(master);
-                } else {
-                    rs_panel_master_send_ui_nav_to_ready_panels(master,
-                                                                RS_PANEL_SCREEN_MENU_ROOT,
-                                                                RS_PANEL_UI_ACTION_REPLACE);
-                    rs_panel_master_send_menu_list_to_ready_panels(master,
-                                                                     g_menu_selected,
-                                                                     g_menu_n_items);
-                    rs_panel_master_send_menu_state_to_ready_panels(master);
-                }
+                g_journal_detail_open = 0u;
+                rs_panel_master_send_ui_nav_to_ready_panels(master,
+                                                            RS_PANEL_SCREEN_MENU_ROOT,
+                                                            RS_PANEL_UI_ACTION_REPLACE);
+                rs_panel_master_send_menu_list_to_ready_panels(master,
+                                                                 g_menu_selected,
+                                                                 g_menu_n_items);
+                rs_panel_master_send_menu_state_to_ready_panels(master);
                 break;
             }
 
@@ -1737,8 +1770,9 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                 } break;
 
                 case 3u: {
-                    /* ЖУРНАЛ */
+                    /* ЖУРНАЛ — сразу новейшая запись, как ППКУ 1. */
                     g_journal_detail_open = 0u;
+                    s_journal_jump_newest = 1u;
                     rs_panel_master_send_ui_nav_to_ready_panels(master,
                                                                 RS_PANEL_SCREEN_MENU_JOURNAL,
                                                                 RS_PANEL_UI_ACTION_REPLACE);
