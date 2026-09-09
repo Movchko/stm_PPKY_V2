@@ -25,6 +25,7 @@
 #include "app.hpp"
 #include "led.h"
 #include "can_bus.h"
+#include "menu_ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -97,7 +98,7 @@ uint8_t isMainInit = 0;
 /* USER CODE BEGIN 0 */
 
 
-#define APP_VERSION_U32 14u
+#define APP_VERSION_U32 18u
 
 const char *GetAppVersion(void)
 {
@@ -169,10 +170,9 @@ int main(void)
   MX_USART1_UART_Init();
   MX_DTS_Init();
   /* USER CODE BEGIN 2 */
-  // must have for esp32
-  HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, GPIO_PIN_SET);
-  HAL_Delay(100);
+  /* Как на ППКУ 1: до AppInit держим ESP выключенным (EN/BOOT = 0).
+   * Включение — Esp32_SetEnabled(1) в AppInit: BOOT↑, затем EN↑, 100 ms. */
+  Esp32_SetEnabled(0);
 
   uint8_t isFlash = 0;
   isFlash = SPIF_Init(&hFlash, &hspi1, FLASH_CS_GPIO_Port, FLASH_CS_Pin);

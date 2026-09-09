@@ -81,10 +81,7 @@ extern int32_t CHANNEL_VAL[NUM_ADC_CHANNEL];
 
 uint8_t status_sec_cnt = 0;
 
-uint8_t uart_send_buf[32] = {0};
-
 extern UART_HandleTypeDef huart1;
-extern UART_HandleTypeDef huart2;
 static RsPanelMaster g_rs_panel_master;
 
 extern "C" __attribute__((weak)) void App_OnFireUiUpdate(uint8_t active, uint8_t mode,
@@ -347,36 +344,6 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters) {
 
 
 
-static void UartSendPpkyTime(void) {
-	// Формат: "PPKY " + 6 цифр BCD (HHMMSS) + "\r\n"
-	// Системное время берём из RTC
-	// BCD поля RTC: 0x23 → "23"
-	uint8_t h = cur_time.Hours;
-	uint8_t m = cur_time.Minutes;
-	uint8_t s = cur_time.Seconds;
-
-	uint8_t buf[16];
-	buf[0] = 'P';
-	buf[1] = 'P';
-	buf[2] = 'K';
-	buf[3] = 'Y';
-	buf[4] = ' ';
-	buf[5] = ((h >> 4) & 0x0F) + '0';
-	buf[6] = (h & 0x0F) + '0';
-	buf[7] = ((m >> 4) & 0x0F) + '0';
-	buf[8] = (m & 0x0F) + '0';
-	buf[9] = ((s >> 4) & 0x0F) + '0';
-	buf[10] = (s & 0x0F) + '0';
-	buf[11] = '\r';
-	buf[12] = '\n';
-
-	// Копируем в глобальный uart_send_buf и шлём по USART2 раз в секунду
-	memset(uart_send_buf, 0, sizeof(uart_send_buf));
-	memcpy(uart_send_buf, buf, 13);
-	HAL_UART_Transmit(&huart2, uart_send_buf, 13, 10);
-}
-
-
 void AppSetStatus() {
 
 	int32_t power_v = CHANNEL_VAL[4] / 1000;   // шаг 1В
@@ -432,8 +399,8 @@ void AppSetStatus() {
 
 	SendMessage(0, ServiceCmd_SetSystemTime, date, SEND_NOW, BUS_CAN12);
 
-	// Параллельно раз в секунду шлём время ППКУ по UART
-	UartSendPpkyTime();
+	/* Не слать ASCII в USART2: это линия ESP (BSU 1 Мбод). На ППКУ 1 такого TX нет.
+	 * Блокирующий HAL_UART_Transmit сюда срывал RX IT моста (uart_rx_started=1, приёма нет). */
 }
 
 static void UpdateActiveDeviceList(uint32_t msg_id, uint32_t now_ms) {

@@ -89,6 +89,7 @@ static volatile uint8_t  uart_tx_busy = 0;
 static volatile uint8_t  uart_rx_started = 0;
 static uint8_t           uart_rx_byte = 0;
 static UartRxState       uart_rx_state = UART_RX_PREAMBLE_0;
+
 static uint8_t           uart_body_buf[LOG_UART_BODY_MAX];
 static uint16_t          uart_pkt_size = 0;
 static uint16_t          uart_pkt_type = 0;
@@ -407,11 +408,15 @@ static void uart_bridge_rx_start(void)
 	if (!Esp32_IsEnabled()) {
 		return;
 	}
-	if (uart_rx_started != 0u) {
+	/* Если кто-то сделал блокирующий TX на huart2, RX IT мог умереть,
+	 * а uart_rx_started остаться 1 — перевзводим по реальному RxState. */
+	if (uart_rx_started != 0u && huart2.RxState == HAL_UART_STATE_BUSY) {
 		return;
 	}
 	if (HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1u) == HAL_OK) {
 		uart_rx_started = 1u;
+	} else {
+		uart_rx_started = 0u;
 	}
 }
 
@@ -1132,7 +1137,19 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
 	uart_tx_busy = 0u;
 	uart_rx_started = 0u;
+	uart_rx_reset();
 	LogTransport_OnUartError(huart);
-	(void)HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1u);
-	uart_rx_started = 1u;
+
+	/* Сброс FE/NE/ORE и слив RDR — иначе Receive_IT часто не встаёт снова. */
+	__HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_PEF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_OREF);
+	if (__HAL_UART_GET_FLAG(huart, UART_FLAG_RXNE) != 0u) {
+		volatile uint32_t discard = huart->Instance->RDR;
+		(void)discard;
+	}
+	huart->ErrorCode = HAL_UART_ERROR_NONE;
+	huart->RxState = HAL_UART_STATE_READY;
+
+	if (Esp32_IsEnabled() && HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1u) == HAL_OK) {
+		uart_rx_started = 1u;
+	}
 }
