@@ -30,6 +30,8 @@ const EventLogDescriptor_t g_event_log_catalog[] = {
 	EV(EVENT_LOG_PANEL_BTN_PRESS,        EVENT_LOG_LEVEL_CRITICAL, 0),
 	EV(EVENT_LOG_COUNTDOWN_PAUSE,        EVENT_LOG_LEVEL_CRITICAL, 0),
 	EV(EVENT_LOG_COUNTDOWN_RESUME,       EVENT_LOG_LEVEL_CRITICAL, 0),
+	EV(EVENT_LOG_CONFIG_SAVED,           EVENT_LOG_LEVEL_CRITICAL, 0),
+	EV(EVENT_LOG_ZONE_NAME,              EVENT_LOG_LEVEL_CRITICAL, 0),
 };
 
 const uint32_t g_event_log_catalog_count = sizeof(g_event_log_catalog) / sizeof(g_event_log_catalog[0]);

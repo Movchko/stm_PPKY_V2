@@ -614,7 +614,8 @@ static void can_rx_drain_fifo(FDCAN_HandleTypeDef *hfdcan, uint32_t rx_fifo, uin
 		if (HAL_FDCAN_GetRxMessage(hfdcan, rx_fifo, &msg, data) != HAL_OK) {
 			break;
 		}
-		uart_tx_packet_push(can_bus, msg.Identifier, data);
+		/* Не зеркалить в UART здесь: каждый RX (в т.ч. дубликаты шин) забивает
+		 * uart_tx_ring. Уникальные кадры — после дедупа в CanProcess (как ППКУ1). */
 		CanRxPush(msg.Identifier, data, can_bus);
 	}
 }
@@ -693,66 +694,70 @@ void CanProcess(void)
 		pending_timeout[d] = 0;
 	}
 
-	/* while */ if (can_rx_head != can_rx_tail) {
-		CanRxEntry *e = &can_rx_ring[can_rx_tail];
-		can_rx_tail++;
-		if (can_rx_tail >= CAN_RX_RING_SIZE) {
-			can_rx_tail = 0;
-		}
+	{
+		uint8_t budget = 32u;
+		while (budget-- != 0u && can_rx_head != can_rx_tail) {
+			CanRxEntry *e = &can_rx_ring[can_rx_tail];
+			can_rx_tail++;
+			if (can_rx_tail >= CAN_RX_RING_SIZE) {
+				can_rx_tail = 0;
+			}
 
-		uint8_t dev;
-		uint8_t other_bus;
-		uint32_t *last_id_other;
-		uint8_t  *last_data_other;
-		uint32_t *last_id_cur;
-		uint8_t  *last_data_cur;
+			uint8_t dev;
+			uint8_t other_bus;
+			uint32_t *last_id_other;
+			uint8_t  *last_data_other;
+			uint32_t *last_id_cur;
+			uint8_t  *last_data_cur;
 
-		dev = CAN_DEVICE_INDEX(e->id);
-		if (e->can_bus == CAN_BUS_1) {
-			other_bus = CAN_BUS_2;
-		} else {
-			other_bus = CAN_BUS_1;
-		}
+			dev = CAN_DEVICE_INDEX(e->id);
+			if (e->can_bus == CAN_BUS_1) {
+				other_bus = CAN_BUS_2;
+			} else {
+				other_bus = CAN_BUS_1;
+			}
 
-		if (other_bus == CAN_BUS_1) {
-			last_id_other = &last_id_can1[dev];
-			last_data_other = last_data_can1[dev];
-		} else {
-			last_id_other = &last_id_can2[dev];
-			last_data_other = last_data_can2[dev];
-		}
+			if (other_bus == CAN_BUS_1) {
+				last_id_other = &last_id_can1[dev];
+				last_data_other = last_data_can1[dev];
+			} else {
+				last_id_other = &last_id_can2[dev];
+				last_data_other = last_data_can2[dev];
+			}
 
-		if (e->can_bus == CAN_BUS_1) {
-			last_id_cur = &last_id_can1[dev];
-			last_data_cur = last_data_can1[dev];
-		} else {
-			last_id_cur = &last_id_can2[dev];
-			last_data_cur = last_data_can2[dev];
-		}
+			if (e->can_bus == CAN_BUS_1) {
+				last_id_cur = &last_id_can1[dev];
+				last_data_cur = last_data_can1[dev];
+			} else {
+				last_id_cur = &last_id_can2[dev];
+				last_data_cur = last_data_can2[dev];
+			}
 
-		/* Дубликат с другой шины: тот же пакет уже пришёл с другой линии — не парсить, снять ожидание */
-		if (*last_id_other != CAN_ID_NONE && e->id == *last_id_other && memcmp(e->data, last_data_other, 8) == 0) {
+			/* Дубликат с другой шины: тот же пакет уже пришёл с другой линии — не парсить, снять ожидание */
+			if (*last_id_other != CAN_ID_NONE && e->id == *last_id_other && memcmp(e->data, last_data_other, 8) == 0) {
+				*last_id_cur = e->id;
+				memcpy(last_data_cur, e->data, 8);
+				pending_timeout[dev] = 0;
+				device_can_error[dev] &= (uint8_t)(~(1 << (e->can_bus - 1)));
+				continue;
+			}
+
+			/* Один и тот же пакет дважды с одной шины — пропустить */
+			if (*last_id_cur != CAN_ID_NONE && e->id == *last_id_cur && memcmp(e->data, last_data_cur, 8) == 0) {
+				continue;
+			}
+
+			/* Уникальный пакет: разобрать один раз, ждать дубликат с другой шины */
+			ProtocolParse(e->id, e->data, BUS_CAN12);
+			App_PositionRxFromCan(e->id, e->data, e->can_bus, now);
+			uart_tx_packet_push(CAN_BUS_1, e->id, e->data);
+
 			*last_id_cur = e->id;
 			memcpy(last_data_cur, e->data, 8);
-			pending_timeout[dev] = 0;
-			device_can_error[dev] &= (uint8_t)(~(1 << (e->can_bus - 1)));
-			return; /* continue; */
+
+			pending_bus[dev] = other_bus;
+			pending_timeout[dev] = now + CAN_DUP_WINDOW_MS;
 		}
-
-		/* Один и тот же пакет дважды с одной шины — пропустить */
-		if (*last_id_cur != CAN_ID_NONE && e->id == *last_id_cur && memcmp(e->data, last_data_cur, 8) == 0) {
-			return; /* continue; */
-		}
-
-		/* Уникальный пакет: разобрать один раз, ждать дубликат с другой шины */
-		ProtocolParse(e->id, e->data, BUS_CAN12);
-		App_PositionRxFromCan(e->id, e->data, e->can_bus, now);
-
-		*last_id_cur = e->id;
-		memcpy(last_data_cur, e->data, 8);
-
-		pending_bus[dev] = other_bus;
-		pending_timeout[dev] = now + CAN_DUP_WINDOW_MS;
 	}
 }
 

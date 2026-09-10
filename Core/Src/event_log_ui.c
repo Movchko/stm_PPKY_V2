@@ -383,6 +383,12 @@ static void FormatTitle(const EventLogRecord_t *rec, char *title, size_t title_s
 	case EVENT_LOG_COUNTDOWN_RESUME:
 		snprintf(title, title_sz, "СНЯТ.ПАУЗ");
 		break;
+	case EVENT_LOG_CONFIG_SAVED:
+		snprintf(title, title_sz, "СОХР.КФГ");
+		break;
+	case EVENT_LOG_ZONE_NAME:
+		snprintf(title, title_sz, "ИМЯ ЗОНЫ");
+		break;
 	default:
 		snprintf(title, title_sz, "СОБ.%u", (unsigned)rec->event_code);
 		break;
@@ -488,6 +494,22 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 			FormatPpkyDetail(detail, detail_sz);
 		}
 		break;
+	case EVENT_LOG_CONFIG_SAVED:
+		snprintf(detail, detail_sz, "ППКУ зон %u/%u",
+			 (unsigned)a[0], (unsigned)a[1]);
+		break;
+	case EVENT_LOG_ZONE_NAME: {
+		char name[17];
+		memcpy(name, rec->can_data, 8u);
+		memcpy(name + 8u, rec->additional, 8u);
+		name[16] = '\0';
+		if (name[0] == '\0') {
+			snprintf(detail, detail_sz, "%u", (unsigned)zone);
+		} else {
+			snprintf(detail, detail_sz, "%u %s", (unsigned)zone, name);
+		}
+		break;
+	}
 	default:
 		if (IsMcuDType(d_type)) {
 			FormatMkuDetail(detail, detail_sz, zone, h_adr, d_type);

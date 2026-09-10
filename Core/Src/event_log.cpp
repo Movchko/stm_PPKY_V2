@@ -180,6 +180,85 @@ void EventLog_LogConfigApplyOk(uint8_t mcu_ok_count, uint8_t mcu_total)
 	(void)EventLog_Post(EVENT_LOG_CONFIG_APPLY_OK, &payload);
 }
 
+#define EVENT_LOG_ZONE_NAME_PACKED_BYTES  16u /* can_data[8] + additional[8] */
+
+static uint8_t EventLog_CountNamedZones(void)
+{
+	uint8_t count = 0u;
+	for (uint16_t zi = 0u; zi < ZONE_NUMBER; zi++) {
+		if (PPKYConfig.zone_name[zi][0] != 0) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static void EventLog_PackZoneName(const int8_t *src, uint8_t can_data[8], uint8_t additional[8])
+{
+	uint8_t packed[EVENT_LOG_ZONE_NAME_PACKED_BYTES];
+	uint8_t i;
+
+	memset(packed, 0, sizeof(packed));
+	if (src == nullptr) {
+		memcpy(can_data, packed, 8u);
+		memcpy(additional, packed + 8u, 8u);
+		return;
+	}
+	for (i = 0u; i < EVENT_LOG_ZONE_NAME_PACKED_BYTES && i < ZONE_NAME_SIZE; i++) {
+		if (src[i] == 0) {
+			break;
+		}
+		packed[i] = (uint8_t)src[i];
+	}
+	memcpy(can_data, packed, 8u);
+	memcpy(additional, packed + 8u, 8u);
+}
+
+static void EventLog_LogZoneName(uint8_t zone_1based, const int8_t *name)
+{
+	EventLogPayload_t payload;
+	can_ext_id_t id;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+
+	id.ID = 0u;
+	id.field.zone = zone_1based & 0x7Fu;
+	id.field.d_type = DEVICE_PPKY_TYPE;
+	id.field.h_adr = PPKYConfig.UId.devId.h_adr;
+	id.field.dir = 1u;
+	payload.can_header = id.ID & 0x1FFFFFFFu;
+
+	EventLog_PackZoneName(name, payload.can_data, payload.additional);
+	(void)EventLog_Post(EVENT_LOG_ZONE_NAME, &payload);
+}
+
+void EventLog_LogConfigSaved(void)
+{
+	EventLogPayload_t payload;
+	uint8_t named_count;
+
+	if (!g_initialized) {
+		return;
+	}
+
+	named_count = EventLog_CountNamedZones();
+	memset(&payload, 0, sizeof(payload));
+	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+	payload.additional[0] = named_count;
+	payload.additional[1] = (uint8_t)ZONE_NUMBER;
+	if (!EventLog_Post(EVENT_LOG_CONFIG_SAVED, &payload)) {
+		return;
+	}
+
+	for (uint16_t zi = 0u; zi < ZONE_NUMBER; zi++) {
+		if (PPKYConfig.zone_name[zi][0] == 0) {
+			continue;
+		}
+		EventLog_LogZoneName((uint8_t)(zi + 1u), PPKYConfig.zone_name[zi]);
+	}
+}
+
 static uint8_t EventLog_IsMcuType(uint8_t d_type)
 {
 	return (d_type == DEVICE_MCU_IGN_TYPE || d_type == DEVICE_MCU_TC_TYPE || d_type == DEVICE_MCU_K1 || d_type == DEVICE_MCU_K2 || d_type == DEVICE_MCU_K3 || d_type == DEVICE_MCU_KR) ? 1u : 0u;

@@ -44,6 +44,8 @@ typedef enum {
 	EVENT_LOG_PANEL_BTN_PRESS        = 23,
 	EVENT_LOG_COUNTDOWN_PAUSE        = 24,
 	EVENT_LOG_COUNTDOWN_RESUME       = 25,
+	EVENT_LOG_CONFIG_SAVED           = 26,
+	EVENT_LOG_ZONE_NAME              = 27,
 } EventLogCode_t;
 
 typedef struct {

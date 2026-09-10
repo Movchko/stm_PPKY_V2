@@ -7,7 +7,7 @@
 
 #include <string.h>
 
-#define LOG_TX_QUEUE_SIZE              8u
+#define LOG_TX_QUEUE_SIZE              32u
 #define LOG_UART_BODY_MAX              246u
 
 typedef struct {

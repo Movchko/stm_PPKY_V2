@@ -87,7 +87,7 @@ static uint8_t g_connection_selected = 0u;
 
 /* UI TX нельзя делать из HAL_UARTEx_RxEventCallback: AbortReceive+Transmit
  * на half-duplex ломает DMA/RX. Очередь → Process10ms (main). */
-#define RS_PANEL_UI_EVT_Q_DEPTH 4u
+#define RS_PANEL_UI_EVT_Q_DEPTH 16u
 typedef struct {
     uint8_t panel_idx;
     RsPanelPollRsp rsp;
@@ -96,6 +96,31 @@ static RsPanelUiEvtQItem s_ui_evt_q[RS_PANEL_UI_EVT_Q_DEPTH];
 static volatile uint8_t s_ui_evt_q_head = 0u;
 static volatile uint8_t s_ui_evt_q_tail = 0u;
 static volatile uint8_t s_ui_evt_q_count = 0u;
+
+/* ESP_UART inject тоже нельзя слать из UART2 RX IRQ (can_bus): тот же Abort+TX.
+ * Кадры копятся здесь и уходят из Process10ms (не больше 1 TX за тик). */
+#define RS_PANEL_INJECT_Q_DEPTH 8u
+typedef struct {
+    uint16_t len;
+    uint8_t data[ESP_UART_BODY_MAX];
+} RsPanelInjectQItem;
+static RsPanelInjectQItem s_inject_q[RS_PANEL_INJECT_Q_DEPTH];
+static volatile uint8_t s_inject_q_head = 0u;
+static volatile uint8_t s_inject_q_tail = 0u;
+static volatile uint8_t s_inject_q_count = 0u;
+static volatile uint8_t s_inject_pause_poll = 0u;
+static uint32_t s_inject_pause_until_ms = 0u;
+
+static uint8_t rs_panel_inject_cmd_allowed(uint8_t cmd)
+{
+    /* Только команды прошивки/бутлоадера с ПК. Иначе мусор ESP при WiFi
+     * забивает очередь и Process10ms намертво крутит SendRaw. */
+    return (cmd == RS_PANEL_CMD_ENTER_BOOTLOADER ||
+            cmd == RS_PANEL_CMD_BOOT_RESET_MCU ||
+            cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD ||
+            cmd == RS_PANEL_CMD_BOOT_UPD_TRANSMIT ||
+            cmd == RS_PANEL_CMD_BOOT_GET_VERSION) ? 1u : 0u;
+}
 
 static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                                              PanelState *panel,
@@ -2386,6 +2411,61 @@ void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_
     RsBus_ProcessRxBytes(&master->bus, data, len);
 }
 
+static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cmd)
+{
+    uint32_t add_ms = 2000u;
+
+    /* Во время erase слова 0 бутлоадер занят десятки секунд. Если за это время
+     * снова пойдёт POLL — RX-кольцо панели забьётся, ACK пропадут. */
+    if (cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD) {
+        add_ms = 45000u;
+    } else if (cmd == RS_PANEL_CMD_ENTER_BOOTLOADER) {
+        add_ms = 5000u;
+    } else if (cmd == RS_PANEL_CMD_BOOT_UPD_TRANSMIT) {
+        add_ms = 10000u;
+    } else if (cmd == RS_PANEL_CMD_BOOT_GET_VERSION ||
+               cmd == RS_PANEL_CMD_BOOT_RESET_MCU) {
+        add_ms = 2000u;
+    }
+    {
+        uint32_t until = now_ms + add_ms;
+        if (s_inject_pause_until_ms == 0u ||
+            (int32_t)(until - s_inject_pause_until_ms) > 0) {
+            s_inject_pause_until_ms = until;
+        }
+    }
+    s_inject_pause_poll = 0u;
+}
+
+static void rs_panel_master_inject_process_pending(RsPanelMaster *master, uint32_t now_ms)
+{
+    RsPanelInjectQItem item;
+    uint32_t primask;
+    RsBusFrameView view;
+    uint16_t consumed = 0u;
+
+    /* Не больше одного RS TX за 10 мс тик — иначе WiFi/ESP заливает main loop. */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_inject_q_count == 0u) {
+        __set_PRIMASK(primask);
+        return;
+    }
+    item = s_inject_q[s_inject_q_head];
+    s_inject_q_head = (uint8_t)((s_inject_q_head + 1u) % RS_PANEL_INJECT_Q_DEPTH);
+    s_inject_q_count--;
+    __set_PRIMASK(primask);
+
+    if (master == 0 || item.len == 0u) {
+        return;
+    }
+    (void)RsBus_SendRaw(&master->bus, item.data, item.len);
+    if (RsBus_FrameDecode(item.data, item.len, &view, &consumed) != 0u &&
+        rs_panel_inject_cmd_allowed(view.cmd) != 0u) {
+        rs_panel_master_inject_extend_poll_pause(now_ms, view.cmd);
+    }
+}
+
 void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
 {
     PanelState *panel;
@@ -2395,6 +2475,31 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
 
     if (master == 0 || master->panel_count == 0u) {
         return;
+    }
+
+    if (s_inject_pause_poll != 0u) {
+        /* Пока кадр ещё в очереди — держим длинную паузу POLL (см. extend). */
+        rs_panel_master_inject_extend_poll_pause(now_ms, RS_PANEL_CMD_BOOT_SET_UPD_WORD);
+        s_inject_pause_poll = 0u;
+    }
+
+    /* Host→RS inject (в т.ч. 0xF3) — вне UART2 IRQ, максимум 1 кадр/тик. */
+    if (s_inject_q_count != 0u) {
+        rs_panel_master_inject_process_pending(master, now_ms);
+        /* Не делаем POLL в том же тике (half-duplex). */
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        return;
+    }
+
+    if (s_inject_pause_until_ms != 0u) {
+        if ((int32_t)(now_ms - s_inject_pause_until_ms) < 0) {
+            /* Тишина на RS: ждём ACK бутлоадера, без POLL/UI TX. */
+            RsPanelMasterDebug_Timer10ms();
+            return;
+        }
+        s_inject_pause_until_ms = 0u;
     }
 
     /* Сначала UI-ответы на кнопки (TX вне RX IRQ).
@@ -2549,8 +2654,10 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
 {
     RsBusFrameView view;
     uint16_t consumed = 0u;
+    uint32_t primask;
 
-    if (g_active_master == 0 || frame == 0 || frame_len == 0u) {
+    if (g_active_master == 0 || frame == 0 || frame_len == 0u ||
+        frame_len > ESP_UART_BODY_MAX) {
         return 0u;
     }
     if (RsBus_FrameDecode(frame, frame_len, &view, &consumed) == 0u) {
@@ -2560,9 +2667,23 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
     if ((view.flags & RS_BUS_FLAG_DIR) != 0u) {
         return 0u;
     }
-    if (RsBus_SendRaw(&g_active_master->bus, frame, frame_len) != HAL_OK) {
+    if (rs_panel_inject_cmd_allowed(view.cmd) == 0u) {
         return 0u;
     }
+
+    /* Не TX из IRQ UART2 — только постановка в очередь Process10ms. */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_inject_q_count >= RS_PANEL_INJECT_Q_DEPTH) {
+        __set_PRIMASK(primask);
+        return 0u;
+    }
+    memcpy(s_inject_q[s_inject_q_tail].data, frame, frame_len);
+    s_inject_q[s_inject_q_tail].len = frame_len;
+    s_inject_q_tail = (uint8_t)((s_inject_q_tail + 1u) % RS_PANEL_INJECT_Q_DEPTH);
+    s_inject_q_count++;
+    s_inject_pause_poll = 1u;
+    __set_PRIMASK(primask);
     return 1u;
 }
 

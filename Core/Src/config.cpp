@@ -4,6 +4,7 @@
 #include "device_cfg_common.h"
 #include "backend.h"
 #include "menu_ui.h"
+#include "event_log.h"
 
 extern struct PPKYCfg PPKYConfig;       // локальная (рабочая) конфигурация
 extern struct PPKYCfg SavedPPKYConfig; // копия сохранённой конфигурации из Flash
@@ -61,6 +62,8 @@ void SaveConfig() {
 		// Что-то пошло не так, оставляем SavedPPKYConfig равным локальной конфигурации
 		SavedPPKYConfig = PPKYConfig;
 	}
+
+	EventLog_LogConfigSaved();
 }
 
 // Запись 4-байтового слова в локальную конфигурацию (big-endian)
