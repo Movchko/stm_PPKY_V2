@@ -357,6 +357,11 @@ static void uart_bridge_on_rx_byte(uint8_t b)
 				uart_rx_reset();
 				break;
 			}
+		} else if (uart_pkt_type == BSU_PKT_TYPE_ESP_CMD) {
+			if (uart_body_total == 0u || uart_body_total > ESP_UART_BODY_MAX) {
+				uart_rx_reset();
+				break;
+			}
 		} else {
 			uart_rx_reset();
 			break;
@@ -392,6 +397,8 @@ static void uart_bridge_on_rx_byte(uint8_t b)
 			} else if (uart_pkt_type == BSU_PKT_TYPE_ESP_UART) {
 				/* ПО → ESP → ППКУ → RS485 (панель / бутлоадер). */
 				(void)RsPanelMaster_InjectRawRsFrame(uart_body_buf, uart_body_total);
+			} else if (uart_pkt_type == BSU_PKT_TYPE_ESP_CMD) {
+				EspManager_OnEspCmd(uart_body_buf, uart_body_total);
 			}
 		}
 		uart_rx_reset();

@@ -13,6 +13,13 @@ void EspManager_Process(uint32_t now_ms);
 void EspManager_OnEspPoweredOn(void);
 void EspManager_OnEspPoweredOff(void);
 void EspManager_OnActivity(const uint8_t *payload, uint16_t len);
+/** Ответ ESP_CMD (тип 3) с UART ESP: сборка версии по 159. */
+void EspManager_OnEspCmd(const uint8_t *payload, uint16_t len);
+/** Запрос версии ESP (команда 159). Пока без UI — вызывать при необходимости. */
+void EspManager_RequestVersion(void);
+/** Копия UTF-8 строки версии в out. Возвращает длину без нуля, 0 если ещё нет. */
+uint8_t EspManager_GetVersion(char *out, uint8_t out_size);
+uint8_t EspManager_IsVersionValid(void);
 /** Повторно запросить включение WiFi (меню связи и т.п.). */
 void EspManager_RequestWifiEnable(void);
 /** Выключить WiFi в ESP (меню «Связь»). */

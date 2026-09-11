@@ -34,6 +34,12 @@ static uint32_t s_wifi_attempt_start_ms = 0u;
 static uint8_t  s_prev_tcp_connected = 0u;
 static uint16_t s_cmd_seq = 0u;
 
+#define ESP_VERSION_STR_MAX 80u
+
+static char s_version_str[ESP_VERSION_STR_MAX];
+static uint8_t s_version_valid = 0u;
+static uint8_t s_version_pkt_next = 0u;
+
 void EspManager_Init(void)
 {
 	s_last_activity_ms = 0u;
@@ -48,6 +54,9 @@ void EspManager_Init(void)
 	s_next_wifi_retry_ms = 0u;
 	s_wifi_attempt_start_ms = 0u;
 	s_prev_tcp_connected = 0u;
+	s_version_str[0] = '\0';
+	s_version_valid = 0u;
+	s_version_pkt_next = 0u;
 }
 
 static void send_esp_cmd(uint8_t cmd, const uint8_t *payload, uint16_t payload_len)
@@ -111,6 +120,9 @@ void EspManager_OnEspPoweredOn(void)
 	s_prev_tcp_connected = 0u;
 	s_want_wifi = 0u;
 	s_user_wifi_on = 0u;
+	s_version_str[0] = '\0';
+	s_version_valid = 0u;
+	s_version_pkt_next = 0u;
 	/* Конфиг уйдёт после activity; WiFi — только по запросу из меню. */
 }
 
@@ -130,6 +142,9 @@ void EspManager_OnEspPoweredOff(void)
 	s_wifi_enabled = 0u;
 	s_tcp_connected = 0u;
 	s_last_activity_ms = 0u;
+	s_version_str[0] = '\0';
+	s_version_valid = 0u;
+	s_version_pkt_next = 0u;
 }
 
 void EspManager_RequestWifiEnable(void)
@@ -231,6 +246,106 @@ void EspManager_OnActivity(const uint8_t *payload, uint16_t len)
 		s_wifi_attempt_start_ms = s_last_activity_ms;
 	}
 	s_prev_tcp_connected = s_tcp_connected;
+}
+
+static uint8_t version_payload_empty(const uint8_t *payload, uint16_t len)
+{
+	uint16_t i;
+	if (payload == NULL || len < 3u) {
+		return 1u;
+	}
+	for (i = 2u; i < len && i < 8u; i++) {
+		if (payload[i] != 0u) {
+			return 0u;
+		}
+	}
+	return 1u;
+}
+
+void EspManager_OnEspCmd(const uint8_t *payload, uint16_t len)
+{
+	uint8_t pkt;
+	size_t n;
+	uint16_t i;
+
+	if (payload == NULL || len < 2u) {
+		return;
+	}
+	if (payload[0] != (uint8_t)ESP_CMD_GET_VERSION) {
+		return;
+	}
+
+	pkt = payload[1];
+	if (pkt == 0u && version_payload_empty(payload, len)) {
+		return;
+	}
+	if (pkt == 0u) {
+		s_version_str[0] = '\0';
+		s_version_valid = 0u;
+		s_version_pkt_next = 0u;
+	} else if (pkt != s_version_pkt_next) {
+		return;
+	}
+
+	n = strlen(s_version_str);
+	for (i = 2u; i < len && i < 8u; i++) {
+		if (payload[i] == 0u) {
+			s_version_valid = 1u;
+			s_version_pkt_next = 0u;
+			return;
+		}
+		if (n + 1u >= ESP_VERSION_STR_MAX) {
+			s_version_valid = 1u;
+			s_version_pkt_next = 0u;
+			return;
+		}
+		s_version_str[n++] = (char)payload[i];
+		s_version_str[n] = '\0';
+	}
+	s_version_pkt_next = (uint8_t)(pkt + 1u);
+	if (len < 8u) {
+		s_version_valid = 1u;
+		s_version_pkt_next = 0u;
+	}
+}
+
+void EspManager_RequestVersion(void)
+{
+	uint8_t body[8];
+
+	memset(body, 0, sizeof(body));
+	body[0] = (uint8_t)ESP_CMD_GET_VERSION;
+	s_version_str[0] = '\0';
+	s_version_valid = 0u;
+	s_version_pkt_next = 0u;
+	send_esp_cmd(ESP_CMD_GET_VERSION, &body[1], 7u);
+}
+
+uint8_t EspManager_GetVersion(char *out, uint8_t out_size)
+{
+	size_t n;
+
+	if (out == NULL || out_size == 0u) {
+		return 0u;
+	}
+	out[0] = '\0';
+	if (s_version_valid == 0u) {
+		return 0u;
+	}
+	n = strlen(s_version_str);
+	if (n >= (size_t)out_size) {
+		n = (size_t)out_size - 1u;
+	}
+	if (n > 0u) {
+		memcpy(out, s_version_str, n);
+	}
+	out[n] = '\0';
+	return (uint8_t)n;
+}
+
+uint8_t EspManager_IsVersionValid(void)
+{
+	return s_version_valid;
 }
 
 uint8_t EspManager_IsOnline(void)
