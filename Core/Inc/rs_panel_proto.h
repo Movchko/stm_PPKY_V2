@@ -8,12 +8,38 @@
 extern "C" {
 #endif
 
+typedef enum {
+    RS_PANEL_ADDR_FSM_IDLE = 0,
+    RS_PANEL_ADDR_FSM_WAIT_BOOT,
+    RS_PANEL_ADDR_FSM_DISCOVER,
+    RS_PANEL_ADDR_FSM_ASSIGN,
+    RS_PANEL_ADDR_FSM_SETTLE
+} RsPanelAddrFsm;
+
+typedef struct {
+    uint32_t uid0;
+    uint32_t uid1;
+    uint32_t uid2;
+    uint8_t current_addr;
+    uint8_t flags;
+    uint8_t assigned_addr;
+    uint8_t seen;
+} RsPanelDiscoverEntry;
+
 typedef struct {
     RsBusContext bus;
     PanelState panels[RS_PANEL_MAX_PANELS];
     uint8_t panel_count;
     uint8_t next_seq;
     uint8_t round_robin_idx;
+    /* Автораздача адресов / коллизии. */
+    RsPanelAddrFsm addr_fsm;
+    uint32_t addr_fsm_deadline_ms;
+    uint8_t addr_assign_idx;
+    uint8_t discover_count;
+    RsPanelDiscoverEntry discover[RS_PANEL_MAX_PANELS];
+    uint8_t collision_pending;
+    uint8_t first_boot_discover_done;
 } RsPanelMaster;
 
 void RsPanelMaster_Init(RsPanelMaster *master,

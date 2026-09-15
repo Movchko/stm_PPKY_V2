@@ -16,6 +16,7 @@
 #include "sound_profiles.h"
 #include "menu_ui.h"
 #include "rs_panel_master_debug.h"
+#include "rs_panel_proto.h"
 
 #define WARN_TITLE_LEN 24
 
@@ -1219,11 +1220,13 @@ static void UpdateFaultSound(uint32_t now_ms)
 			g_attention_sound_phase = ATTN_SOUND_WAIT_PERIODIC;
 			g_attention_sound_deadline_ms =
 				now_ms + ((SOUND_ATTN_SIGNAL_ON_MS + SOUND_ATTN_SIGNAL_OFF_MS) * (uint32_t)SOUND_ATTN_SIGNAL_PULSES);
+			RsPanelMaster_PushSound();
 		} else if (g_attention_sound_phase == ATTN_SOUND_WAIT_PERIODIC &&
 			   TimeReached(now_ms, g_attention_sound_deadline_ms)) {
 			Beeper_StartPulseTrain(SOUND_ATTN_DUTY_ON_MS, SOUND_ATTN_DUTY_OFF_MS,
 					       SOUND_ATTN_DUTY_PULSES, SOUND_ATTN_DUTY_REPEAT_MS);
 			g_attention_sound_phase = ATTN_SOUND_PERIODIC;
+			RsPanelMaster_PushSound();
 		}
 
 		g_prev_sound_attention_count = attention_count;
@@ -1232,13 +1235,16 @@ static void UpdateFaultSound(uint32_t now_ms)
 	}
 
 	if (fault_count == 0u) {
+		uint8_t stopped = 0u;
 		if (g_fault_sound_phase == FAULT_SOUND_PERIODIC ||
 		    g_fault_sound_phase == FAULT_SOUND_WAIT_PERIODIC) {
 			Beeper_StopPattern();
+			stopped = 1u;
 		}
 		if (g_attention_sound_phase == ATTN_SOUND_PERIODIC ||
 		    g_attention_sound_phase == ATTN_SOUND_WAIT_PERIODIC) {
 			Beeper_StopPattern();
+			stopped = 1u;
 		}
 		g_fault_sound_phase = FAULT_SOUND_IDLE;
 		g_fault_sound_deadline_ms = 0u;
@@ -1246,6 +1252,9 @@ static void UpdateFaultSound(uint32_t now_ms)
 		g_attention_sound_deadline_ms = 0u;
 		g_prev_sound_fault_count = fault_count;
 		g_prev_sound_attention_count = attention_count;
+		if (stopped != 0u) {
+			RsPanelMaster_PushSound();
+		}
 		return;
 	}
 
@@ -1262,6 +1271,7 @@ static void UpdateFaultSound(uint32_t now_ms)
 			now_ms + ((SOUND_FAULT_SIGNAL_ON_MS + SOUND_FAULT_SIGNAL_OFF_MS) * (uint32_t)SOUND_FAULT_SIGNAL_PULSES);
 		g_prev_sound_fault_count = fault_count;
 		g_prev_sound_attention_count = attention_count;
+		RsPanelMaster_PushSound();
 		return;
 	}
 	g_prev_sound_fault_count = fault_count;
@@ -1271,6 +1281,7 @@ static void UpdateFaultSound(uint32_t now_ms)
 		Beeper_StartPulseTrain(SOUND_FAULT_DUTY_ON_MS, SOUND_FAULT_DUTY_OFF_MS,
 				       SOUND_FAULT_DUTY_PULSES, SOUND_FAULT_DUTY_REPEAT_MS);
 		g_fault_sound_phase = FAULT_SOUND_PERIODIC;
+		RsPanelMaster_PushSound();
 	}
 }
 

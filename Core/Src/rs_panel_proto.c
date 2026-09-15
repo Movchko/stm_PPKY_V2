@@ -20,6 +20,7 @@
 #include "beeper.h"
 #include "warning.h"
 #include "fire.h"
+#include "rtc_cache.h"
 
 extern PPKYCfg PPKYConfig;
 extern void SaveConfig(void);
@@ -81,6 +82,13 @@ static uint8_t rs_panel_master_accept_menu_root_evt(void)
 }
 
 #define RS_PANEL_CAPS_RETRY_MS 50u
+#define RS_PANEL_ADDR_BOOT_DELAY_MS 2000u
+#define RS_PANEL_ADDR_DISCOVER_WINDOW_MS 700u
+#define RS_PANEL_ADDR_ASSIGN_GAP_MS 80u
+#define RS_PANEL_ADDR_SETTLE_MS 500u
+/* Синхронизация RTC панелей: не чаще 1 раза в 10 минут. */
+#define RS_PANEL_TIME_SYNC_PERIOD_MS (10u * 60u * 1000u)
+
 static uint32_t s_last_caps_req_ms = 0u;
 static uint8_t g_block_zone_selected = 0u;
 static uint8_t g_connection_selected = 0u;
@@ -1144,9 +1152,77 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
     }
 }
 
+static volatile uint8_t s_sound_push_pending = 0u;
+static uint32_t s_last_time_sync_ms = 0u;
+
+static uint8_t rs_panel_sound_timings_eq(uint16_t on_ms, uint16_t off_ms, uint8_t pulses,
+                                         uint16_t repeat_ms,
+                                         uint16_t e_on, uint16_t e_off, uint8_t e_pulses,
+                                         uint16_t e_repeat)
+{
+    return (on_ms == e_on && off_ms == e_off && pulses == e_pulses && repeat_ms == e_repeat) ? 1u : 0u;
+}
+
+static uint8_t rs_panel_master_any_panel_ready(const RsPanelMaster *master)
+{
+    uint8_t i;
+
+    if (master == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < master->panel_count; i++) {
+        const PanelState *panel = &master->panels[i];
+        if (panel->cfg.enabled != 0u && PanelState_IsReady(panel) != 0u) {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+/* Broadcast CMD_TIME (0x32): панель без кварца/батарейки синхронизирует RTC от ППКУ. */
+static uint8_t rs_panel_master_send_time_broadcast(RsPanelMaster *master)
+{
+    RTC_TimeTypeDef time_bin;
+    RTC_DateTypeDef date_bin;
+    RsPanelTimeCmd cmd;
+    uint8_t payload[6];
+    uint16_t payload_len;
+
+    if (master == 0) {
+        return 0u;
+    }
+    if (!RtcCache_IsValid()) {
+        RtcCache_Refresh();
+    }
+    if (!RtcCache_GetBin(&time_bin, &date_bin)) {
+        return 0u;
+    }
+
+    cmd.hour = (uint8_t)time_bin.Hours;
+    cmd.min = (uint8_t)time_bin.Minutes;
+    cmd.sec = (uint8_t)time_bin.Seconds;
+    cmd.day = (uint8_t)date_bin.Date;
+    cmd.month = (uint8_t)date_bin.Month;
+    cmd.year = (uint8_t)date_bin.Year; /* offset от 2000 */
+
+    payload_len = RsPanel_EncodeTimeCmd(payload, (uint16_t)sizeof(payload), &cmd);
+    if (payload_len == 0u) {
+        return 0u;
+    }
+
+    (void)RsBus_SendFrame(&master->bus,
+                          RS_BUS_BROADCAST_ADDR,
+                          master->next_seq++,
+                          0u,
+                          RS_PANEL_CMD_TIME,
+                          payload,
+                          payload_len);
+    return 1u;
+}
+
 static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
 {
-    if (master == 0u) {
+    if (master == 0) {
         return;
     }
 
@@ -1160,13 +1236,53 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
     uint8_t pulses = 0u;
     uint16_t repeat_ms = 0u;
 
-    if (sound_enabled != 0u && state_code != 0u) {
-        profile = RS_PANEL_SOUND_CUSTOM;
-        mute = 0u;
-        on_ms = Beeper_GetPatternOnMs();
-        off_ms = Beeper_GetPatternOffMs();
-        pulses = Beeper_GetPatternPulses();
-        repeat_ms = Beeper_GetPatternRepeatMs();
+    /* BEEPER_STATE_CONTINUOUS=4, FIRE_ALARM=5, PATTERN=6 — как в beeper.c */
+    if (sound_enabled != 0u) {
+        if (state_code == 4u || state_code == 5u) {
+            /* ПОЖАР2 alert: непрерывный тон → именованный FIRE (не CUSTOM с нулями). */
+            profile = RS_PANEL_SOUND_FIRE;
+            mute = 0u;
+        } else if (state_code == 6u) {
+            on_ms = Beeper_GetPatternOnMs();
+            off_ms = Beeper_GetPatternOffMs();
+            pulses = Beeper_GetPatternPulses();
+            repeat_ms = Beeper_GetPatternRepeatMs();
+            mute = 0u;
+            /* Дежурные / известные профили как в ППКУ1 → именованные команды. */
+            if (rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                          SOUND_FAULT_DUTY_ON_MS, SOUND_FAULT_DUTY_OFF_MS,
+                                          SOUND_FAULT_DUTY_PULSES, SOUND_FAULT_DUTY_REPEAT_MS) != 0u) {
+                profile = RS_PANEL_SOUND_FAULT;
+            } else if (rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                                 SOUND_ATTN_DUTY_ON_MS, SOUND_ATTN_DUTY_OFF_MS,
+                                                 SOUND_ATTN_DUTY_PULSES, SOUND_ATTN_DUTY_REPEAT_MS) != 0u) {
+                profile = RS_PANEL_SOUND_ATTN;
+            } else if (rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                                 SOUND_FIRE1_DUTY_ON_MS, SOUND_FIRE1_DUTY_OFF_MS,
+                                                 SOUND_FIRE1_DUTY_PULSES, SOUND_FIRE1_DUTY_REPEAT_MS) != 0u) {
+                profile = RS_PANEL_SOUND_FIRE1;
+            } else if (rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                                 SOUND_FIRE_DUTY_ON_MS, SOUND_FIRE_DUTY_OFF_MS,
+                                                 SOUND_FIRE_DUTY_PULSES, SOUND_FIRE_DUTY_REPEAT_MS) != 0u) {
+                /* Дежурный ПОЖАР2 — на панели нет отдельного named duty, шлём CUSTOM. */
+                profile = RS_PANEL_SOUND_CUSTOM;
+            } else if (rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                                 SOUND_START_DUTY_ON_MS, SOUND_START_DUTY_OFF_MS,
+                                                 SOUND_START_DUTY_PULSES, SOUND_START_DUTY_REPEAT_MS) != 0u) {
+                profile = RS_PANEL_SOUND_START;
+            } else if (rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                                 SOUND_START_ALL_HOLD_DUTY_MS,
+                                                 (uint16_t)(SOUND_START_ALL_HOLD_PERIOD_MS - SOUND_START_ALL_HOLD_DUTY_MS),
+                                                 1u, SOUND_START_ALL_HOLD_PERIOD_MS) != 0u ||
+                       rs_panel_sound_timings_eq(on_ms, off_ms, pulses, repeat_ms,
+                                                 SOUND_START_ALL_HOLD_DUTY_MS, SOUND_START_ALL_HOLD_DUTY_MS,
+                                                 1u, 0u) != 0u) {
+                profile = RS_PANEL_SOUND_START_ALL_HOLD;
+            } else {
+                /* Сигнальный неиспр./внимание/ПОЖАР1 и прочие — CUSTOM с таймингами ППКУ1. */
+                profile = RS_PANEL_SOUND_CUSTOM;
+            }
+        }
     }
 
     uint8_t payload[9u];
@@ -1215,6 +1331,9 @@ static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
         s_logo_main_nav_deadline_ms = 0u;
     }
     s_panel_ui_resync_pending = 1u;
+    /* Сразу после READY — RTC / LED / SOUND (UI WARN/FIRE — после логотипа). */
+    s_last_time_sync_ms = 0u;
+    RsPanelMaster_PushSound();
     /* UI_NAV/WARN/FIRE не из обработчика RX CAPS: UART half-duplex, плюс логотип
      * на панели сам переходит на MAIN через 400 тиков. Снимок отправим после лого. */
 }
@@ -1272,7 +1391,7 @@ void App_OnFireUiUpdate(uint8_t active,
     rs_panel_master_send_ui_data_to_ready_panels(master, RS_PANEL_UI_DATA_MAIN_FIRE, ui_payload, pos);
 
     rs_panel_master_send_leds_to_ready_panels(master);
-    rs_panel_master_send_sound_to_ready_panels(master);
+    RsPanelMaster_PushSound();
 
     /* Журнал: обновляем кэш на панели по мере прихода UI-обновлений. */
     rs_panel_master_send_journal_list_to_ready_panels(master);
@@ -1352,7 +1471,7 @@ uint8_t App_OnWarningUiUpdate(uint8_t active,
     g_rs_master_dbg.last_warn_n_items = packed_items;
 
     rs_panel_master_send_leds_to_ready_panels(master);
-    rs_panel_master_send_sound_to_ready_panels(master);
+    RsPanelMaster_PushSound();
     return 1u;
 }
 
@@ -1789,7 +1908,7 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                         Beeper_SoundOnOff(new_beep != 0u);
                         EventLog_LogSoundToggle(new_beep, panel_addr);
                         rs_panel_master_send_menu_state_to_ready_panels(master);
-                        rs_panel_master_send_sound_to_ready_panels(master);
+                        RsPanelMaster_PushSound();
                         rs_panel_master_send_leds_to_ready_panels(master);
                     }
                 } break;
@@ -2052,6 +2171,11 @@ uint16_t RsPanel_EncodeActivity(uint8_t *dst, uint16_t dst_size, const RsPanelAc
     pos = (uint16_t)(pos + rs_put_u16le(&dst[pos], act->hw_id));
     dst[pos++] = act->status;
     pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], act->uptime_sec));
+    if (act->uid_valid != 0u && dst_size >= RS_PANEL_ACTIVITY_PAYLOAD_SIZE_UID) {
+        pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], act->uid0));
+        pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], act->uid1));
+        pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], act->uid2));
+    }
     return pos;
 }
 
@@ -2060,6 +2184,7 @@ uint8_t RsPanel_DecodeActivity(const uint8_t *src, uint16_t src_len, RsPanelActi
     if (src == 0 || out_act == 0 || src_len < RS_PANEL_ACTIVITY_PAYLOAD_SIZE) {
         return 0u;
     }
+    memset(out_act, 0, sizeof(*out_act));
     out_act->dev_type = src[0];
     out_act->fw_ver = rs_get_u16le(&src[1]);
     out_act->hw_id = rs_get_u16le(&src[3]);
@@ -2068,6 +2193,93 @@ uint8_t RsPanel_DecodeActivity(const uint8_t *src, uint16_t src_len, RsPanelActi
                           ((uint32_t)src[7] << 8) |
                           ((uint32_t)src[8] << 16) |
                           ((uint32_t)src[9] << 24);
+    if (src_len >= RS_PANEL_ACTIVITY_PAYLOAD_SIZE_UID) {
+        out_act->uid0 = (uint32_t)src[10] |
+                        ((uint32_t)src[11] << 8) |
+                        ((uint32_t)src[12] << 16) |
+                        ((uint32_t)src[13] << 24);
+        out_act->uid1 = (uint32_t)src[14] |
+                        ((uint32_t)src[15] << 8) |
+                        ((uint32_t)src[16] << 16) |
+                        ((uint32_t)src[17] << 24);
+        out_act->uid2 = (uint32_t)src[18] |
+                        ((uint32_t)src[19] << 8) |
+                        ((uint32_t)src[20] << 16) |
+                        ((uint32_t)src[21] << 24);
+        out_act->uid_valid = 1u;
+    }
+    return 1u;
+}
+
+uint16_t RsPanel_EncodeDiscoverRsp(uint8_t *dst, uint16_t dst_size, const RsPanelDiscoverRsp *rsp)
+{
+    uint16_t pos = 0u;
+
+    if (dst == 0 || rsp == 0 || dst_size < RS_PANEL_DISCOVER_RSP_SIZE) {
+        return 0u;
+    }
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], rsp->uid0));
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], rsp->uid1));
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], rsp->uid2));
+    dst[pos++] = rsp->current_addr;
+    dst[pos++] = rsp->flags;
+    return pos;
+}
+
+uint8_t RsPanel_DecodeDiscoverRsp(const uint8_t *src, uint16_t src_len, RsPanelDiscoverRsp *out_rsp)
+{
+    if (src == 0 || out_rsp == 0 || src_len < RS_PANEL_DISCOVER_RSP_SIZE) {
+        return 0u;
+    }
+    out_rsp->uid0 = (uint32_t)src[0] |
+                    ((uint32_t)src[1] << 8) |
+                    ((uint32_t)src[2] << 16) |
+                    ((uint32_t)src[3] << 24);
+    out_rsp->uid1 = (uint32_t)src[4] |
+                    ((uint32_t)src[5] << 8) |
+                    ((uint32_t)src[6] << 16) |
+                    ((uint32_t)src[7] << 24);
+    out_rsp->uid2 = (uint32_t)src[8] |
+                    ((uint32_t)src[9] << 8) |
+                    ((uint32_t)src[10] << 16) |
+                    ((uint32_t)src[11] << 24);
+    out_rsp->current_addr = src[12];
+    out_rsp->flags = src[13];
+    return 1u;
+}
+
+uint16_t RsPanel_EncodeAssignByUid(uint8_t *dst, uint16_t dst_size, const RsPanelAssignByUidCmd *cmd)
+{
+    uint16_t pos = 0u;
+
+    if (dst == 0 || cmd == 0 || dst_size < RS_PANEL_ASSIGN_BY_UID_SIZE) {
+        return 0u;
+    }
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], cmd->uid0));
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], cmd->uid1));
+    pos = (uint16_t)(pos + rs_put_u32le(&dst[pos], cmd->uid2));
+    dst[pos++] = cmd->new_addr;
+    return pos;
+}
+
+uint8_t RsPanel_DecodeAssignByUid(const uint8_t *src, uint16_t src_len, RsPanelAssignByUidCmd *out_cmd)
+{
+    if (src == 0 || out_cmd == 0 || src_len < RS_PANEL_ASSIGN_BY_UID_SIZE) {
+        return 0u;
+    }
+    out_cmd->uid0 = (uint32_t)src[0] |
+                    ((uint32_t)src[1] << 8) |
+                    ((uint32_t)src[2] << 16) |
+                    ((uint32_t)src[3] << 24);
+    out_cmd->uid1 = (uint32_t)src[4] |
+                    ((uint32_t)src[5] << 8) |
+                    ((uint32_t)src[6] << 16) |
+                    ((uint32_t)src[7] << 24);
+    out_cmd->uid2 = (uint32_t)src[8] |
+                    ((uint32_t)src[9] << 8) |
+                    ((uint32_t)src[10] << 16) |
+                    ((uint32_t)src[11] << 24);
+    out_cmd->new_addr = src[12];
     return 1u;
 }
 
@@ -2228,6 +2440,7 @@ uint8_t RsPanel_DecodeProfileSetCmd(const uint8_t *src, uint16_t src_len, RsPane
     case RS_PANEL_PROFILE_SET_ORIENTATION:
     case RS_PANEL_PROFILE_SET_BTN_MASK:
     case RS_PANEL_PROFILE_SET_JOURNAL_LINES:
+    case RS_PANEL_PROFILE_SET_RS_ADDR:
         if (src_len < 2u) {
             return 0u;
         }
@@ -2289,6 +2502,341 @@ static void rs_panel_forward_frame_to_esp(const RsBusFrameView *frame)
     (void)UartBridge_SendBsuPacket(BSU_PKT_TYPE_ESP_UART, g_esp_uart_fwd_seq++, raw, len);
 }
 
+static uint8_t rs_panel_uid_eq(uint32_t a0, uint32_t a1, uint32_t a2,
+                               uint32_t b0, uint32_t b1, uint32_t b2)
+{
+    return (a0 == b0 && a1 == b1 && a2 == b2) ? 1u : 0u;
+}
+
+static void rs_panel_master_discover_reset(RsPanelMaster *master)
+{
+    if (master == 0) {
+        return;
+    }
+    master->discover_count = 0u;
+    master->addr_assign_idx = 0u;
+    memset(master->discover, 0, sizeof(master->discover));
+}
+
+static void rs_panel_master_discover_add(RsPanelMaster *master, const RsPanelDiscoverRsp *rsp)
+{
+    uint8_t i;
+
+    if (master == 0 || rsp == 0) {
+        return;
+    }
+    for (i = 0u; i < master->discover_count; i++) {
+        if (rs_panel_uid_eq(master->discover[i].uid0, master->discover[i].uid1, master->discover[i].uid2,
+                            rsp->uid0, rsp->uid1, rsp->uid2) != 0u) {
+            master->discover[i].current_addr = rsp->current_addr;
+            master->discover[i].flags = rsp->flags;
+            master->discover[i].seen = 1u;
+            return;
+        }
+    }
+    if (master->discover_count >= RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    i = master->discover_count++;
+    master->discover[i].uid0 = rsp->uid0;
+    master->discover[i].uid1 = rsp->uid1;
+    master->discover[i].uid2 = rsp->uid2;
+    master->discover[i].current_addr = rsp->current_addr;
+    master->discover[i].flags = rsp->flags;
+    master->discover[i].assigned_addr = 0u;
+    master->discover[i].seen = 1u;
+}
+
+static uint8_t rs_panel_master_addr_in_use(const RsPanelMaster *master, uint8_t addr, uint8_t skip_idx)
+{
+    uint8_t i;
+
+    if (master == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < master->discover_count; i++) {
+        if (i == skip_idx) {
+            continue;
+        }
+        if (master->discover[i].assigned_addr == addr) {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+static uint8_t rs_panel_master_pick_free_addr(const RsPanelMaster *master, uint8_t preferred, uint8_t skip_idx)
+{
+    uint8_t a;
+
+    if (preferred >= 1u && preferred <= RS_PANEL_MAX_PANELS &&
+        rs_panel_master_addr_in_use(master, preferred, skip_idx) == 0u) {
+        return preferred;
+    }
+    for (a = 1u; a <= RS_PANEL_MAX_PANELS; a++) {
+        if (rs_panel_master_addr_in_use(master, a, skip_idx) == 0u) {
+            return a;
+        }
+    }
+    return 0u;
+}
+
+static void rs_panel_master_plan_assigns(RsPanelMaster *master)
+{
+    uint8_t i;
+    uint8_t used[RS_PANEL_MAX_PANELS + 1u];
+
+    if (master == 0) {
+        return;
+    }
+    memset(used, 0, sizeof(used));
+
+    /* Сначала оставляем уже уникальные assigned адреса. */
+    for (i = 0u; i < master->discover_count; i++) {
+        uint8_t cur = master->discover[i].current_addr;
+        uint8_t assigned = (master->discover[i].flags & RS_PANEL_DISCOVER_FLAG_ASSIGNED) != 0u;
+        uint8_t clash = 0u;
+        uint8_t j;
+
+        master->discover[i].assigned_addr = 0u;
+        if (assigned == 0u || cur < 1u || cur > RS_PANEL_MAX_PANELS) {
+            continue;
+        }
+        for (j = 0u; j < i; j++) {
+            if (master->discover[j].assigned_addr == cur) {
+                clash = 1u;
+                break;
+            }
+        }
+        if (clash == 0u && used[cur] == 0u) {
+            master->discover[i].assigned_addr = cur;
+            used[cur] = 1u;
+        }
+    }
+
+    /* Остальным — свободные 1..MAX. Virgin с current=1: первый оставить 1, остальным новые. */
+    for (i = 0u; i < master->discover_count; i++) {
+        uint8_t prefer;
+
+        if (master->discover[i].assigned_addr != 0u) {
+            continue;
+        }
+        prefer = master->discover[i].current_addr;
+        if (prefer < 1u || prefer > RS_PANEL_MAX_PANELS || used[prefer] != 0u) {
+            prefer = 0u;
+        }
+        master->discover[i].assigned_addr =
+            rs_panel_master_pick_free_addr(master, prefer, i);
+        if (master->discover[i].assigned_addr != 0u) {
+            used[master->discover[i].assigned_addr] = 1u;
+        }
+    }
+}
+
+static void rs_panel_master_apply_discovered_panels(RsPanelMaster *master)
+{
+    uint8_t i;
+    uint8_t n = 0u;
+
+    if (master == 0) {
+        return;
+    }
+    for (i = 0u; i < master->discover_count && n < RS_PANEL_MAX_PANELS; i++) {
+        PanelConfig cfg;
+        RsPanelDiscoverEntry *e = &master->discover[i];
+
+        if (e->assigned_addr == 0u) {
+            continue;
+        }
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.enabled = 1u;
+        cfg.addr = e->assigned_addr;
+        cfg.role = (n == 0u) ? RS_PANEL_ROLE_PRIMARY : RS_PANEL_ROLE_NORMAL;
+        cfg.poll_ms = 10u;
+        cfg.expected_hw_id = 0u;
+        PanelState_Reset(&master->panels[n]);
+        PanelState_BindConfig(&master->panels[n], &cfg);
+        master->panels[n].uid0 = e->uid0;
+        master->panels[n].uid1 = e->uid1;
+        master->panels[n].uid2 = e->uid2;
+        master->panels[n].uid_valid = 1u;
+        n++;
+    }
+    if (n == 0u) {
+        /* Нет ответов — оставляем дефолт addr=1. */
+        return;
+    }
+    master->panel_count = n;
+    master->round_robin_idx = 0u;
+}
+
+static void rs_panel_master_start_discover(RsPanelMaster *master, uint32_t now_ms)
+{
+    if (master == 0) {
+        return;
+    }
+    rs_panel_master_discover_reset(master);
+    master->addr_fsm = RS_PANEL_ADDR_FSM_DISCOVER;
+    master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_DISCOVER_WINDOW_MS;
+    master->collision_pending = 0u;
+    (void)RsBus_SendFrame(&master->bus,
+                          RS_BUS_BROADCAST_ADDR,
+                          master->next_seq++,
+                          0u,
+                          RS_PANEL_CMD_DISCOVER,
+                          0,
+                          0u);
+}
+
+static void rs_panel_master_send_next_assign(RsPanelMaster *master, uint32_t now_ms)
+{
+    uint8_t payload[RS_PANEL_ASSIGN_BY_UID_SIZE];
+    uint16_t len;
+    RsPanelAssignByUidCmd cmd;
+
+    if (master == 0) {
+        return;
+    }
+    while (master->addr_assign_idx < master->discover_count) {
+        RsPanelDiscoverEntry *e = &master->discover[master->addr_assign_idx];
+        master->addr_assign_idx++;
+        if (e->assigned_addr == 0u) {
+            continue;
+        }
+        if (e->assigned_addr == e->current_addr &&
+            (e->flags & RS_PANEL_DISCOVER_FLAG_ASSIGNED) != 0u) {
+            /* Уже на нужном адресе и помечена assigned — пропускаем. */
+            continue;
+        }
+        cmd.uid0 = e->uid0;
+        cmd.uid1 = e->uid1;
+        cmd.uid2 = e->uid2;
+        cmd.new_addr = e->assigned_addr;
+        len = RsPanel_EncodeAssignByUid(payload, sizeof(payload), &cmd);
+        if (len == 0u) {
+            continue;
+        }
+        (void)RsBus_SendFrame(&master->bus,
+                              RS_BUS_BROADCAST_ADDR,
+                              master->next_seq++,
+                              0u,
+                              RS_PANEL_CMD_ASSIGN_BY_UID,
+                              payload,
+                              len);
+        master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_ASSIGN_GAP_MS;
+        return;
+    }
+    rs_panel_master_apply_discovered_panels(master);
+    master->addr_fsm = RS_PANEL_ADDR_FSM_SETTLE;
+    master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_SETTLE_MS;
+    master->first_boot_discover_done = 1u;
+}
+
+static void rs_panel_master_addr_fsm_tick(RsPanelMaster *master, uint32_t now_ms)
+{
+    if (master == 0) {
+        return;
+    }
+
+    if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
+        if (master->collision_pending != 0u) {
+            rs_panel_master_start_discover(master, now_ms);
+            return;
+        }
+        if (master->first_boot_discover_done == 0u) {
+            master->addr_fsm = RS_PANEL_ADDR_FSM_WAIT_BOOT;
+            master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_BOOT_DELAY_MS;
+        }
+        return;
+    }
+
+    if ((int32_t)(now_ms - master->addr_fsm_deadline_ms) < 0) {
+        return;
+    }
+
+    switch (master->addr_fsm) {
+    case RS_PANEL_ADDR_FSM_WAIT_BOOT:
+        rs_panel_master_start_discover(master, now_ms);
+        break;
+    case RS_PANEL_ADDR_FSM_DISCOVER:
+        if (master->discover_count == 0u) {
+            /* Панели ещё не ответили — повторить через 3 с. */
+            master->addr_fsm = RS_PANEL_ADDR_FSM_WAIT_BOOT;
+            master->addr_fsm_deadline_ms = now_ms + 3000u;
+            break;
+        }
+        rs_panel_master_plan_assigns(master);
+        master->addr_fsm = RS_PANEL_ADDR_FSM_ASSIGN;
+        master->addr_assign_idx = 0u;
+        rs_panel_master_send_next_assign(master, now_ms);
+        break;
+    case RS_PANEL_ADDR_FSM_ASSIGN:
+        rs_panel_master_send_next_assign(master, now_ms);
+        break;
+    case RS_PANEL_ADDR_FSM_SETTLE:
+        master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
+        break;
+    default:
+        master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
+        break;
+    }
+}
+
+static void rs_panel_master_on_activity_uid(RsPanelMaster *master,
+                                           uint8_t frame_addr,
+                                           const RsPanelActivity *act)
+{
+    uint8_t i;
+    PanelState *matched = 0;
+
+    if (master == 0 || act == 0 || act->uid_valid == 0u) {
+        return;
+    }
+    if (act->dev_type != DEVICE_PANEL_TYPE) {
+        return;
+    }
+
+    for (i = 0u; i < master->panel_count; i++) {
+        PanelState *panel = &master->panels[i];
+        if (panel->cfg.addr != frame_addr) {
+            continue;
+        }
+        matched = panel;
+        if (panel->uid_valid == 0u) {
+            panel->uid0 = act->uid0;
+            panel->uid1 = act->uid1;
+            panel->uid2 = act->uid2;
+            panel->uid_valid = 1u;
+            return;
+        }
+        if (rs_panel_uid_eq(panel->uid0, panel->uid1, panel->uid2,
+                            act->uid0, act->uid1, act->uid2) == 0u) {
+            /* Тот же addr, другой UID — коллизия. */
+            if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
+                master->collision_pending = 1u;
+            }
+            return;
+        }
+        return;
+    }
+
+    /* ACTIVITY с известным addr слота нет, но UID уже есть в другом слоте — ок.
+     * ACTIVITY на addr, которого нет в конфиге: запомним коллизию/новое устройство. */
+    (void)matched;
+    if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
+        for (i = 0u; i < master->panel_count; i++) {
+            PanelState *panel = &master->panels[i];
+            if (panel->uid_valid != 0u &&
+                rs_panel_uid_eq(panel->uid0, panel->uid1, panel->uid2,
+                                act->uid0, act->uid1, act->uid2) != 0u) {
+                /* UID уже известен — возможно после assign ещё старый кадр. */
+                return;
+            }
+        }
+        master->collision_pending = 1u;
+    }
+}
+
 static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
 {
     RsPanelMaster *master = (RsPanelMaster *)ctx;
@@ -2306,6 +2854,23 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
     /* Прокидка в WiFi/ПО: activity + ответы boot-команд (тот же addr панели). */
     if (rs_panel_should_forward_to_host(frame) != 0u) {
         rs_panel_forward_frame_to_esp(frame);
+    }
+
+    if (frame->cmd == RS_PANEL_RSP_DISCOVER) {
+        RsPanelDiscoverRsp drsp;
+        if (RsPanel_DecodeDiscoverRsp(frame->payload, frame->payload_len, &drsp) != 0u) {
+            if (master->addr_fsm == RS_PANEL_ADDR_FSM_DISCOVER) {
+                rs_panel_master_discover_add(master, &drsp);
+            }
+        }
+        return;
+    }
+
+    if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
+        RsPanelActivity act;
+        if (RsPanel_DecodeActivity(frame->payload, frame->payload_len, &act) != 0u) {
+            rs_panel_master_on_activity_uid(master, frame->addr, &act);
+        }
     }
 
     for (i = 0u; i < master->panel_count; i++) {
@@ -2354,8 +2919,21 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                 (void)rs_panel_master_ui_evt_enqueue(i, &rsp);
             }
         } else if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
-            /* Presence для ПО уже прокинута выше; локально только фиксируем RX. */
+            RsPanelActivity act;
             panel->last_rx_ms = HAL_GetTick();
+            /* Падение uptime_sec = панель перезапустилась (питание/reset).
+             * Сбрасываем READY → снова CAPS → on_panel_became_ready (полный resync). */
+            if (RsPanel_DecodeActivity(frame->payload, frame->payload_len, &act) != 0u &&
+                act.dev_type == DEVICE_PANEL_TYPE) {
+                if (panel->uptime_valid != 0u &&
+                    act.uptime_sec < panel->last_uptime_sec &&
+                    panel->link_state == PANEL_LINK_READY) {
+                    panel->link_state = PANEL_LINK_CAPS_PENDING;
+                    panel->caps_valid = 0u;
+                }
+                panel->last_uptime_sec = act.uptime_sec;
+                panel->uptime_valid = 1u;
+            }
         }
         break;
     }
@@ -2391,6 +2969,8 @@ void RsPanelMaster_Init(RsPanelMaster *master,
     }
     memset(master, 0, sizeof(*master));
     master->next_seq = 1u;
+    master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
+    master->first_boot_discover_done = 0u;
     RsBus_Init(&master->bus, uart, de_port, de_pin, rs_panel_master_on_frame, master);
     RsPanelMaster_LoadDefaultConfig(master);
     g_active_master = master;
@@ -2398,9 +2978,8 @@ void RsPanelMaster_Init(RsPanelMaster *master,
 
 void RsPanelMaster_PushSound(void)
 {
-    if (g_active_master != 0) {
-        rs_panel_master_send_sound_to_ready_panels(g_active_master);
-    }
+    /* Не TX сразу из fire/warning — отложим в Process10ms (half-duplex RS). */
+    s_sound_push_pending = 1u;
 }
 
 void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_t len)
@@ -2502,6 +3081,43 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         s_inject_pause_until_ms = 0u;
     }
 
+    /* Звук fire/fault — отдельный TX, не привязан к WARN/FIRE UI. */
+    if (s_sound_push_pending != 0u) {
+        s_sound_push_pending = 0u;
+        rs_panel_master_send_sound_to_ready_panels(master);
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        return;
+    }
+
+    /* RTC → панели: не чаще 1/10 мин; первый раз — как только есть READY. */
+    if (rs_panel_master_any_panel_ready(master) != 0u &&
+        (s_last_time_sync_ms == 0u ||
+         (now_ms - s_last_time_sync_ms) >= RS_PANEL_TIME_SYNC_PERIOD_MS)) {
+        if (rs_panel_master_send_time_broadcast(master) != 0u) {
+            s_last_time_sync_ms = now_ms;
+            RsPanelMasterDebug_Timer10ms();
+            g_rs_master_dbg.menu_selected = g_menu_selected;
+            g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+            return;
+        }
+    }
+
+    /* Автораздача адресов / коллизии — приоритетнее POLL. */
+    if (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE || master->collision_pending != 0u ||
+        master->first_boot_discover_done == 0u) {
+        uint8_t prev_fsm = (uint8_t)master->addr_fsm;
+        rs_panel_master_addr_fsm_tick(master, now_ms);
+        if (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE ||
+            prev_fsm != (uint8_t)master->addr_fsm) {
+            RsPanelMasterDebug_Timer10ms();
+            g_rs_master_dbg.menu_selected = g_menu_selected;
+            g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+            return;
+        }
+    }
+
     /* Сначала UI-ответы на кнопки (TX вне RX IRQ).
      * В этом же тике не шлём POLL/WARN: иначе UI_NAV+MENU_LIST+POLL одним пакетом
      * и панель часто теряет первый вход в меню. */
@@ -2534,12 +3150,18 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         PanelState_IsReady(&master->panels[0]) != 0u &&
         s_logo_main_nav_deadline_ms == 0u &&
         rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u &&
-        Warning_IsProcessDelayActive() == 0u &&
-        Warning_GetLastUiBuildCount() != 0u) {
+        Warning_IsProcessDelayActive() == 0u) {
+        /* После старта/reboot панели: WARN + FIRE + LED (+ SOUND уже в PushSound). */
         s_panel_ui_resync_pending = 0u;
         Warning_ResetPanelUiCache();
         Warning_RepublishUiNow();
         Fire_ForceUiResync();
+        RsPanelMaster_PushSound();
+        rs_panel_master_send_leds_to_ready_panels(master);
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        return;
     }
 
     /* Если панель READY, но кэш «отправлено» без реальной доставки — сброс раз в 1 с,

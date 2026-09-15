@@ -16,6 +16,7 @@
 #include "gost_mode.h"
 #include "config_zone_block.h"
 #include "tick_time.h"
+#include "rs_panel_proto.h"
 
 extern PPKYCfg PPKYConfig;
 extern ActiveDeviceInfo g_active_devices[NUM_ACTIVE_DEVICE];
@@ -387,6 +388,7 @@ static void Fire_BeeperEnterAlert(uint8_t fire1_sound)
 	} else {
 		Beeper_FireAlarmOn();
 	}
+	RsPanelMaster_PushSound();
 }
 
 static void Fire_BeeperEnterDuty(uint8_t fire1_sound)
@@ -403,6 +405,7 @@ static void Fire_BeeperEnterDuty(uint8_t fire1_sound)
 		Beeper_StartPulseTrain(BEEPER_PATTERN_FIRE_ON_MS, BEEPER_PATTERN_FIRE_OFF_MS,
 				       BEEPER_PATTERN_FIRE_PULSES, BEEPER_PATTERN_FIRE_REPEAT_MS);
 	}
+	RsPanelMaster_PushSound();
 }
 
 static void Fire_BeeperEnterStartPattern(uint32_t now_ms)
@@ -417,6 +420,7 @@ static void Fire_BeeperEnterStartPattern(uint32_t now_ms)
 	Beeper_ContinuousOff();
 	Beeper_StartPulseTrain(BEEPER_PATTERN_START_ON_MS, BEEPER_PATTERN_START_OFF_MS,
 			       BEEPER_PATTERN_START_PULSES, BEEPER_PATTERN_START_REPEAT_MS);
+	RsPanelMaster_PushSound();
 }
 
 /* Есть зона, у которой тушение ещё в процессе (фаза 2 ушла, end_ack нет). */
@@ -468,6 +472,7 @@ static void Fire_StartAllHoldSoundOn(void)
 	Beeper_ContinuousOff();
 	/* Непрерывное мигание/звук 0.8/0.8с без дополнительной паузы между циклами. */
 	Beeper_StartPulseTrain(FIRE_START_ALL_SOUND_DUTY_MS, FIRE_START_ALL_SOUND_DUTY_MS, 1u, 0u);
+	RsPanelMaster_PushSound();
 }
 
 static void Fire_StartAllHoldSoundOff(void)
@@ -487,6 +492,7 @@ static void Fire_StartAllHoldSoundOff(void)
 		Beeper_StartPulseTrain(BEEPER_PATTERN_FIRE_ON_MS, BEEPER_PATTERN_FIRE_OFF_MS,
 				       BEEPER_PATTERN_FIRE_PULSES, BEEPER_PATTERN_FIRE_REPEAT_MS);
 	}
+	RsPanelMaster_PushSound();
 }
 
 static uint8_t Fire_ZoneCanToIdx(uint8_t zone_can)
@@ -2640,6 +2646,7 @@ static void Fire_SetIdleIndication(void)
 	if (!g_fire.start_all_hold_sound_active) {
 		Beeper_StopPattern();
 	}
+	RsPanelMaster_PushSound();
 }
 
 #if GOST_MODE

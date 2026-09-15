@@ -32,6 +32,14 @@ typedef struct {
     uint32_t last_rx_ms;
     uint32_t last_poll_ms;
     uint32_t watchdog_ms;
+    /* Chip UID с ACTIVITY (для коллизий). */
+    uint32_t uid0;
+    uint32_t uid1;
+    uint32_t uid2;
+    uint8_t uid_valid;
+    /* RSP_ACTIVITY.uptime_sec: падение = soft/hard reset панели. */
+    uint32_t last_uptime_sec;
+    uint8_t uptime_valid;
     /* Битмаска нажатых кнопок, агрегированная по событиям POLL от панели. */
     uint8_t remote_btn_mask;
     uint8_t pending_ack_seq;
