@@ -335,6 +335,10 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters) {
 		/* Применить конфиг-образ из ППКУ ко всем МКУ и проверить по CRC. */
 		ConfigSync_StartApply();
 	}break;
+	case 16: {
+		/* Внешняя команда: включить WiFi модуля ESP (без панели). */
+		EspManager_RequestWifiEnable();
+	}break;
 
 	default: break;
 	}

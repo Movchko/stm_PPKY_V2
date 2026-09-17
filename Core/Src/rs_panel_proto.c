@@ -118,6 +118,8 @@ static volatile uint8_t s_inject_q_tail = 0u;
 static volatile uint8_t s_inject_q_count = 0u;
 static volatile uint8_t s_inject_pause_poll = 0u;
 static uint32_t s_inject_pause_until_ms = 0u;
+/* Запрос WiFi с RS (sniffer): не вызывать EspManager из UART RX IRQ. */
+static volatile uint8_t s_wifi_enable_req = 0u;
 
 static uint8_t rs_panel_inject_cmd_allowed(uint8_t cmd)
 {
@@ -1153,6 +1155,9 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
 }
 
 static volatile uint8_t s_sound_push_pending = 0u;
+static uint8_t s_last_sound_tx[9];
+static uint16_t s_last_sound_tx_len = 0u;
+static uint8_t s_last_sound_tx_valid = 0u;
 static uint32_t s_last_time_sync_ms = 0u;
 
 static uint8_t rs_panel_sound_timings_eq(uint16_t on_ms, uint16_t off_ms, uint8_t pulses,
@@ -1300,6 +1305,16 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
         payload[8] = (uint8_t)(repeat_ms >> 8);
     }
 
+    /* Не слать повтор того же SOUND — иначе панель рестартит duty (кэш WARN / resync). */
+    if (s_last_sound_tx_valid != 0u &&
+        s_last_sound_tx_len == payload_len &&
+        memcmp(s_last_sound_tx, payload, payload_len) == 0) {
+        return;
+    }
+    memcpy(s_last_sound_tx, payload, payload_len);
+    s_last_sound_tx_len = payload_len;
+    s_last_sound_tx_valid = 1u;
+
     for (uint8_t i = 0u; i < master->panel_count; i++) {
         PanelState *panel = &master->panels[i];
         if (panel->cfg.enabled == 0u || PanelState_IsReady(panel) == 0u) {
@@ -1333,6 +1348,7 @@ static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
     s_panel_ui_resync_pending = 1u;
     /* Сразу после READY — RTC / LED / SOUND (UI WARN/FIRE — после логотипа). */
     s_last_time_sync_ms = 0u;
+    s_last_sound_tx_valid = 0u; /* панель перезагрузилась — обязательно переслать SOUND */
     RsPanelMaster_PushSound();
     /* UI_NAV/WARN/FIRE не из обработчика RX CAPS: UART half-duplex, плюс логотип
      * на панели сам переходит на MAIN через 400 тиков. Снимок отправим после лого. */
@@ -1391,7 +1407,8 @@ void App_OnFireUiUpdate(uint8_t active,
     rs_panel_master_send_ui_data_to_ready_panels(master, RS_PANEL_UI_DATA_MAIN_FIRE, ui_payload, pos);
 
     rs_panel_master_send_leds_to_ready_panels(master);
-    RsPanelMaster_PushSound();
+    /* SOUND не из FIRE UI: remaining_s меняется каждую секунду и сбрасывал бы
+     * дежурный паттерн на панели. Звук шлётся из fire/warning при смене фазы. */
 
     /* Журнал: обновляем кэш на панели по мере прихода UI-обновлений. */
     rs_panel_master_send_journal_list_to_ready_panels(master);
@@ -1471,7 +1488,7 @@ uint8_t App_OnWarningUiUpdate(uint8_t active,
     g_rs_master_dbg.last_warn_n_items = packed_items;
 
     rs_panel_master_send_leds_to_ready_panels(master);
-    RsPanelMaster_PushSound();
+    /* SOUND не из WARN UI: кэш WARN сбрасывается раз в 1 с и иначе рестартил duty на панели. */
     return 1u;
 }
 
@@ -2845,6 +2862,12 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
     if (master == 0 || frame == 0) {
         return;
     }
+    /* Host/sniffer → ППКУ: включить WiFi (DIR=0). Панели эту cmd не обрабатывают. */
+    if ((frame->flags & RS_BUS_FLAG_DIR) == 0u &&
+        frame->cmd == RS_PANEL_CMD_PPKY_WIFI_ENABLE) {
+        s_wifi_enable_req = 1u;
+        return;
+    }
     if ((frame->flags & RS_BUS_FLAG_DIR) == 0u) {
         g_rs_master_dbg.rx_frames_wrong_dir++;
         return;
@@ -3052,7 +3075,16 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     uint8_t payload[8];
     uint16_t payload_len;
 
-    if (master == 0 || master->panel_count == 0u) {
+    if (master == 0) {
+        return;
+    }
+
+    if (s_wifi_enable_req != 0u) {
+        s_wifi_enable_req = 0u;
+        EspManager_RequestWifiEnable();
+    }
+
+    if (master->panel_count == 0u) {
         return;
     }
 
@@ -3156,6 +3188,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         Warning_ResetPanelUiCache();
         Warning_RepublishUiNow();
         Fire_ForceUiResync();
+        s_last_sound_tx_valid = 0u;
         RsPanelMaster_PushSound();
         rs_panel_master_send_leds_to_ready_panels(master);
         RsPanelMasterDebug_Timer10ms();
@@ -3288,6 +3321,11 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
     /* Только master→slave (DIR=0): команды ПО на панель/бутлоадер. */
     if ((view.flags & RS_BUS_FLAG_DIR) != 0u) {
         return 0u;
+    }
+    /* WiFi enable — локально на ППКУ, на шину панелей не кладём. */
+    if (view.cmd == RS_PANEL_CMD_PPKY_WIFI_ENABLE) {
+        EspManager_RequestWifiEnable();
+        return 1u;
     }
     if (rs_panel_inject_cmd_allowed(view.cmd) == 0u) {
         return 0u;
