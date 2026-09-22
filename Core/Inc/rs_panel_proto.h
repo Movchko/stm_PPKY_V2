@@ -53,6 +53,11 @@ void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
 void RsPanelMaster_PushSound(void);
 /* Прокидка сырого RS-кадра с WiFi/ПО (BSU_PKT_TYPE_ESP_UART) на шину панелей. */
 uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len);
+/* Зеркало CAN→RS485 (cmd 0xF7/0xF8): default OFF. */
+void RsPanelMaster_SetCanMirrorEnable(uint8_t enable);
+uint8_t RsPanelMaster_IsCanMirrorEnabled(void);
+/* Поставить полный BSU CAN-кадр (22 байта) в очередь на RS (если mirror ON). */
+void RsPanelMaster_PushCanMirrorBsu(const uint8_t *bsu_pkt, uint16_t len);
 
 #ifdef __cplusplus
 }

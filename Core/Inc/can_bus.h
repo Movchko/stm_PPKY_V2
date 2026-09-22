@@ -60,6 +60,12 @@ void App_CanTxProcess(void);
   */
 void CANSendData(uint8_t *Buf);
 
+/**
+  * Host/RS: полный BSU CAN (22 байта, type 0/1) → на шину CAN (как WiFi type 0/1).
+  * @return 1 ok, 0 bad packet
+  */
+uint8_t CanHostTxFromBsu(const uint8_t *bsu_pkt, uint16_t len);
+
 /** Остановить UART-мост ESP32 (при выключении модуля). */
 void UartBridge_Stop(void);
 /** Отправить BSU-кадр на ESP32 (type 3 - команды ESP и др.). */
@@ -68,10 +74,9 @@ uint8_t UartBridge_SendBsuPacket(uint16_t pkt_type, uint16_t seq, const uint8_t 
 uint8_t UartBridge_IsTxIdle(void);
 
 /**
- * Целостность CAN-кольца по статусам МКУ.
- * @return 1 - кольцо целое (или нет online МКУ с валидным статусом,
- *            или ещё не прошло окно устаканивания после старта питания);
- *         0 - у какого-то МКУ КЗ/обрыв по CAN0 или CAN1.
+ * Целостность CAN-кольца по эху собственного TX.
+ * @return 1 — ППКУ видел свой пакет на другой шине (не позже CAN_RING_ECHO_TIMEOUT_MS);
+ *         0 — эхо не пришло вовремя → обрыв кольца (TX на обе шины).
  */
 uint8_t CanRingIsIntact(void);
 

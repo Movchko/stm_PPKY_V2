@@ -25,7 +25,9 @@
 #define CAN_RX_RING_SIZE      256
 #define CAN_TX_RING_SIZE      256
 #define CAN_NO_RX_TIMEOUT_MS  3000
-#define CAN_DUP_WINDOW_MS     30
+#define CAN_DUP_WINDOW_MS     50
+/* Эхо собственного TX на другой шине: не позже 1 с → кольцо целое. */
+#define CAN_RING_ECHO_TIMEOUT_MS 1000u
 #define UART_BRIDGE_QUEUE_SIZE 128
 #define LOG_UART_BODY_MAX     246u
 #define UART_TX_PKT_MAX       256u
@@ -113,6 +115,14 @@ static uint32_t pending_timeout[CAN_MAX_DEVICES];
 
 uint8_t can_bus_error_flags = 0;
 uint8_t device_can_error[CAN_MAX_DEVICES] = {0};
+
+/* Целостность кольца: ППКУ увидел свой TX на другой шине (эхо). */
+static uint8_t  s_ring_intact = 1u;
+static uint8_t  s_ring_probe_active = 0u;
+static uint8_t  s_ring_probe_tx_bus = 0u; /* CAN_BUS_1 / CAN_BUS_2 */
+static uint32_t s_ring_probe_id = 0u;
+static uint8_t  s_ring_probe_data[8];
+static uint32_t s_ring_probe_tx_ms = 0u;
 
 /* Учёт веса физической позиции МКУ для последующего вычисления fault'ов. */
 #define POSITION_MAX_HADR 32u
@@ -280,6 +290,9 @@ static void uart_tx_packet_push(uint8_t can_bus, uint32_t id, const uint8_t *dat
 	p->len = pos;
 
 	uart_tx_head = next;
+
+	/* Опциональное зеркало на RS485 (панельная шина) — тот же BSU, что уходит в WiFi. */
+	RsPanelMaster_PushCanMirrorBsu(p->pkt, p->len);
 }
 
 static void uart_bridge_on_rx_byte(uint8_t b)
@@ -537,9 +550,54 @@ static void CanTxEnqueueOne(CanTxEntry *ring,
 	*head = next;
 }
 
-/* Для BUS_CAN12 выбираем только одну линию:
- * приоритет CAN1, fallback CAN2, если CAN1 неактивен.
- * Неактивность определяется по can_bus_error_flags (бит выставлен = no-rx timeout). */
+static void CanRingProbeOnTx(uint8_t tx_bus, uint32_t id, const uint8_t *data)
+{
+	if (data == 0 || (tx_bus != CAN_BUS_1 && tx_bus != CAN_BUS_2)) {
+		return;
+	}
+	s_ring_probe_active = 1u;
+	s_ring_probe_tx_bus = tx_bus;
+	s_ring_probe_id = id;
+	memcpy(s_ring_probe_data, data, 8u);
+	s_ring_probe_tx_ms = HAL_GetTick();
+}
+
+static void CanRingProbeOnRx(uint8_t rx_bus, uint32_t id, const uint8_t *data)
+{
+	if (s_ring_probe_active == 0u || data == 0) {
+		return;
+	}
+	/* Эхо = тот же кадр на противоположной шине (не на той, куда ушёл TX). */
+	if (rx_bus == s_ring_probe_tx_bus) {
+		return;
+	}
+	if (id != s_ring_probe_id) {
+		return;
+	}
+	if (memcmp(data, s_ring_probe_data, 8u) != 0) {
+		return;
+	}
+	s_ring_intact = 1u;
+	s_ring_probe_active = 0u;
+}
+
+static void CanRingProbePoll(uint32_t now_ms)
+{
+	if (s_ring_probe_active == 0u) {
+		return;
+	}
+	if (TickAgeExpiredMs(now_ms, s_ring_probe_tx_ms, CAN_RING_ECHO_TIMEOUT_MS) == 0u) {
+		return;
+	}
+	/* Свой пакет не вернулся по другой шине за 1 с → обрыв кольца. */
+	s_ring_intact = 0u;
+	s_ring_probe_active = 0u;
+}
+
+/* Для BUS_CAN12:
+ * - кольцо целое → одна линия (приоритет CAN1, иначе CAN2), без дублей на кольце;
+ * - кольцо разорвано → обе линии, чтобы МКУ за обрывом тоже получали опрос/WiFi.
+ * Неактивность линии — can_bus_error_flags (бит = no-rx timeout). */
 static uint8_t CanSelectSingleBusMask(uint8_t bus_mask)
 {
 	uint8_t has_can1 = ((bus_mask & BUS_CAN0) != 0u) ? 1u : 0u;
@@ -547,6 +605,11 @@ static uint8_t CanSelectSingleBusMask(uint8_t bus_mask)
 
 	if (!(has_can1 && has_can2)) {
 		return bus_mask;
+	}
+
+	/* При обрыве кольца шлём в обе стороны. */
+	if (CanRingIsIntact() == 0u) {
+		return BUS_CAN12;
 	}
 
 	uint8_t can1_active = ((can_bus_error_flags & 0x01u) == 0u) ? 1u : 0u;
@@ -604,6 +667,8 @@ static void App_CanTxProcessBus(FDCAN_HandleTypeDef *hfdcan,
 		}
 		/* Зеркалим исходящий кадр ППКУ в UART (BSU-обёртка). */
 		uart_tx_packet_push(can_bus, e->id, e->data);
+		/* Ждём этот же кадр на другой шине (признак замкнутого кольца). */
+		CanRingProbeOnTx(can_bus, e->id, e->data);
 
 		(*tail)++;
 		if (*tail >= CAN_TX_RING_SIZE) {
@@ -638,34 +703,15 @@ void CanInit(void)
 		last_id_can1[i] = CAN_ID_NONE;
 		last_id_can2[i] = CAN_ID_NONE;
 	}
+	s_ring_intact = 1u;
+	s_ring_probe_active = 0u;
 	can_init_done = 1;
 }
 
-/* Кольцо целое (1), если ни у одного online МКУ с can_status_valid
- * нет КЗ (1) или обрыва (2) по CAN0/CAN1.
- */
+/* Кольцо целое только если недавно видели эхо своего TX на другой шине. */
 uint8_t CanRingIsIntact(void)
 {
-	if (can_init_done == 0u) {
-		return 1u;
-	}
-
-	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
-		const ActiveDeviceInfo *m = &g_active_devices[i];
-		if (!m->online || !m->can_status_valid) {
-			continue;
-		}
-
-		for (uint8_t can_idx = 0u; can_idx < 2u; can_idx++) {
-			uint8_t shift = (uint8_t)(can_idx * 2u);
-			uint8_t can_state = (uint8_t)((m->can_state_mask >> shift) & 0x3u);
-			if (can_state == 1u || can_state == 2u) {
-				return 0u;
-			}
-		}
-	}
-
-	return 1u;
+	return s_ring_intact;
 }
 
 void CanProcess(void)
@@ -675,6 +721,8 @@ void CanProcess(void)
 	if (!can_init_done) {
 		CanInit();
 	}
+
+	CanRingProbePoll(now);
 
 	/* Флаги «нет приёма по шине» */
 	if (now - last_rx_tick_can1 <= CAN_NO_RX_TIMEOUT_MS) {
@@ -709,6 +757,9 @@ void CanProcess(void)
 			if (can_rx_tail >= CAN_RX_RING_SIZE) {
 				can_rx_tail = 0;
 			}
+
+			/* Эхо своего TX проверяем до дедупа (дубликат с другой шины — как раз эхо). */
+			CanRingProbeOnRx(e->can_bus, e->id, e->data);
 
 			uint8_t dev;
 			uint8_t other_bus;
@@ -757,7 +808,8 @@ void CanProcess(void)
 			/* Уникальный пакет: разобрать один раз, ждать дубликат с другой шины */
 			ProtocolParse(e->id, e->data, BUS_CAN12);
 			App_PositionRxFromCan(e->id, e->data, e->can_bus, now);
-			uart_tx_packet_push(CAN_BUS_1, e->id, e->data);
+			/* Метка шины = фактический RX (type 0/1), не хардкод CAN1. */
+			uart_tx_packet_push(e->can_bus, e->id, e->data);
 
 			*last_id_cur = e->id;
 			memcpy(last_data_cur, e->data, 8);
@@ -1067,6 +1119,45 @@ void CANSendData(uint8_t *Buf)
 	uint8_t bus_mask = Buf[4 + 8];
 
 	CanTxEnqueue(id, data, bus_mask);
+}
+
+uint8_t CanHostTxFromBsu(const uint8_t *bsu_pkt, uint16_t len)
+{
+	uint16_t pkt_type;
+	uint16_t calc_crc;
+	uint16_t rx_crc;
+	uint32_t can_id;
+	uint8_t data[8];
+
+	if (isMainInit == 0u || bsu_pkt == 0 || len != BSU_PKT_CAN_SIZE) {
+		return 0u;
+	}
+	if (bsu_pkt[0] != BSU_PKT_PREAMBLE_LO || bsu_pkt[1] != BSU_PKT_PREAMBLE_HI) {
+		return 0u;
+	}
+	pkt_type = (uint16_t)bsu_pkt[4] | ((uint16_t)bsu_pkt[5] << 8);
+	if (pkt_type != BSU_PKT_TYPE_CAN && pkt_type != BSU_PKT_TYPE_CAN2) {
+		return 0u;
+	}
+	calc_crc = BSU_Checksum(bsu_pkt, 20u);
+	rx_crc = (uint16_t)bsu_pkt[20] | ((uint16_t)bsu_pkt[21] << 8);
+	if (calc_crc != rx_crc) {
+		return 0u;
+	}
+	can_id = (uint32_t)bsu_pkt[8] |
+	         ((uint32_t)bsu_pkt[9] << 8) |
+	         ((uint32_t)bsu_pkt[10] << 16) |
+	         ((uint32_t)bsu_pkt[11] << 24);
+	memcpy(data, &bsu_pkt[12], 8u);
+
+	/* Как WiFi UART type 0/1: локальный разбор + ретрансляция на CAN. */
+	if (uart_frame_is_for_ppku(can_id)) {
+		ProtocolParse(can_id, data, BUS_UART1);
+	} else {
+		ProtocolParse(can_id, data, BUS_UART1);
+		CanTxEnqueue(can_id, data, BUS_CAN12);
+	}
+	return 1u;
 }
 
 void UARTSendData(uint8_t *Buf)

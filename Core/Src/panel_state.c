@@ -27,7 +27,9 @@ void PanelState_Reset(PanelState *state)
     }
     memset(state, 0, sizeof(*state));
     state->cfg.poll_ms = 10u;
-    state->watchdog_ms = 500u;
+    /* ACTIVITY панели — 1 Гц. 500 мс давали CAPS-флап при задержке POLL
+     * (WARN/LED/SOUND) → PushSound рестартил дежурный звук ~раз в секунду. */
+    state->watchdog_ms = 3000u;
     state->remote_btn_mask = 0u;
 }
 
@@ -42,7 +44,7 @@ void PanelState_BindConfig(PanelState *state, const PanelConfig *cfg)
         state->cfg.poll_ms = 10u;
     }
     if (state->watchdog_ms == 0u) {
-        state->watchdog_ms = 500u;
+        state->watchdog_ms = 3000u;
     }
 }
 

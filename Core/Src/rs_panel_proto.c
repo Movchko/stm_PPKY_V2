@@ -21,6 +21,7 @@
 #include "warning.h"
 #include "fire.h"
 #include "rtc_cache.h"
+#include "backend.h"
 
 extern PPKYCfg PPKYConfig;
 extern void SaveConfig(void);
@@ -120,6 +121,14 @@ static volatile uint8_t s_inject_pause_poll = 0u;
 static uint32_t s_inject_pause_until_ms = 0u;
 /* Запрос WiFi с RS (sniffer): не вызывать EspManager из UART RX IRQ. */
 static volatile uint8_t s_wifi_enable_req = 0u;
+
+/* CAN→RS485 mirror (default OFF). Очередь полных BSU CAN (22 байта). */
+#define RS_PANEL_CAN_MIRROR_Q_DEPTH 64u
+static volatile uint8_t s_can_mirror_enable = 0u;
+static uint8_t s_can_mirror_q[RS_PANEL_CAN_MIRROR_Q_DEPTH][BSU_PKT_CAN_SIZE];
+static volatile uint8_t s_can_mirror_q_head = 0u;
+static volatile uint8_t s_can_mirror_q_tail = 0u;
+static volatile uint8_t s_can_mirror_q_count = 0u;
 
 static uint8_t rs_panel_inject_cmd_allowed(uint8_t cmd)
 {
@@ -1158,6 +1167,8 @@ static volatile uint8_t s_sound_push_pending = 0u;
 static uint8_t s_last_sound_tx[9];
 static uint16_t s_last_sound_tx_len = 0u;
 static uint8_t s_last_sound_tx_valid = 0u;
+/* 1 = панель реально перезапустилась (uptime упал) — переслать SOUND без dedup. */
+static uint8_t s_force_sound_resync = 0u;
 static uint32_t s_last_time_sync_ms = 0u;
 
 static uint8_t rs_panel_sound_timings_eq(uint16_t on_ms, uint16_t off_ms, uint8_t pulses,
@@ -1240,6 +1251,14 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
     uint16_t off_ms = 0u;
     uint8_t pulses = 0u;
     uint16_t repeat_ms = 0u;
+
+    /* One-shot (SHORT/DOUBLE/LONG) временно сменяет PATTERN на ППКУ.
+     * Не слать SOUND_OFF — иначе панель гасит дежурный, а следующий FAULT
+     * стартует паттерн заново (клик ~каждую секунду при resync/флапах). */
+    if (sound_enabled != 0u &&
+        state_code != 0u && state_code != 4u && state_code != 5u && state_code != 6u) {
+        return;
+    }
 
     /* BEEPER_STATE_CONTINUOUS=4, FIRE_ALARM=5, PATTERN=6 — как в beeper.c */
     if (sound_enabled != 0u) {
@@ -1348,7 +1367,12 @@ static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
     s_panel_ui_resync_pending = 1u;
     /* Сразу после READY — RTC / LED / SOUND (UI WARN/FIRE — после логотипа). */
     s_last_time_sync_ms = 0u;
-    s_last_sound_tx_valid = 0u; /* панель перезагрузилась — обязательно переслать SOUND */
+    /* Переслать SOUND только после реального reboot панели (uptime↓).
+     * Краткий CAPS-флап не должен сбрасывать dedup — иначе duty рестартится. */
+    if (s_force_sound_resync != 0u) {
+        s_force_sound_resync = 0u;
+        s_last_sound_tx_valid = 0u;
+    }
     RsPanelMaster_PushSound();
     /* UI_NAV/WARN/FIRE не из обработчика RX CAPS: UART half-duplex, плюс логотип
      * на панели сам переходит на MAIN через 400 тиков. Снимок отправим после лого. */
@@ -2868,6 +2892,27 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
         s_wifi_enable_req = 1u;
         return;
     }
+    /* Host/sniffer → ППКУ: вкл/выкл зеркало CAN→RS. */
+    if ((frame->flags & RS_BUS_FLAG_DIR) == 0u &&
+        frame->cmd == RS_PANEL_CMD_PPKY_CAN_MIRROR_SET) {
+        uint8_t en = 1u;
+        if (frame->payload_len > 0u && frame->payload != 0) {
+            en = (frame->payload[0] != 0u) ? 1u : 0u;
+        }
+        RsPanelMaster_SetCanMirrorEnable(en);
+        return;
+    }
+    /* Host→ППКУ: BSU CAN в payload → на шину CAN. */
+    if ((frame->flags & RS_BUS_FLAG_DIR) == 0u &&
+        frame->cmd == RS_PANEL_CMD_CAN_TO_BUS) {
+        (void)CanHostTxFromBsu(frame->payload, frame->payload_len);
+        return;
+    }
+    /* Собственные/чужие кадры зеркала — не считать wrong_dir. */
+    if ((frame->flags & RS_BUS_FLAG_DIR) == 0u &&
+        frame->cmd == RS_PANEL_CMD_CAN_MIRROR) {
+        return;
+    }
     if ((frame->flags & RS_BUS_FLAG_DIR) == 0u) {
         g_rs_master_dbg.rx_frames_wrong_dir++;
         return;
@@ -2953,6 +2998,7 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                     panel->link_state == PANEL_LINK_READY) {
                     panel->link_state = PANEL_LINK_CAPS_PENDING;
                     panel->caps_valid = 0u;
+                    s_force_sound_resync = 1u;
                 }
                 panel->last_uptime_sec = act.uptime_sec;
                 panel->uptime_valid = 1u;
@@ -3003,6 +3049,92 @@ void RsPanelMaster_PushSound(void)
 {
     /* Не TX сразу из fire/warning — отложим в Process10ms (half-duplex RS). */
     s_sound_push_pending = 1u;
+}
+
+void RsPanelMaster_SetCanMirrorEnable(uint8_t enable)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_can_mirror_enable = (enable != 0u) ? 1u : 0u;
+    if (s_can_mirror_enable == 0u) {
+        s_can_mirror_q_head = 0u;
+        s_can_mirror_q_tail = 0u;
+        s_can_mirror_q_count = 0u;
+    }
+    __set_PRIMASK(primask);
+}
+
+uint8_t RsPanelMaster_IsCanMirrorEnabled(void)
+{
+    return s_can_mirror_enable;
+}
+
+void RsPanelMaster_PushCanMirrorBsu(const uint8_t *bsu_pkt, uint16_t len)
+{
+    uint32_t primask;
+
+    if (s_can_mirror_enable == 0u || bsu_pkt == 0 || len != BSU_PKT_CAN_SIZE) {
+        return;
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_can_mirror_q_count >= RS_PANEL_CAN_MIRROR_Q_DEPTH) {
+        /* Drop oldest. */
+        s_can_mirror_q_tail = (uint8_t)((s_can_mirror_q_tail + 1u) % RS_PANEL_CAN_MIRROR_Q_DEPTH);
+        s_can_mirror_q_count--;
+    }
+    memcpy(s_can_mirror_q[s_can_mirror_q_head], bsu_pkt, BSU_PKT_CAN_SIZE);
+    s_can_mirror_q_head = (uint8_t)((s_can_mirror_q_head + 1u) % RS_PANEL_CAN_MIRROR_Q_DEPTH);
+    s_can_mirror_q_count++;
+    __set_PRIMASK(primask);
+}
+
+static uint8_t rs_panel_master_any_poll_due(RsPanelMaster *master, uint32_t now_ms)
+{
+    uint8_t i;
+    if (master == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < master->panel_count; i++) {
+        PanelState *p = &master->panels[i];
+        if (p->cfg.enabled == 0u || PanelState_IsReady(p) == 0u) {
+            continue;
+        }
+        if ((now_ms - p->last_poll_ms) >= p->cfg.poll_ms) {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+/* 1 кадр зеркала на RS. addr=0xFF — панели отсекают до switch. */
+static uint8_t rs_panel_master_drain_can_mirror(RsPanelMaster *master)
+{
+    uint8_t bsu[BSU_PKT_CAN_SIZE];
+    uint32_t primask;
+
+    if (master == 0 || s_can_mirror_enable == 0u || s_can_mirror_q_count == 0u) {
+        return 0u;
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_can_mirror_q_count == 0u) {
+        __set_PRIMASK(primask);
+        return 0u;
+    }
+    memcpy(bsu, s_can_mirror_q[s_can_mirror_q_tail], BSU_PKT_CAN_SIZE);
+    s_can_mirror_q_tail = (uint8_t)((s_can_mirror_q_tail + 1u) % RS_PANEL_CAN_MIRROR_Q_DEPTH);
+    s_can_mirror_q_count--;
+    __set_PRIMASK(primask);
+
+    (void)RsBus_SendFrame(&master->bus,
+                          RS_BUS_ADDR_RESERVED,
+                          master->next_seq++,
+                          0u, /* DIR=0, без ACK_REQ */
+                          RS_PANEL_CMD_CAN_MIRROR,
+                          bsu,
+                          BSU_PKT_CAN_SIZE);
+    return 1u;
 }
 
 void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_t len)
@@ -3084,7 +3216,11 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         EspManager_RequestWifiEnable();
     }
 
+    /* Без панелей всё равно можно сливать CAN-зеркало на RS (sniffer). */
     if (master->panel_count == 0u) {
+        if (s_can_mirror_enable != 0u && s_can_mirror_q_count != 0u) {
+            (void)rs_panel_master_drain_can_mirror(master);
+        }
         return;
     }
 
@@ -3188,7 +3324,8 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         Warning_ResetPanelUiCache();
         Warning_RepublishUiNow();
         Fire_ForceUiResync();
-        s_last_sound_tx_valid = 0u;
+        /* Не сбрасывать sound-dedup здесь: PushSound уже ушёл в became_ready.
+         * Повторный clear+PushSound после логотипа рестартил duty на панели. */
         RsPanelMaster_PushSound();
         rs_panel_master_send_leds_to_ready_panels(master);
         RsPanelMasterDebug_Timer10ms();
@@ -3197,20 +3334,16 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         return;
     }
 
-    /* Если панель READY, но кэш «отправлено» без реальной доставки — сброс раз в 1 с,
-     * следующий WarningProcess1ms переотправит через PushUiIfChanged. */
-    {
-        static uint32_t s_warn_cache_reset_ms = 0u;
-        if (PanelState_IsReady(&master->panels[0]) != 0u &&
-            rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u &&
-            Warning_IsProcessDelayActive() == 0u &&
-            Warning_GetLastUiBuildCount() != 0u) {
-            if (s_warn_cache_reset_ms == 0u || (now_ms - s_warn_cache_reset_ms) >= 1000u) {
-                s_warn_cache_reset_ms = now_ms;
-                Warning_ResetPanelUiCache();
-            }
-        } else {
-            s_warn_cache_reset_ms = 0u;
+    /* Периодический сброс WARN-кэша раз в 1 с убран: он слал WARN+LED каждую
+     * секунду, забивал RS и вместе с коротким watchdog ронял CAPS → duty 1 Гц.
+     * Повторная доставка — через became_ready / deliver_fail (PushUiIfChanged). */
+
+    /* CAN→RS mirror: только в свободные тики (POLL не просрочен), 1 кадр/тик.
+     * Панели не принимают addr=0xFF — логика панели не затрагивается. */
+    if (s_can_mirror_enable != 0u && s_can_mirror_q_count != 0u &&
+        rs_panel_master_any_poll_due(master, now_ms) == 0u) {
+        if (rs_panel_master_drain_can_mirror(master) != 0u) {
+            return;
         }
     }
 
@@ -3326,6 +3459,19 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
     if (view.cmd == RS_PANEL_CMD_PPKY_WIFI_ENABLE) {
         EspManager_RequestWifiEnable();
         return 1u;
+    }
+    /* CAN mirror set — локально, на шину не кладём. */
+    if (view.cmd == RS_PANEL_CMD_PPKY_CAN_MIRROR_SET) {
+        uint8_t en = 1u;
+        if (view.payload_len > 0u && view.payload != 0) {
+            en = (view.payload[0] != 0u) ? 1u : 0u;
+        }
+        RsPanelMaster_SetCanMirrorEnable(en);
+        return 1u;
+    }
+    /* CAN→bus: локально на CAN, на RS повторно не кладём. */
+    if (view.cmd == RS_PANEL_CMD_CAN_TO_BUS) {
+        return CanHostTxFromBsu(view.payload, view.payload_len);
     }
     if (rs_panel_inject_cmd_allowed(view.cmd) == 0u) {
         return 0u;
