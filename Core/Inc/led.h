@@ -57,6 +57,8 @@ void Led_SetBrightness(uint8_t led, uint8_t power);
 void Led_ForceStatusBright(uint8_t led);
 uint8_t Led_GetState(uint8_t led);
 uint8_t Led_GetBrightness(uint8_t led);
+/* 1 = статусные LED менялись с прошлого Take — нужно CMD_LED на панель. */
+uint8_t Led_TakeRemoteDirty(void);
 
 #ifdef __cplusplus
 }

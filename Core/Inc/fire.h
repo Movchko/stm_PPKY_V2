@@ -45,6 +45,9 @@ uint8_t Fire_HasExtinguishIncomplete(void);
 /* Идёт удержание ПУСК ОБЩИЙ (3с) - нужен главный экран со счётчиком. */
 uint8_t Fire_IsStartAllHoldActive(void);
 
+/* Активен звук/индикация тушения (мигание ПУСК на панели). */
+uint8_t Fire_IsExtinguishIndicationActive(void);
+
 /* Ручной выбор пожара на главном экране (индекс в текущем UI-списке). */
 void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index);
 

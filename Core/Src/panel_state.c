@@ -1,6 +1,7 @@
 #include "panel_state.h"
 
 #include <string.h>
+#include "device_config.h"
 
 static uint8_t rs_btn_type_to_but(uint8_t type)
 {
@@ -57,6 +58,21 @@ void PanelState_OnCaps(PanelState *state, const RsPanelCaps *caps, uint32_t now_
     state->caps = *caps;
     state->caps_valid = 1u;
     state->last_rx_ms = now_ms;
+    state->is_small_panel = (caps->ui_profile == PANEL_TYPE_SMALL) ? 1u : 0u;
+    /* Запасной признак: в CAPS нет START_ALL. */
+    if (state->is_small_panel == 0u) {
+        uint8_t has_start_all = 0u;
+        uint8_t i;
+        for (i = 0u; i < caps->btn_count && i < RS_PANEL_MAX_CAPS_BUTTONS; i++) {
+            if (caps->btn_list[i] == (uint8_t)RS_PANEL_BTN_START_ALL) {
+                has_start_all = 1u;
+                break;
+            }
+        }
+        if (has_start_all == 0u && caps->btn_count > 0u) {
+            state->is_small_panel = 1u;
+        }
+    }
 
     if (state->cfg.expected_hw_id != 0u && state->cfg.expected_hw_id != caps->hw_id) {
         state->link_state = PANEL_LINK_BLOCKED;
@@ -83,6 +99,11 @@ void PanelState_OnPollRsp(PanelState *state, const RsPanelPollRsp *rsp, uint32_t
         uint8_t but = rs_btn_type_to_but(rsp->btn_events[i].type);
         if (but == 0xFFu) {
             continue;
+        }
+
+        /* Хост: любое событие ПУСК ОБЩИЙ ⇒ панель большая (согласовано с автоопределением). */
+        if (rsp->btn_events[i].type == (uint8_t)RS_PANEL_BTN_START_ALL) {
+            state->is_small_panel = 0u;
         }
 
         uint8_t pressed = (rsp->btn_events[i].level != 0u) ? 1u : 0u;

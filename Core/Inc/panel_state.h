@@ -42,6 +42,8 @@ typedef struct {
     uint8_t uptime_valid;
     /* Битмаска нажатых кнопок, агрегированная по событиям POLL от панели. */
     uint8_t remote_btn_mask;
+    /* 1 = малая панель (нет ПУСК ОБЩИЙ): CAPS.ui_profile == PANEL_TYPE_SMALL. */
+    uint8_t is_small_panel;
     uint8_t pending_ack_seq;
     uint8_t ack_wait_active;
     uint8_t ack_retries_left;

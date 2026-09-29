@@ -64,6 +64,8 @@ typedef enum {
 static AddrAutoState g_addr_auto_state = ADDR_AUTO_IDLE;
 static uint32_t g_addr_auto_phase_start_ms = 0;
 
+static void MkuHardReset_StartNow(uint32_t now_ms);
+
 
 
 GPIO_TypeDef   *POWER_ST_PORT[2] = {ST1_MK_GPIO_Port, ST2_MK_GPIO_Port};
@@ -144,29 +146,11 @@ static void AddrAuto_Process(uint32_t now_ms) {
 		}
 		break;
 	case ADDR_AUTO_WAIT_AFTER_SET:
-		// ещё 100 мс, потом включаем ретрансляцию, очищаем список устройств
-		// и перезапускаем питание на обоих каналах
+		/* После CircSetAdr: очистить список и сделать power-cycle МКУ через FSM
+		 * (без HAL_Delay / без прямого SetOut при want_on — иначе ST→Fault). */
 		if ((now_ms - g_addr_auto_phase_start_ms) >= 5000u) {
-			//uint8_t data[7] = {0};
-			//data[0] = 0u; // 0 = старт ретрансляции
-			//SendAllMessage(ServiceCmd_StopStartReTranslate, data, SEND_NOW, BUS_CAN12);
-
-			// адреса изменились — очищаем список активных устройств, он будет заполнен заново
 			AddrAuto_ClearActiveDevices();
-
-			// Перезапустить питание МКУ на обоих каналах (короткое выключение/включение)
-			for (uint8_t i = 0; i < POWER_NUM_MKU_CH; i++) {
-				if (Power[i] != nullptr) {
-					Power[i]->PControlSetOut(i, false);
-				}
-			}
-			HAL_Delay(500);
-			for (uint8_t i = 0; i < POWER_NUM_MKU_CH; i++) {
-				if (Power[i] != nullptr) {
-					Power[i]->PControlSetOut(i, true);
-				}
-			}
-
+			MkuHardReset_StartNow(now_ms);
 			g_addr_auto_state = ADDR_AUTO_IDLE;
 		}
 		break;
@@ -304,18 +288,10 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters) {
 			uint8_t data[7] = {0};
 			SendAllMessage(ServiceCmd_ResetMCU, data, SEND_NOW, BUS_CAN12);
 		} else {
-			/* Хард‑ресет: отключить питание на 1 с и снова включить. */
-			for (uint8_t i = 0; i < POWER_NUM_CHANNELS; i++) {
-				if (Power[i] != nullptr) {
-					Power[i]->PControlSetOut(i, false);
-				}
-			}
-			HAL_Delay(1000);
-			for (uint8_t i = 0; i < POWER_NUM_CHANNELS; i++) {
-				if (Power[i] != nullptr) {
-					Power[i]->PControlSetOut(i, true);
-				}
-			}
+			/* Хард‑ресет: неблокирующий power-cycle МКУ (off 1с → on),
+			 * через MkuHardReset_* — с SetEnable(false), иначе ST-глитч
+			 * уводит PControl в Fault и питание не поднимается. */
+			MkuHardReset_StartNow(HAL_GetTick());
 		}
 	}break;
 	case 13: {

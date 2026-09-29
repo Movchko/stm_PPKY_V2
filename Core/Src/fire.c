@@ -30,6 +30,9 @@ extern uint8_t g_active_devices_count;
 #define FIRE_START_ALL_TEXT_BLINK_PERIOD_MS  1600u
 #define FIRE_START_ALL_SOUND_PERIOD_MS       SOUND_START_ALL_HOLD_PERIOD_MS
 #define FIRE_START_ALL_SOUND_DUTY_MS         SOUND_START_ALL_HOLD_DUTY_MS
+/* Малая панель: порог «короткого» ПУСК СП vs переход к удержанию общего пуска. */
+#define FIRE_SP_TO_ALL_HOLD_MS               1000u
+#define FIRE_START_ALL_HOLD_MS               3000u
 #define FIRE_START_LED_HOLD_MS               3000u
 /* ack_flags у IGNITER: предполагаем бит 1 = end_ack */
 #define FIRE_IGNITER_END_ACK_MASK            0x02u
@@ -175,6 +178,9 @@ typedef struct {
 	uint8_t   reply_received;
 	uint8_t   all_hold_active;
 	uint16_t  all_hold_ms;
+	/* Малая панель: удержание ПУСК СП (<1с → ПУСК СП, ≥1с UI общего, 3с → ОБЩИЙ). */
+	uint8_t   sp_hold_active;
+	uint16_t  sp_hold_ms;
 	uint32_t  state_start_ms;
 	uint32_t  led_toggle_ms;
 	uint8_t   beeper_alert_active;
@@ -421,6 +427,8 @@ static void Fire_BeeperEnterStartPattern(uint32_t now_ms)
 	Beeper_StartPulseTrain(BEEPER_PATTERN_START_ON_MS, BEEPER_PATTERN_START_OFF_MS,
 			       BEEPER_PATTERN_START_PULSES, BEEPER_PATTERN_START_REPEAT_MS);
 	RsPanelMaster_PushSound();
+	/* На панель — мигание LED_START (MODE_BLINK) + звук START; не дёргать POLL. */
+	RsPanelMaster_PushLeds();
 }
 
 /* Есть зона, у которой тушение ещё в процессе (фаза 2 ушла, end_ack нет). */
@@ -455,10 +463,12 @@ static void Fire_BeeperTick(uint32_t now_ms)
 			g_fire.beeper_start_pattern_active = 0u;
 			g_fire.start_led_hold_until_ms = now_ms + FIRE_START_LED_HOLD_MS;
 			Fire_BeeperEnterDuty(Fire_ShouldUseFire1Sound());
+			RsPanelMaster_PushLeds();
 		} else if (Fire_AnyZoneExtinguishingInProgress() == 0u) {
 			/* Тушение части зон закончилось, но пожар ещё есть (другие зоны
 			 * в останове/ожидании) — вернуть звук пожара, не держать ПУСК. */
 			Fire_BeeperEnterAlert(Fire_ShouldUseFire1Sound());
+			RsPanelMaster_PushLeds();
 		}
 	}
 }
@@ -2709,6 +2719,8 @@ static void Fire_GostResetFire(uint32_t now_ms)
 	g_fire.start_sp_text_blink_until_ms = 0u;
 	g_fire.all_hold_active = 0u;
 	g_fire.all_hold_ms = 0u;
+	g_fire.sp_hold_active = 0u;
+	g_fire.sp_hold_ms = 0u;
 	g_fire.btn_start_all_hold_latched = 0u;
 	Fire_StartAllHoldSoundOff();
 
@@ -2759,6 +2771,8 @@ static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8
 	Fire_AbortExtinguishRetriesAll();
 	g_fire.all_hold_active = 0u;
 	g_fire.all_hold_ms = 0u;
+	g_fire.sp_hold_active = 0u;
+	g_fire.sp_hold_ms = 0u;
 	g_fire.btn_start_all_hold_latched = 0u;
 	Fire_StartAllHoldSoundOff();
 	if (Fire_CountPendingPhase2() > 0u) {
@@ -2938,6 +2952,8 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		g_fire.start_launch_pressed_latched = 0u;
 		g_fire.all_hold_active = 0u;
 		g_fire.all_hold_ms = 0u;
+		g_fire.sp_hold_active = 0u;
+		g_fire.sp_hold_ms = 0u;
 		g_fire.btn_start_all_hold_latched = 0u;
 		Fire_StartAllHoldSoundOff();
 		if (Fire_CountPendingPhase2() > 0u) {
@@ -3408,42 +3424,50 @@ void Fire_Timer1ms(void)
 void Fire_Timer10ms(void)
 {
 	uint32_t now_ms = HAL_GetTick();
+	uint8_t panel_small = RsPanelMaster_IsSmallPanel();
+
 	/* ПУСК ОБЩИЙ обрабатываем даже во время config-сессии: удержание поднимает
 	 * all_hold_active, UI возвращает на главный экран со счётчиком 3с. */
-	ButtonState st_start_all = Button_GetState(BUT_FORCE);
-	if (st_start_all == ButtonStatePress || st_start_all == ButtonStateLongPress) {
-		if (!g_fire.all_hold_active) {
-			g_fire.all_hold_active = 1u;
-			g_fire.all_hold_ms = 0u;
-			g_fire.state_start_ms = now_ms;
-			Fire_StartAllHoldSoundOn();
-			/* Сырое касание ПУСК ОБЩИЙ — до удержания 3 с (код 14 после hold). */
-			Fire_LogPanelBtnPress(FIRE_LOG_BTN_START_ALL, 0u);
-		} else {
-			if (g_fire.all_hold_ms < 3000u) {
-				g_fire.all_hold_ms += 10u;
-			}
-			if (g_fire.all_hold_ms >= 3000u && g_fire.btn_start_all_hold_latched == 0u) {
-				g_fire.btn_start_all_hold_latched = 1u;
-				Fire_StartAllHoldSoundOff();
-				if (g_fire.last_btn_start_all_action_ms == 0u ||
-				    (now_ms - g_fire.last_btn_start_all_action_ms) >= 500u) {
-					g_fire.last_btn_start_all_action_ms = now_ms;
-					g_fire_panel_btn_source = 1u;
-					Fire_Transition(FIRE_EVENT_BTN_START_ALL, now_ms);
-					g_fire_panel_btn_source = 0u;
+	if (panel_small == 0u) {
+		ButtonState st_start_all = Button_GetState(BUT_FORCE);
+		uint8_t start_all_down =
+		    (st_start_all == ButtonStatePress || st_start_all == ButtonStateLongPress) ? 1u : 0u;
+		if (start_all_down != 0u) {
+			if (!g_fire.all_hold_active) {
+				g_fire.all_hold_active = 1u;
+				g_fire.all_hold_ms = 0u;
+				g_fire.state_start_ms = now_ms;
+				Fire_StartAllHoldSoundOn();
+				/* Сырое касание ПУСК ОБЩИЙ — до удержания 3 с (код 14 после hold). */
+				Fire_LogPanelBtnPress(FIRE_LOG_BTN_START_ALL, 0u);
+			} else {
+				if (g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS) {
+					g_fire.all_hold_ms = (uint16_t)(g_fire.all_hold_ms + 10u);
+				}
+				if (g_fire.all_hold_ms >= FIRE_START_ALL_HOLD_MS &&
+				    g_fire.btn_start_all_hold_latched == 0u) {
+					g_fire.btn_start_all_hold_latched = 1u;
+					Fire_StartAllHoldSoundOff();
+					if (g_fire.last_btn_start_all_action_ms == 0u ||
+					    (now_ms - g_fire.last_btn_start_all_action_ms) >= 500u) {
+						g_fire.last_btn_start_all_action_ms = now_ms;
+						g_fire_panel_btn_source = 1u;
+						Fire_Transition(FIRE_EVENT_BTN_START_ALL, now_ms);
+						g_fire_panel_btn_source = 0u;
+					}
 				}
 			}
+		} else if (g_fire.all_hold_active) {
+			/* Отпускание / сбой чтения: любой не-Press отменяет отсчёт.
+			 * Раньше только ButtonStateReset — при потере RELEASE на RS таймер
+			 * продолжал и всё равно выполнял общий пуск. */
+			g_fire.all_hold_active = 0u;
+			g_fire.all_hold_ms = 0u;
+			g_fire.btn_start_all_hold_latched = 0u;
+			Fire_StartAllHoldSoundOff();
+			g_fire.last_ui_active = 0xFFu;
+			Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
 		}
-	} else if (st_start_all == ButtonStateReset && g_fire.all_hold_active) {
-		g_fire.all_hold_active = 0u;
-		g_fire.all_hold_ms = 0u;
-		g_fire.btn_start_all_hold_latched = 0u;
-		Fire_StartAllHoldSoundOff();
-		/* Сброс кэша UI: иначе после неполного удержания мог не уйти active=0. */
-		g_fire.last_ui_active = 0xFFu;
-		/* Обновить UI/LED сразу после отпускания кнопки, даже если пожара нет */
-		Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
 	}
 
 #if GOST_MODE
@@ -3470,7 +3494,8 @@ void Fire_Timer10ms(void)
 					g_fire_panel_btn_source = 0u;
 				}
 			}
-		} else if (st_stop_hold == ButtonStateReset && g_fire.gost_stop_hold_active != 0u) {
+		} else if (g_fire.gost_stop_hold_active != 0u) {
+			/* Отпускание / Error: сброс удержания сброса пожара (как у ПУСК ОБЩИЙ). */
 			g_fire.gost_stop_hold_active = 0u;
 			g_fire.gost_stop_hold_ms = 0u;
 			g_fire.gost_stop_reset_latched = 0u;
@@ -3478,8 +3503,74 @@ void Fire_Timer10ms(void)
 	}
 #endif
 
-	/* Сырое нажатие ПУСК СП / ОСТАНОВ — всегда (в т.ч. IDLE и config). */
-	uint8_t pressed_sp = Fire_ButtonPressedEvent(BUT_FIRE, &g_fire.btn_start_sp_latched);
+	/* Малая панель: ПУСК СП с длинным удержанием = ПУСК ОБЩИЙ. */
+	if (panel_small != 0u) {
+		ButtonState st_sp = Button_GetState(BUT_FIRE);
+		uint8_t sp_down =
+		    (st_sp == ButtonStatePress || st_sp == ButtonStateLongPress) ? 1u : 0u;
+		if (sp_down != 0u) {
+			if (g_fire.sp_hold_active == 0u) {
+				g_fire.sp_hold_active = 1u;
+				g_fire.sp_hold_ms = 0u;
+				g_fire.btn_start_all_hold_latched = 0u;
+				Fire_LogPanelBtnPress(FIRE_LOG_BTN_START_SP, 0u);
+			} else if (g_fire.sp_hold_ms < FIRE_START_ALL_HOLD_MS) {
+				g_fire.sp_hold_ms = (uint16_t)(g_fire.sp_hold_ms + 10u);
+			}
+			if (g_fire.sp_hold_ms >= FIRE_SP_TO_ALL_HOLD_MS) {
+				if (g_fire.all_hold_active == 0u) {
+					g_fire.all_hold_active = 1u;
+					g_fire.state_start_ms = now_ms;
+					Fire_StartAllHoldSoundOn();
+					Fire_LogPanelBtnPress(FIRE_LOG_BTN_START_ALL, 0u);
+				}
+				g_fire.all_hold_ms = g_fire.sp_hold_ms;
+				if (g_fire.sp_hold_ms >= FIRE_START_ALL_HOLD_MS &&
+				    g_fire.btn_start_all_hold_latched == 0u) {
+					g_fire.btn_start_all_hold_latched = 1u;
+					Fire_StartAllHoldSoundOff();
+					if (g_fire.last_btn_start_all_action_ms == 0u ||
+					    (now_ms - g_fire.last_btn_start_all_action_ms) >= 500u) {
+						g_fire.last_btn_start_all_action_ms = now_ms;
+						g_fire_panel_btn_source = 1u;
+						Fire_Transition(FIRE_EVENT_BTN_START_ALL, now_ms);
+						g_fire_panel_btn_source = 0u;
+					}
+				}
+			}
+		} else if (g_fire.sp_hold_active != 0u) {
+			uint16_t held = g_fire.sp_hold_ms;
+			g_fire.sp_hold_active = 0u;
+			g_fire.sp_hold_ms = 0u;
+			if (g_fire.all_hold_active != 0u) {
+				g_fire.all_hold_active = 0u;
+				g_fire.all_hold_ms = 0u;
+				g_fire.btn_start_all_hold_latched = 0u;
+				Fire_StartAllHoldSoundOff();
+				g_fire.last_ui_active = 0xFFu;
+				Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
+			}
+			/* <1с: обычный ПУСК СП. ≥1с и отпустили до 3с: ничего. */
+			if (held < FIRE_SP_TO_ALL_HOLD_MS &&
+			    MenuUi_IsConfigSessionActive() == 0u &&
+			    (g_fire.state != FIRE_STATE_IDLE || Fire_AnyActiveSlot())) {
+				if (g_fire.last_btn_start_sp_action_ms == 0u ||
+				    (now_ms - g_fire.last_btn_start_sp_action_ms) >= 500u) {
+					g_fire.last_btn_start_sp_action_ms = now_ms;
+					g_fire_panel_btn_source = 1u;
+					Fire_Transition(FIRE_EVENT_BTN_START_SP, now_ms);
+					g_fire_panel_btn_source = 0u;
+				}
+			}
+		}
+	}
+
+	/* Сырое нажатие ПУСК СП / ОСТАНОВ — всегда (в т.ч. IDLE и config).
+	 * На малой панели ПУСК СП обрабатывается удержанием выше. */
+	uint8_t pressed_sp = 0u;
+	if (panel_small == 0u) {
+		pressed_sp = Fire_ButtonPressedEvent(BUT_FIRE, &g_fire.btn_start_sp_latched);
+	}
 	uint8_t pressed_stop = Fire_ButtonPressedEvent(BUT_STOP, &g_fire.btn_stop_latched);
 	if (pressed_sp != 0u || pressed_stop != 0u) {
 		uint8_t press_zone = 0u;
@@ -3655,6 +3746,11 @@ uint8_t Fire_HasExtinguishIncomplete(void)
 uint8_t Fire_IsStartAllHoldActive(void)
 {
 	return g_fire.all_hold_active ? 1u : 0u;
+}
+
+uint8_t Fire_IsExtinguishIndicationActive(void)
+{
+	return g_fire.beeper_start_pattern_active ? 1u : 0u;
 }
 
 void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index)

@@ -132,13 +132,14 @@ static volatile uint8_t s_can_mirror_q_count = 0u;
 
 static uint8_t rs_panel_inject_cmd_allowed(uint8_t cmd)
 {
-    /* Только команды прошивки/бутлоадера с ПК. Иначе мусор ESP при WiFi
+    /* Команды прошивки/бутлоадера и PROFILE_SET с ПК. Иначе мусор ESP при WiFi
      * забивает очередь и Process10ms намертво крутит SendRaw. */
     return (cmd == RS_PANEL_CMD_ENTER_BOOTLOADER ||
             cmd == RS_PANEL_CMD_BOOT_RESET_MCU ||
             cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD ||
             cmd == RS_PANEL_CMD_BOOT_UPD_TRANSMIT ||
-            cmd == RS_PANEL_CMD_BOOT_GET_VERSION) ? 1u : 0u;
+            cmd == RS_PANEL_CMD_BOOT_GET_VERSION ||
+            cmd == RS_PANEL_CMD_PROFILE_SET) ? 1u : 0u;
 }
 
 static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
@@ -1133,7 +1134,11 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
 
         uint8_t mode;
         uint8_t value = 0u;
-        if (st == 0u) {
+        /* Тушение: на панели мигание ПУСК (независимо от локального GOST ON/blink). */
+        if (local_led == LED_START && Fire_IsExtinguishIndicationActive() != 0u) {
+            mode = RS_PANEL_LED_MODE_BLINK;
+            value = 0u;
+        } else if (st == 0u) {
             mode = RS_PANEL_LED_MODE_OFF;
         } else if (st == 2u) {
             mode = RS_PANEL_LED_MODE_BLINK;
@@ -1164,6 +1169,7 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
 }
 
 static volatile uint8_t s_sound_push_pending = 0u;
+static volatile uint8_t s_led_push_pending = 0u;
 static uint8_t s_last_sound_tx[9];
 static uint16_t s_last_sound_tx_len = 0u;
 static uint8_t s_last_sound_tx_valid = 0u;
@@ -2482,6 +2488,7 @@ uint8_t RsPanel_DecodeProfileSetCmd(const uint8_t *src, uint16_t src_len, RsPane
     case RS_PANEL_PROFILE_SET_BTN_MASK:
     case RS_PANEL_PROFILE_SET_JOURNAL_LINES:
     case RS_PANEL_PROFILE_SET_RS_ADDR:
+    case RS_PANEL_PROFILE_SET_PANEL_TYPE:
         if (src_len < 2u) {
             return 0u;
         }
@@ -3051,6 +3058,29 @@ void RsPanelMaster_PushSound(void)
     s_sound_push_pending = 1u;
 }
 
+void RsPanelMaster_PushLeds(void)
+{
+    s_led_push_pending = 1u;
+}
+
+uint8_t RsPanelMaster_IsSmallPanel(void)
+{
+    uint8_t i;
+    if (g_active_master == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < g_active_master->panel_count; i++) {
+        const PanelState *panel = &g_active_master->panels[i];
+        if (panel->cfg.enabled == 0u || PanelState_IsReady(panel) == 0u) {
+            continue;
+        }
+        if (panel->is_small_panel != 0u) {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
 void RsPanelMaster_SetCanMirrorEnable(uint8_t enable)
 {
     uint32_t primask = __get_PRIMASK();
@@ -3253,6 +3283,16 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     if (s_sound_push_pending != 0u) {
         s_sound_push_pending = 0u;
         rs_panel_master_send_sound_to_ready_panels(master);
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        return;
+    }
+
+    /* NORM/ERR и др. статусные LED: dirty из Led_Set или явный PushLeds. */
+    if (s_led_push_pending != 0u || Led_TakeRemoteDirty() != 0u) {
+        s_led_push_pending = 0u;
+        rs_panel_master_send_leds_to_ready_panels(master);
         RsPanelMasterDebug_Timer10ms();
         g_rs_master_dbg.menu_selected = g_menu_selected;
         g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;

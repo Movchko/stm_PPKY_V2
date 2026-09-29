@@ -51,6 +51,10 @@ void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
 /* Синхронизировать текущее состояние Beeper на все готовые панели. */
 void RsPanelMaster_PushSound(void);
+/* Синхронизировать LED (в т.ч. NORM/ERR) на готовые панели. */
+void RsPanelMaster_PushLeds(void);
+/* 1 = подключена малая панель (нет ПУСК ОБЩИЙ). */
+uint8_t RsPanelMaster_IsSmallPanel(void);
 /* Прокидка сырого RS-кадра с WiFi/ПО (BSU_PKT_TYPE_ESP_UART) на шину панелей. */
 uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len);
 /* Зеркало CAN→RS485 (cmd 0xF7/0xF8): default OFF. */

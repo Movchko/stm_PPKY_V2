@@ -22,6 +22,7 @@ static uint8_t cur_led_power[NUM_LED];
 static uint8_t hw_led_state[NUM_LED];
 static uint8_t hw_led_power[NUM_LED];
 static uint8_t led_sync_tick = 0u;
+static uint8_t s_led_remote_dirty = 0u;
 
 /* Счетчик неактивности кнопок для управления яркостью подсветки ENTER/ESC */
 static uint16_t led_but_idle_counter = 0;
@@ -180,6 +181,18 @@ void Led_Set(uint8_t led, uint8_t st) {
         return;
     }
     cur_led_state[led] = st;
+    /* На панель по dirty — только NORM/ERR (иначе мигание ПУСК/ПОЖАР
+     * заливает RS и душит POLL/ОСТАНОВ). Остальное — явным PushLeds. */
+    if (led == LED_NORM || led == LED_ERR) {
+        s_led_remote_dirty = 1u;
+    }
+}
+
+uint8_t Led_TakeRemoteDirty(void)
+{
+	uint8_t d = s_led_remote_dirty;
+	s_led_remote_dirty = 0u;
+	return d;
 }
 
 void Led_Snake(uint8_t state) {
