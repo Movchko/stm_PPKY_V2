@@ -88,13 +88,17 @@ static RsPanelMaster g_rs_panel_master;
 
 extern "C" __attribute__((weak)) void App_OnFireUiUpdate(uint8_t active, uint8_t mode,
 							      uint8_t remaining_s, uint8_t n_zones,
-							      char (*zone_names)[ZONE_NAME_SIZE + 1])
+							      char (*zone_names)[ZONE_NAME_SIZE + 1],
+							      const uint8_t *zone_modes,
+							      const uint8_t *zone_remaining)
 {
 	(void)active;
 	(void)mode;
 	(void)remaining_s;
 	(void)n_zones;
 	(void)zone_names;
+	(void)zone_modes;
+	(void)zone_remaining;
 }
 
 extern "C" __attribute__((weak)) uint8_t App_OnWarningUiUpdate(uint8_t active, uint8_t n_items,
@@ -1027,6 +1031,9 @@ void AppInit() {
 	PPKYConfig.fire_and[1] = 1;
 	sizesctruct = sizeof(PPKYConfig);
 
+
+
+
 }
 
 extern "C" void PControl_OnStatusFault(uint8_t ch, uint32_t now_ms) {
@@ -1322,8 +1329,9 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData) {
 }
 
 extern "C" void Fire_UiUpdate(uint8_t active, uint8_t mode, uint8_t remaining_s, uint8_t n_zones,
-			      char (*zone_names)[ZONE_NAME_SIZE + 1]) {
-	App_OnFireUiUpdate(active, mode, remaining_s, n_zones, zone_names);
+			      char (*zone_names)[ZONE_NAME_SIZE + 1],
+			      const uint8_t *zone_modes, const uint8_t *zone_remaining) {
+	App_OnFireUiUpdate(active, mode, remaining_s, n_zones, zone_names, zone_modes, zone_remaining);
 }
 
 extern "C" uint8_t Warning_UiUpdate(uint8_t active, uint8_t n_items,

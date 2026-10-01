@@ -1285,7 +1285,8 @@ static void UpdateFaultSound(uint32_t now_ms)
 	}
 }
 
-/* Управляет LED_ERR: только неисправность (непрерывно). ВНИМАНИЕ — на LED_FIRE. */
+/* Управляет LED_ERR: только неисправность (непрерывно). ВНИМАНИЕ — на LED_FIRE.
+ * NORM гасим здесь же до PushUi/CMD_LED (App_Update в том же тике ещё со старым has_fault). */
 static void UpdateErrorLed(uint32_t now_ms)
 {
 	uint8_t fault_count = CountActiveFaultNow();
@@ -1301,12 +1302,14 @@ static void UpdateErrorLed(uint32_t now_ms)
 	if (fault_count > 0u || Fire_HasExtinguishIncomplete()) {
 		Led_Set(LED_ERR, 1u);
 		g_led_err_on = 1u;
-		return;
-	}
-
-	if (g_led_err_on) {
+	} else if (g_led_err_on) {
 		Led_Set(LED_ERR, 0u);
 		g_led_err_on = 0u;
+	}
+
+	if (fault_count > 0u || attention_count > 0u ||
+	    Fire_HasExtinguishIncomplete() || Fire_IsActive()) {
+		Led_Set(LED_NORM, 0u);
 	}
 }
 

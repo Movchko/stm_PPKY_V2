@@ -26,6 +26,7 @@
 #include "led.h"
 #include "can_bus.h"
 #include "menu_ui.h"
+#include "fw_update.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -98,13 +99,13 @@ uint8_t isMainInit = 0;
 /* USER CODE BEGIN 0 */
 
 
-#define APP_VERSION_U32 6u
+#define APP_VERSION_U32 16u
 
 const char *GetAppVersion(void)
 {
     static char ver_buf[64];
     /* fw: версия прошивки (пока константа) */
-    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 5 версия программной части %u", (unsigned)APP_VERSION_U32);
+    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия программной части %u", (unsigned)APP_VERSION_U32);
     return ver_buf;
 }
 
@@ -197,6 +198,9 @@ int main(void)
 
   if(isFlash == true) {
 	  AppInit();
+	  /* Сразу после старта: SetApp(MAIN,UPDATE) стирает сектор с Program WD.
+	   * Без флага бутлоадер при следующем reset делает SetDefaultBoot() → откат на заводскую. */
+	  Boot_WriteProgramWatchDog();
 
 	  HAL_TIM_Base_Start_IT(&htim1);
 	  HAL_TIM_Base_Start_IT(&htim2);

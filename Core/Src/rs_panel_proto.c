@@ -251,6 +251,10 @@ static void rs_panel_master_log_journal_link(uint8_t panel_addr, uint8_t recover
  * В `button.c` эта функция объявлена как weak, поэтому сильная реализация здесь
  * автоматически перехватывает remote-кнопки.
  */
+/* FORCE / STOP / FIRE — биты пусковых кнопок. */
+#define RS_PANEL_LAUNCH_BTN_MASK \
+    ((uint8_t)((1u << 4) | (1u << 5) | (1u << 6)))
+
 uint8_t Button_FetchRemotePressedMask(uint8_t *mask_out)
 {
     if (mask_out != 0u) {
@@ -267,6 +271,9 @@ uint8_t Button_FetchRemotePressedMask(uint8_t *mask_out)
             continue;
         }
         if (PanelState_IsReady(panel) == 0u) {
+            /* Не READY — не держим залипшие пусковые биты от прошлой сессии. */
+            panel->remote_btn_mask =
+                (uint8_t)(panel->remote_btn_mask & (uint8_t)~RS_PANEL_LAUNCH_BTN_MASK);
             continue;
         }
         mask |= panel->remote_btn_mask;
@@ -276,6 +283,27 @@ uint8_t Button_FetchRemotePressedMask(uint8_t *mask_out)
         *mask_out = mask;
     }
     return 1u;
+}
+
+static uint8_t rs_panel_master_launch_btn_poll_priority(const RsPanelMaster *master)
+{
+    uint8_t i;
+    if (Fire_IsStartAllHoldActive() != 0u) {
+        return 1u;
+    }
+    if (master == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < master->panel_count; i++) {
+        const PanelState *panel = &master->panels[i];
+        if (panel->cfg.enabled == 0u || PanelState_IsReady(panel) == 0u) {
+            continue;
+        }
+        if ((panel->remote_btn_mask & RS_PANEL_LAUNCH_BTN_MASK) != 0u) {
+            return 1u;
+        }
+    }
+    return 0u;
 }
 
 /* WARNING_TITLE_LEN задаётся в app.cpp; чтобы сигнатура совпадала с extern-weak коллбеком,
@@ -718,8 +746,9 @@ static uint8_t rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *maste
         if (panel->cfg.enabled == 0u || PanelState_IsReady(panel) == 0u) {
             continue;
         }
-        /* Не слать WARN/FIRE поверх кадра, который ещё ждёт ACK — иначе CRC на панели. */
-        if (panel->ack_wait_active != 0u) {
+        /* Не слать WARN/FIRE поверх кадра, который ещё ждёт ACK — иначе CRC на панели.
+         * MAIN_FIRE (короткий) пропускаем: иначе при ACK журнала нет таймера удержания. */
+        if (panel->ack_wait_active != 0u && sub_id != RS_PANEL_UI_DATA_MAIN_FIRE) {
             continue;
         }
 
@@ -1112,16 +1141,18 @@ static uint8_t rs_led_type_from_local(uint8_t local_led)
     }
 }
 
-static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
+static uint8_t rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
 {
+    uint8_t any_ok = 0u;
+    uint8_t count = 0u;
+
     if (master == 0u) {
-        return;
+        return 0u;
     }
 
     /* local: 15 led -> protocol: <= 16 led items */
     uint8_t payload[1u + 15u * 3u];
-    uint16_t pos = 0u;
-    payload[pos++] = 15u; /* count */
+    uint16_t pos = 1u; /* count заполним после сборки */
 
     for (uint8_t local_led = 0u; local_led < 15u; local_led++) {
         uint8_t type = rs_led_type_from_local(local_led);
@@ -1134,10 +1165,31 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
 
         uint8_t mode;
         uint8_t value = 0u;
-        /* Тушение: на панели мигание ПУСК (независимо от локального GOST ON/blink). */
+        uint8_t fire_led_mode = Fire_GetPanelFireLedMode();
+        /* Тушение: ГОСТ — непрерывное свечение ПУСК, ОСТ.ПУСК выключен.
+         * Удержание ПУСК ОБЩИЙ: на хосте уже toggle ON/OFF — шлём как есть (не MODE_BLINK):
+         * так панель гарантированно видит фронты даже при редком TX. */
         if (local_led == LED_START && Fire_IsExtinguishIndicationActive() != 0u) {
-            mode = RS_PANEL_LED_MODE_BLINK;
+            mode = RS_PANEL_LED_MODE_BRIGHT;
+            value = LED_STATUS_MAX_BRIGHTNESS;
+        } else if (local_led == LED_STOP && Fire_IsExtinguishIndicationActive() != 0u) {
+            mode = RS_PANEL_LED_MODE_OFF;
             value = 0u;
+        } else if (local_led == LED_FIRE) {
+            if (fire_led_mode == 1u) {
+                /* ПОЖАР1 — непрерывно */
+                mode = RS_PANEL_LED_MODE_BRIGHT;
+                value = LED_STATUS_MAX_BRIGHTNESS;
+            } else if (fire_led_mode == 2u || fire_led_mode == 3u) {
+                /* ПОЖАР2 / ВНИМАНИЕ — софт-мигание на панели */
+                mode = RS_PANEL_LED_MODE_BLINK;
+                value = LED_STATUS_MAX_BRIGHTNESS;
+            } else if (st == 0u) {
+                mode = RS_PANEL_LED_MODE_OFF;
+            } else {
+                mode = RS_PANEL_LED_MODE_BRIGHT;
+                value = Led_GetBrightness(local_led);
+            }
         } else if (st == 0u) {
             mode = RS_PANEL_LED_MODE_OFF;
         } else if (st == 2u) {
@@ -1150,7 +1202,9 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
         payload[pos++] = type;
         payload[pos++] = mode;
         payload[pos++] = value;
+        count++;
     }
+    payload[0] = count;
 
     for (uint8_t i = 0u; i < master->panel_count; i++) {
         PanelState *panel = &master->panels[i];
@@ -1158,22 +1212,30 @@ static void rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
             continue;
         }
 
-        (void)RsBus_SendFrame(&master->bus,
-                               panel->cfg.addr,
-                               master->next_seq++,
-                               0u, /* flags: master->panel (no DIR) */
-                               RS_PANEL_CMD_LED,
-                               payload,
-                               pos);
+        if (RsBus_SendFrame(&master->bus,
+                            panel->cfg.addr,
+                            master->next_seq++,
+                            0u, /* flags: master->panel (no DIR) */
+                            RS_PANEL_CMD_LED,
+                            payload,
+                            pos) == HAL_OK) {
+            any_ok = 1u;
+        }
     }
+    return any_ok;
 }
 
 static volatile uint8_t s_sound_push_pending = 0u;
 static volatile uint8_t s_led_push_pending = 0u;
+/* Сколько тиков подряд ушли в SOUND/LED/UI без POLL (см. Process10ms). */
+static uint8_t s_nonpoll_streak = 0u;
+/* При удержании пусковых: чередование POLL↔LED/SOUND (POLL сбрасывает streak). */
+static uint8_t s_launch_alt = 0u;
+static uint32_t s_led_hold_refresh_ms = 0u;
 static uint8_t s_last_sound_tx[9];
 static uint16_t s_last_sound_tx_len = 0u;
 static uint8_t s_last_sound_tx_valid = 0u;
-/* 1 = панель реально перезапустилась (uptime упал) — переслать SOUND без dedup. */
+/* 1 = следующий SOUND без dedup (reboot панели / стоп START_ALL_HOLD). */
 static uint8_t s_force_sound_resync = 0u;
 static uint32_t s_last_time_sync_ms = 0u;
 
@@ -1242,10 +1304,12 @@ static uint8_t rs_panel_master_send_time_broadcast(RsPanelMaster *master)
     return 1u;
 }
 
-static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
+static uint8_t rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
 {
+    uint8_t any_ok = 0u;
+
     if (master == 0) {
-        return;
+        return 0u;
     }
 
     uint8_t sound_enabled = Beeper_IsSoundEnabled();
@@ -1263,7 +1327,7 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
      * стартует паттерн заново (клик ~каждую секунду при resync/флапах). */
     if (sound_enabled != 0u &&
         state_code != 0u && state_code != 4u && state_code != 5u && state_code != 6u) {
-        return;
+        return 1u;
     }
 
     /* BEEPER_STATE_CONTINUOUS=4, FIRE_ALARM=5, PATTERN=6 — как в beeper.c */
@@ -1330,15 +1394,18 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
         payload[8] = (uint8_t)(repeat_ms >> 8);
     }
 
-    /* Не слать повтор того же SOUND — иначе панель рестартит duty (кэш WARN / resync). */
-    if (s_last_sound_tx_valid != 0u &&
+    /* Не слать повтор того же SOUND — иначе панель рестартит duty (кэш WARN / resync).
+     * Принудительный resync (стоп hold) — всегда TX. */
+    if (s_force_sound_resync == 0u &&
+        s_last_sound_tx_valid != 0u &&
         s_last_sound_tx_len == payload_len &&
         memcmp(s_last_sound_tx, payload, payload_len) == 0) {
-        return;
+        return 1u;
     }
     memcpy(s_last_sound_tx, payload, payload_len);
     s_last_sound_tx_len = payload_len;
     s_last_sound_tx_valid = 1u;
+    s_force_sound_resync = 0u;
 
     for (uint8_t i = 0u; i < master->panel_count; i++) {
         PanelState *panel = &master->panels[i];
@@ -1346,14 +1413,17 @@ static void rs_panel_master_send_sound_to_ready_panels(RsPanelMaster *master)
             continue;
         }
 
-        (void)RsBus_SendFrame(&master->bus,
-                               panel->cfg.addr,
-                               master->next_seq++,
-                               0u, /* flags: master->panel (no DIR) */
-                               RS_PANEL_CMD_SOUND,
-                               payload,
-                               payload_len);
+        if (RsBus_SendFrame(&master->bus,
+                            panel->cfg.addr,
+                            master->next_seq++,
+                            0u, /* flags: master->panel (no DIR) */
+                            RS_PANEL_CMD_SOUND,
+                            payload,
+                            payload_len) == HAL_OK) {
+            any_ok = 1u;
+        }
     }
+    return any_ok;
 }
 
 static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
@@ -1388,7 +1458,9 @@ void App_OnFireUiUpdate(uint8_t active,
                           uint8_t mode,
                           uint8_t remaining_s,
                           uint8_t n_zones,
-                          char (*zone_names)[ZONE_NAME_SIZE + 1])
+                          char (*zone_names)[ZONE_NAME_SIZE + 1],
+                          const uint8_t *zone_modes,
+                          const uint8_t *zone_remaining)
 {
     RsPanelMaster *master = g_active_master;
     if (master == 0u || zone_names == 0u) {
@@ -1399,24 +1471,30 @@ void App_OnFireUiUpdate(uint8_t active,
         n_zones = 16u;
     }
 
-    /* rs_apply_main_fire ждёт PAYLOAD без sub_id:
-     * active(1) mode(1) remaining_s(1) sel_index(1) n_zones(1) + [str_len + str]* */
+    /* PAYLOAD без sub_id: active mode remaining_s sel_index n_zones
+     * + n_zones × (len + utf8 + z_mode + z_remaining). sub_id добавляет send. */
     uint8_t ui_payload[RS_BUS_MAX_PAYLOAD];
     uint16_t pos = 0u;
-    uint16_t max_pos = RS_BUS_MAX_PAYLOAD;
+    uint16_t max_pos = (uint16_t)(RS_BUS_MAX_WIRE_PAYLOAD - 1u);
+
+    if (max_pos > RS_BUS_MAX_PAYLOAD) {
+        max_pos = RS_BUS_MAX_PAYLOAD;
+    }
 
     ui_payload[pos++] = (active != 0u) ? (uint8_t)1u : (uint8_t)0u;
     ui_payload[pos++] = mode;
     ui_payload[pos++] = remaining_s;
-    ui_payload[pos++] = 0u; /* sel_index (не используется в панели) */
+    ui_payload[pos++] = Fire_UiGetSelectedIndex();
     uint16_t n_zones_pos = pos;
     ui_payload[pos++] = 0u; /* n_zones: заполним по факту (может урезаться по размеру кадра) */
 
     uint8_t out_n_zones = 0u;
     for (uint8_t i = 0u; i < n_zones; i++) {
         uint8_t str_len = (uint8_t)strnlen(zone_names[i], ZONE_NAME_SIZE);
-        /* payload: [str_len][str bytes] */
-        if ((uint16_t)(pos + 1u + str_len) > max_pos) {
+        uint8_t z_mode = (zone_modes != 0) ? zone_modes[i] : mode;
+        uint8_t z_rem = (zone_remaining != 0) ? zone_remaining[i] : remaining_s;
+        /* payload: [str_len][str bytes][z_mode][z_remaining] */
+        if ((uint16_t)(pos + 1u + str_len + 2u) > max_pos) {
             break;
         }
         ui_payload[pos++] = str_len;
@@ -1424,6 +1502,8 @@ void App_OnFireUiUpdate(uint8_t active,
             memcpy(&ui_payload[pos], zone_names[i], str_len);
             pos = (uint16_t)(pos + str_len);
         }
+        ui_payload[pos++] = z_mode;
+        ui_payload[pos++] = z_rem;
         out_n_zones++;
         ui_payload[n_zones_pos] = out_n_zones;
     }
@@ -1434,14 +1514,16 @@ void App_OnFireUiUpdate(uint8_t active,
 
     /* Как в stm_PPKY v1: если пришёл пожар — принудительно переводим UI панелей на MAIN. */
     rs_panel_master_ensure_main_screen(master);
-    rs_panel_master_send_ui_data_to_ready_panels(master, RS_PANEL_UI_DATA_MAIN_FIRE, ui_payload, pos);
+    (void)rs_panel_master_send_ui_data_to_ready_panels(master,
+                                                       RS_PANEL_UI_DATA_MAIN_FIRE,
+                                                       ui_payload,
+                                                       pos);
 
-    rs_panel_master_send_leds_to_ready_panels(master);
+    /* LED/SOUND — в Process10ms (half-duplex). Сразу после MAIN_FIRE не слать
+     * LED+journal: при удержании/сбросе кадр clear/таймера теряется. */
+    RsPanelMaster_PushLeds();
     /* SOUND не из FIRE UI: remaining_s меняется каждую секунду и сбрасывал бы
      * дежурный паттерн на панели. Звук шлётся из fire/warning при смене фазы. */
-
-    /* Журнал: обновляем кэш на панели по мере прихода UI-обновлений. */
-    rs_panel_master_send_journal_list_to_ready_panels(master);
 }
 
 uint8_t App_OnWarningUiUpdate(uint8_t active,
@@ -2015,6 +2097,10 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                     break;
                 }
             }
+            break;
+
+        case RS_PANEL_UI_EVT_FIRE_SELECT:
+            Fire_UiSetManualSelection((evt->p1 != 0u) ? 1u : 0u, (uint8_t)evt->p2);
             break;
 
         default:
@@ -3058,9 +3144,30 @@ void RsPanelMaster_PushSound(void)
     s_sound_push_pending = 1u;
 }
 
+void RsPanelMaster_InvalidateSoundDedup(void)
+{
+    s_last_sound_tx_valid = 0u;
+    s_last_sound_tx_len = 0u;
+    s_force_sound_resync = 1u;
+}
+
 void RsPanelMaster_PushLeds(void)
 {
     s_led_push_pending = 1u;
+}
+
+void RsPanelMaster_OnStartAllHoldBegin(void)
+{
+    RsPanelMaster *master = g_active_master;
+    if (master == 0u) {
+        return;
+    }
+    rs_panel_master_send_ui_nav_to_ready_panels(master,
+                                                RS_PANEL_SCREEN_MAIN,
+                                                RS_PANEL_UI_ACTION_REPLACE);
+    /* Сразу поставить LED/SOUND в очередь Process10ms (мигание + hold-звук). */
+    s_led_push_pending = 1u;
+    s_sound_push_pending = 1u;
 }
 
 uint8_t RsPanelMaster_IsSmallPanel(void)
@@ -3279,32 +3386,82 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         s_inject_pause_until_ms = 0u;
     }
 
-    /* Звук fire/fault — отдельный TX, не привязан к WARN/FIRE UI. */
-    if (s_sound_push_pending != 0u) {
-        s_sound_push_pending = 0u;
-        rs_panel_master_send_sound_to_ready_panels(master);
-        RsPanelMasterDebug_Timer10ms();
-        g_rs_master_dbg.menu_selected = g_menu_selected;
-        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
-        return;
-    }
+    /* Пока удержание/нажаты пусковые — POLL обязателен, но LED/SOUND нельзя
+     * голодать: иначе нет мигания ПУСК ОБЩИЙ / ПУСК при тушении и нет звука.
+     * POLL обнуляет s_nonpoll_streak → при launch_prio чередуем отдельным флагом. */
+    {
+        uint8_t launch_prio = rs_panel_master_launch_btn_poll_priority(master);
+        uint8_t allow_nonpoll;
 
-    /* NORM/ERR и др. статусные LED: dirty из Led_Set или явный PushLeds. */
-    if (s_led_push_pending != 0u || Led_TakeRemoteDirty() != 0u) {
-        s_led_push_pending = 0u;
-        rs_panel_master_send_leds_to_ready_panels(master);
-        RsPanelMasterDebug_Timer10ms();
-        g_rs_master_dbg.menu_selected = g_menu_selected;
-        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
-        return;
-    }
+        /* Периодический LED refresh: ПУСК (тушение), мигание ПУСК ОБЩИЙ, мигание ПОЖАР. */
+        if ((Fire_IsStartAllHoldActive() != 0u ||
+             Fire_IsExtinguishIndicationActive() != 0u ||
+             Fire_GetPanelFireLedMode() == 2u ||
+             Fire_GetPanelFireLedMode() == 3u) &&
+            (s_led_hold_refresh_ms == 0u ||
+             (now_ms - s_led_hold_refresh_ms) >= 200u)) {
+            s_led_hold_refresh_ms = now_ms;
+            s_led_push_pending = 1u;
+        }
 
-    /* RTC → панели: не чаще 1/10 мин; первый раз — как только есть READY. */
-    if (rs_panel_master_any_panel_ready(master) != 0u &&
-        (s_last_time_sync_ms == 0u ||
-         (now_ms - s_last_time_sync_ms) >= RS_PANEL_TIME_SYNC_PERIOD_MS)) {
-        if (rs_panel_master_send_time_broadcast(master) != 0u) {
-            s_last_time_sync_ms = now_ms;
+        if (launch_prio != 0u) {
+            s_launch_alt ^= 1u;
+            allow_nonpoll = s_launch_alt;
+        } else {
+            s_launch_alt = 0u;
+            allow_nonpoll = (s_nonpoll_streak < 1u) ? 1u : 0u;
+        }
+
+        /* Звук fire/fault — отдельный TX, не привязан к WARN/FIRE UI. */
+        if (s_sound_push_pending != 0u && allow_nonpoll != 0u) {
+            if (launch_prio == 0u) {
+                s_nonpoll_streak++;
+            }
+            if (rs_panel_master_send_sound_to_ready_panels(master) != 0u) {
+                s_sound_push_pending = 0u;
+            }
+            RsPanelMasterDebug_Timer10ms();
+            g_rs_master_dbg.menu_selected = g_menu_selected;
+            g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+            return;
+        }
+
+        /* NORM/ERR и др. статусные LED: dirty из Led_Set или явный PushLeds.
+         * При неудачной TX dirty сохраняем — иначе NORM/ERR на панели залипают. */
+        if (allow_nonpoll != 0u &&
+            (s_led_push_pending != 0u || Led_TakeRemoteDirty() != 0u)) {
+            s_led_push_pending = 0u;
+            if (launch_prio == 0u) {
+                s_nonpoll_streak++;
+            }
+            if (rs_panel_master_send_leds_to_ready_panels(master) == 0u) {
+                s_led_push_pending = 1u;
+            }
+            RsPanelMasterDebug_Timer10ms();
+            g_rs_master_dbg.menu_selected = g_menu_selected;
+            g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+            return;
+        }
+
+        /* RTC → панели: не чаще 1/10 мин; первый раз — как только есть READY. */
+        if (allow_nonpoll != 0u && launch_prio == 0u &&
+            rs_panel_master_any_panel_ready(master) != 0u &&
+            (s_last_time_sync_ms == 0u ||
+             (now_ms - s_last_time_sync_ms) >= RS_PANEL_TIME_SYNC_PERIOD_MS)) {
+            if (rs_panel_master_send_time_broadcast(master) != 0u) {
+                s_last_time_sync_ms = now_ms;
+                s_nonpoll_streak++;
+                RsPanelMasterDebug_Timer10ms();
+                g_rs_master_dbg.menu_selected = g_menu_selected;
+                g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+                return;
+            }
+        }
+
+        /* UI-ответы на кнопки: не блокируем POLL при удержании пуска. */
+        if (s_ui_evt_q_count != 0u && allow_nonpoll != 0u && launch_prio == 0u) {
+            s_nonpoll_streak++;
+            rs_panel_master_ui_evt_process_pending(master);
             RsPanelMasterDebug_Timer10ms();
             g_rs_master_dbg.menu_selected = g_menu_selected;
             g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
@@ -3326,16 +3483,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         }
     }
 
-    /* Сначала UI-ответы на кнопки (TX вне RX IRQ).
-     * В этом же тике не шлём POLL/WARN: иначе UI_NAV+MENU_LIST+POLL одним пакетом
-     * и панель часто теряет первый вход в меню. */
-    if (s_ui_evt_q_count != 0u) {
-        rs_panel_master_ui_evt_process_pending(master);
-        RsPanelMasterDebug_Timer10ms();
-        g_rs_master_dbg.menu_selected = g_menu_selected;
-        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
-        return;
-    }
+    /* UI-очередь при force_poll обслуживается на следующем свободном тике. */
 
     RsPanelMasterDebug_Timer10ms();
     g_rs_master_dbg.panel_caps_valid = master->panels[0].caps_valid;
@@ -3469,6 +3617,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     panel->last_poll_ms = now_ms;
     panel->last_tx_seq = master->next_seq;
     g_rs_master_dbg.poll_req_tx++;
+    s_nonpoll_streak = 0u;
     (void)RsBus_SendFrame(&master->bus,
                           panel->cfg.addr,
                           master->next_seq++,

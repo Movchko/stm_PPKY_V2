@@ -45,11 +45,16 @@ uint8_t Fire_HasExtinguishIncomplete(void);
 /* Идёт удержание ПУСК ОБЩИЙ (3с) - нужен главный экран со счётчиком. */
 uint8_t Fire_IsStartAllHoldActive(void);
 
-/* Активен звук/индикация тушения (мигание ПУСК на панели). */
+/* Активен звук/индикация тушения (ПУСК непрерывно на панели). */
 uint8_t Fire_IsExtinguishIndicationActive(void);
+
+/* Режим обобщённого LED_FIRE для панели:
+ * 0 = OFF, 1 = ПОЖАР1 (непрерывно), 2 = ПОЖАР2 (мигание), 3 = ВНИМАНИЕ (мигание). */
+uint8_t Fire_GetPanelFireLedMode(void);
 
 /* Ручной выбор пожара на главном экране (индекс в текущем UI-списке). */
 void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index);
+uint8_t Fire_UiGetSelectedIndex(void);
 
 /* Смена zone_fire_mode[] (меню РЕЖИМ ЗОН) - обновить LED_AUTO_OFF. */
 void Fire_NotifyZoneModeChanged(void);

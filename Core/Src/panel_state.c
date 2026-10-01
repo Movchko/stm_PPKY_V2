@@ -58,9 +58,10 @@ void PanelState_OnCaps(PanelState *state, const RsPanelCaps *caps, uint32_t now_
     state->caps = *caps;
     state->caps_valid = 1u;
     state->last_rx_ms = now_ms;
-    state->is_small_panel = (caps->ui_profile == PANEL_TYPE_SMALL) ? 1u : 0u;
-    /* Запасной признак: в CAPS нет START_ALL. */
-    if (state->is_small_panel == 0u) {
+    /* ui_profile = PANEL_TYPE_1/2/3; малые = 2 и 3 (и устаревший 0). */
+    state->is_small_panel = PANEL_TYPE_IS_SMALL(caps->ui_profile) ? 1u : 0u;
+    /* Запасной признак: в CAPS нет START_ALL ⇒ малая. */
+    if (state->is_small_panel == 0u && caps->ui_profile != PANEL_TYPE_1) {
         uint8_t has_start_all = 0u;
         uint8_t i;
         for (i = 0u; i < caps->btn_count && i < RS_PANEL_MAX_CAPS_BUTTONS; i++) {

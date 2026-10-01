@@ -800,8 +800,13 @@ void CanProcess(void)
 				continue;
 			}
 
-			/* Один и тот же пакет дважды с одной шины — пропустить */
-			if (*last_id_cur != CAN_ID_NONE && e->id == *last_id_cur && memcmp(e->data, last_data_cur, 8) == 0) {
+			/* Один и тот же пакет дважды с одной шины — пропустить.
+			 * 156/158 хост шлёт повторно тем же кадром, если ACK потерян:
+			 * без исключения ретрай никогда не доходит до SetUpdateWord. */
+			if (e->data[0] != ServiceCmd_SetUpdateWord &&
+			    e->data[0] != ServiceCmd_UpdateTransmit &&
+			    *last_id_cur != CAN_ID_NONE && e->id == *last_id_cur &&
+			    memcmp(e->data, last_data_cur, 8) == 0) {
 				continue;
 			}
 
