@@ -9,6 +9,7 @@
 #include "config_sync.hpp"
 #include "config_monitor.h"
 #include "config_ign_block_sync.h"
+#include "config_zone_block.h"
 #include "can_bus.h"
 #include "tick_time.h"
 #include "device_dpt.hpp"
@@ -243,6 +244,11 @@ extern "C" void App_OnConfigApplySuccess(void)
 	/* UI на RS-панели; локального дисплея нет. */
 	MenuConfig_OnApplySuccess();
 	MkuHardReset_ScheduleAfterApply();
+}
+
+/* backend вызывает это после ACK на ServiceCmd_SaveConfig (154). */
+void AplyConfig() {
+	ConfigSync_StartApply();
 }
 
 void USBSendData(uint8_t *Buf) {};
@@ -930,7 +936,6 @@ void PControlSetOutCB(uint8_t ch, uint8_t out) {
 	}
 }
 
-static volatile uint32_t sizesctruct;
 void AppInit() {
 
 	// Чтение сохранённой конфигурации из Flash (область конфигурации)
@@ -954,21 +959,27 @@ void AppInit() {
 
 
 		ReadSavedConfig();
-/*
-		// Заголовок валиден — читаем полезную часть
-		SPIF_ReadAddress(&hFlash,
-				         cfg_addr + sizeof(PPKYConfigHeader),
-						 (uint8_t *)&SavedPPKYConfig,
-						 sizeof(SavedPPKYConfig));
-						 */
 		PPKYConfig = SavedPPKYConfig;
+		/* Миграция: если zone_fire_mode[] ещё все «авто» (0), взять дефолт из fire_mode. */
+		{
+			uint8_t any_non_auto = 0u;
+			for (uint16_t zi = 0; zi < ZONE_NUMBER; zi++) {
+				uint8_t m = PPKYConfig.zone_fire_mode[zi];
+				if (m > 3u) {
+					PPKYConfig.zone_fire_mode[zi] = 0u;
+					m = 0u;
+				}
+				if (m != 0u) {
+					any_non_auto = 1u;
+				}
+			}
+			if (any_non_auto == 0u && PPKYConfig.fire_mode != 0u) {
+				PPKY_ZoneFireModeInitFromGlobal();
+			}
+		}
 	} else {
 		// Заголовок мусор: считаем, что конфигурации нет
-		// Сбрасываем на значения по умолчанию и сохраняем в область конфигурации
-		//DefaultConfig();
-
-		FillConfigTemplate();
-
+		DefaultConfig();
 		SaveConfig();
 	}
 
@@ -1024,16 +1035,6 @@ void AppInit() {
 	/* Инициализация FSM пожара */
 	Fire_Init();
 	RsPanelMaster_Init(&g_rs_panel_master, &huart1, BRP_485_EN_GPIO_Port, BRP_485_EN_Pin);
-
-
-
-	PPKYConfig.fire_and[0] = 1;
-	PPKYConfig.fire_and[1] = 1;
-	sizesctruct = sizeof(PPKYConfig);
-
-
-
-
 }
 
 extern "C" void PControl_OnStatusFault(uint8_t ch, uint32_t now_ms) {

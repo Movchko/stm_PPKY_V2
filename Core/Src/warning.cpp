@@ -482,7 +482,10 @@ static void RemoveItemAt(uint8_t idx)
 }
 
 /* Добавляет/обновляет запись неисправности и продлевает окно отображения.
- * Возвращает 1 при появлении новой активной неисправности (фронт). */
+ * Возвращает 1 при появлении новой активной неисправности (фронт).
+ * Смена типа уже активной неисправности (обрыв/КЗ/неисп, в том числе CAN)
+ * без возврата в норму пишется в журнал: снятие прежнего типа и появление нового.
+ * Список предупреждений по-прежнему один на канал. */
 static uint8_t UpsertItem(uint8_t kind, uint8_t zone, uint8_t h_adr, uint8_t v_l_adr,
 		       uint8_t mcu_d_type, uint8_t v_d_type, uint8_t line_state,
 		       uint8_t can_idx, int16_t extra, uint32_t now_ms)
@@ -490,14 +493,28 @@ static uint8_t UpsertItem(uint8_t kind, uint8_t zone, uint8_t h_adr, uint8_t v_l
 	int idx = FindItem(kind, zone, h_adr, v_l_adr, mcu_d_type, v_d_type, can_idx);
 	if (idx >= 0) {
 		uint8_t became_active = 0u;
-		g_items[(uint8_t)idx].line_state = line_state;
-		g_items[(uint8_t)idx].can_idx = can_idx;
-		g_items[(uint8_t)idx].extra = extra;
-		if (g_items[(uint8_t)idx].fault_now != 0u) {
-			g_items[(uint8_t)idx].show_until_ms = now_ms + WARNING_SHOW_HOLD_MS;
+		WarningItem &it = g_items[(uint8_t)idx];
+		uint8_t prev_line_state = it.line_state;
+		uint8_t was_active = it.fault_now;
+
+		it.can_idx = can_idx;
+		it.extra = extra;
+		if (was_active != 0u) {
+			if (prev_line_state != line_state &&
+			    IsFaultKind(it.kind) && !IsConfigFaultKind(it.kind)) {
+				/* Снятие пишем со старым line_state: от него зависят
+				 * fault_class и подпись ОБРЫВ/КЗ в журнале. */
+				EventLog_PostDeviceFaultItem(it, 1u);
+				it.line_state = line_state;
+				EventLog_PostDeviceFaultItem(it, 0u);
+			} else {
+				it.line_state = line_state;
+			}
+			it.show_until_ms = now_ms + WARNING_SHOW_HOLD_MS;
 		} else {
-			BeginConfirm(g_items[(uint8_t)idx], now_ms);
-			if (ConfirmElapsed(g_items[(uint8_t)idx], now_ms)) {
+			it.line_state = line_state;
+			BeginConfirm(it, now_ms);
+			if (ConfirmElapsed(it, now_ms)) {
 				became_active = PromoteToActiveFault((uint8_t)idx, now_ms);
 			}
 		}

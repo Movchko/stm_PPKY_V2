@@ -252,7 +252,7 @@ static uint8_t Fire_SendPhase2Zone(uint8_t zone);
 /* Отправляет фазу 2 только тем спичкам зоны, у которых нет end_ack. */
 static uint8_t Fire_SendPhase2ZonePending(uint8_t zone);
 /* Запускает фазу 2 по всем слотам, где она ещё не отправлялась. */
-static void Fire_Phase2AllPending(void);
+static uint8_t Fire_Phase2AllPending(void);
 /* Отметить отправку фазы 2 в слоте и инициализировать контур дотушивания. */
 static void Fire_MarkSlotPhase2Sent(FireZoneSlot *slot, uint32_t now_ms, uint8_t start_type);
 /* Полностью очищает слоты пожара и флаги остановки таймеров. */
@@ -2222,8 +2222,9 @@ static uint8_t Fire_ProcessAutoDeadlines(uint32_t now_ms)
 	return any_started;
 }
 
-static void Fire_Phase2AllPending(void)
+static uint8_t Fire_Phase2AllPending(void)
 {
+	uint8_t started = 0u;
 	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
 		if (!g_fire.slots[i].active || g_fire.slots[i].fire1_waiting) {
 			continue;
@@ -2245,8 +2246,10 @@ static void Fire_Phase2AllPending(void)
 		g_fire.slots[i].countdown_paused = 0u;
 		if (Fire_SendPhase2Zone(g_fire.slots[i].zone)) {
 			Fire_MarkSlotPhase2Sent(&g_fire.slots[i], HAL_GetTick(), FIRE_LOG_START_MANUAL);
+			started = 1u;
 		}
 	}
+	return started;
 }
 
 static uint8_t Fire_Phase2SelectedPending(uint8_t zone)
@@ -2795,6 +2798,15 @@ static void Fire_UpdateUiText(uint8_t active, uint8_t mode, uint8_t remaining_s,
 			same = 0u;
 		}
 	}
+	/* ДО ПУСКА: кадр с новой секундой легко теряется на half-duplex (SOUND/LED/POLL).
+	 * Dedup уже запомнил remaining — без retry экран залипает на первом значении. */
+	if (same && active != 0u && mode == 1u && n_zones > 0u) {
+		uint32_t t = HAL_GetTick();
+		if ((t - g_fire.last_ui_force_names_ms) >= 250u) {
+			g_fire.last_ui_force_names_ms = t;
+			same = 0u;
+		}
+	}
 	/* После GostReset/ForceUiResync: повторять active=0 ~2 с, пока панель
 	 * может не принять единственный clear (fire_active залипает, меню закрыто). */
 	if (same && active == 0u &&
@@ -3233,35 +3245,42 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		}
 		if (g_fire.state == FIRE_STATE_WAIT_AUTO || g_fire.state == FIRE_STATE_WAIT_MANUAL ||
 		    g_fire.state == FIRE_STATE_EXTINGUISHING) {
+			uint8_t started = 0u;
+			uint8_t log_zone = 0u;
 #if GOST_MODE
 			if (g_fire_ui_manual_select_enabled) {
 				uint8_t sel_zone = 0u;
-				/* launch_stopped зоны тоже можно снова запустить ПУСК СП. */
-				if (Fire_GetSelectedZoneFromUi(&sel_zone) && Fire_Phase2SelectedPending(sel_zone)) {
-					if (g_fire_panel_btn_source != 0u) {
-						Fire_LogPanelButton(FIRE_LOG_BTN_START_SP, sel_zone, 0u);
+				/* Сначала — выбранная зона (листание 1/N). */
+				if (Fire_GetSelectedZoneFromUi(&sel_zone)) {
+					started = Fire_Phase2SelectedPending(sel_zone);
+					if (started != 0u) {
+						log_zone = sel_zone;
 					}
-					g_fire.start_launch_pressed_latched = 1u;
-					g_fire.stop_launch_pressed_latched = 0u;
-					g_fire.start_sp_text_blink_until_ms = now_ms + (FIRE_START_SP_TEXT_BLINK_PERIOD_MS * 3u);
-					Fire_SyncStateFromSlots();
-					fire_processed = 1u;
-					start_processed = 1u;
 				}
-				break;
-			}
+				/* ГОСТ UI после вспышки нового пожара возвращает выбор на зону 0
+				 * (уже в тушении при delay=0). ПУСК СП тогда молча no-op,
+				 * а зона с задержкой так и остаётся в «ДО ПУСКА». Fallback —
+				 * пуск всех ещё ожидающих фазы 2. */
+				if (started == 0u && Fire_CountManualStartable() > 0u) {
+					started = Fire_Phase2AllPending();
+				}
+			} else
 #endif
-			if (Fire_CountPendingPhase2() == 0u) {
+			{
+				if (Fire_CountManualStartable() == 0u) {
+					break;
+				}
+				started = Fire_Phase2AllPending();
+			}
+			if (started == 0u) {
 				break;
 			}
-			/* Пуск тушения обработан — индикацию «ОСТАНОВ ПУСКА» снимаем */
 			if (g_fire_panel_btn_source != 0u) {
-				Fire_LogPanelButton(FIRE_LOG_BTN_START_SP, 0u, 0u);
+				Fire_LogPanelButton(FIRE_LOG_BTN_START_SP, log_zone, 0u);
 			}
 			g_fire.start_launch_pressed_latched = 1u;
 			g_fire.stop_launch_pressed_latched = 0u;
 			g_fire.start_sp_text_blink_until_ms = now_ms + (FIRE_START_SP_TEXT_BLINK_PERIOD_MS * 3u);
-			Fire_Phase2AllPending();
 			Fire_SyncStateFromSlots();
 			fire_processed = 1u;
 			start_processed = 1u;
@@ -3772,9 +3791,13 @@ void Fire_Timer10ms(void)
 			Fire_SetStartAllBrightness(0u);
 			Led_Set(LED_BUT_START_ALL, 0u);
 			Led_Set(LED_STR_START_ALL, 1u);
+			/* Повторный push: один кадр LED легко теряется на half-duplex. */
 			RsPanelMaster_PushLeds();
+			RsPanelMaster_InvalidateSoundDedup();
+			RsPanelMaster_PushSound();
 			Fire_ForceUiResync();
 			Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
+			RsPanelMaster_PushLeds();
 		}
 	}
 

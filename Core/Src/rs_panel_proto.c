@@ -3393,9 +3393,12 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         uint8_t launch_prio = rs_panel_master_launch_btn_poll_priority(master);
         uint8_t allow_nonpoll;
 
-        /* Периодический LED refresh: ПУСК (тушение), мигание ПУСК ОБЩИЙ, мигание ПОЖАР. */
+        /* Периодический LED refresh: ПУСК (тушение), мигание ПУСК ОБЩИЙ,
+         * ПОЖАР1 (непрерывно) и ПОЖАР2/ВНИМАНИЕ (мигание). Без refresh FIRE1
+         * единственный CMD_LED после старта легко теряется — лампа не загорается. */
         if ((Fire_IsStartAllHoldActive() != 0u ||
              Fire_IsExtinguishIndicationActive() != 0u ||
+             Fire_GetPanelFireLedMode() == 1u ||
              Fire_GetPanelFireLedMode() == 2u ||
              Fire_GetPanelFireLedMode() == 3u) &&
             (s_led_hold_refresh_ms == 0u ||
