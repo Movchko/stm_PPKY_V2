@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "rs_panel_protocol_v3.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,6 +62,15 @@ void Fire_NotifyZoneModeChanged(void);
 
 /* Сбросить кэш UI пожара; следующий Fire_Timer10ms переотправит на панели. */
 void Fire_ForceUiResync(void);
+
+/* События с панели (протокол v3): zone=0 — все зоны. */
+void Fire_OnPanelStartAllCommit(void);
+void Fire_OnPanelStartSp(uint8_t zone);
+void Fire_OnPanelStopLaunch(uint8_t zone);
+void Fire_OnPanelFireReset(uint8_t zone);
+
+/* Снимок зон для POLL v3 (ZONES). */
+void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms);
 
 #ifdef __cplusplus
 }

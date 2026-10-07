@@ -20,6 +20,7 @@
 #include "log_transport.h"
 #include "esp_manager.h"
 #include "rs_panel_proto.h"
+#include "rs_panel_v3_master.h"
 #include "fire.h"
 #include "warning.h"
 #include "fw_update.h"
@@ -244,6 +245,7 @@ extern "C" void App_OnConfigApplySuccess(void)
 	/* UI на RS-панели; локального дисплея нет. */
 	MenuConfig_OnApplySuccess();
 	MkuHardReset_ScheduleAfterApply();
+	RsPanelV3Master_RequestCatalogResync();
 }
 
 /* backend вызывает это после ACK на ServiceCmd_SaveConfig (154). */

@@ -17,6 +17,7 @@
 #include "config_zone_block.h"
 #include "tick_time.h"
 #include "rs_panel_proto.h"
+#include "rs_panel_v3_master.h"
 
 extern PPKYCfg PPKYConfig;
 extern ActiveDeviceInfo g_active_devices[NUM_ACTIVE_DEVICE];
@@ -498,6 +499,10 @@ static uint32_t s_ui_clear_retry_until_ms = 0u;
 
 static void Fire_PushStartAllHoldLeds(uint8_t blink_on)
 {
+	/* v3: мигание HOLD на панели локально, не через CMD_LED. */
+	if (RsPanelV3Master_IsV3PollActive() != 0u) {
+		return;
+	}
 	if (blink_on == s_start_all_hold_led_blink) {
 		return;
 	}
@@ -4143,4 +4148,111 @@ void Fire_ForceUiResync(void)
 	g_fire.last_ui_remaining = 0xFFu;
 	g_fire.last_ui_nzones = 0xFFu;
 	s_ui_clear_retry_until_ms = HAL_GetTick() + 2000u;
+}
+
+static void Fire_ApplyPanelZoneSelect(uint8_t zone)
+{
+	if (zone == 0u) {
+		g_fire_ui_manual_select_enabled = 0u;
+		g_fire_ui_selected_index = 0u;
+		return;
+	}
+	{
+		uint8_t zones[FIRE_UI_MAX_ZONES];
+		uint8_t n = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
+		uint8_t i;
+		for (i = 0u; i < n; i++) {
+			if (zones[i] == zone) {
+				g_fire_ui_manual_select_enabled = 1u;
+				g_fire_ui_selected_index = i;
+				return;
+			}
+		}
+	}
+	g_fire_ui_manual_select_enabled = 0u;
+}
+
+void Fire_OnPanelStartAllCommit(void)
+{
+	uint32_t now = HAL_GetTick();
+	g_fire_panel_btn_source = 1u;
+	Fire_Transition(FIRE_EVENT_BTN_START_ALL, now);
+	g_fire_panel_btn_source = 0u;
+}
+
+void Fire_OnPanelStartSp(uint8_t zone)
+{
+	uint32_t now = HAL_GetTick();
+	Fire_ApplyPanelZoneSelect(zone);
+	g_fire_panel_btn_source = 1u;
+	Fire_Transition(FIRE_EVENT_BTN_START_SP, now);
+	g_fire_panel_btn_source = 0u;
+}
+
+void Fire_OnPanelStopLaunch(uint8_t zone)
+{
+	uint32_t now = HAL_GetTick();
+	Fire_ApplyPanelZoneSelect(zone);
+	g_fire_panel_btn_source = 1u;
+	Fire_Transition(FIRE_EVENT_BTN_STOP, now);
+	g_fire_panel_btn_source = 0u;
+}
+
+void Fire_OnPanelFireReset(uint8_t zone)
+{
+	uint32_t now = HAL_GetTick();
+	Fire_ApplyPanelZoneSelect(zone);
+#if GOST_MODE
+	g_fire_panel_btn_source = 1u;
+	Fire_GostResetFire(now);
+	g_fire_panel_btn_source = 0u;
+#else
+	(void)now;
+	(void)zone;
+#endif
+}
+
+void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms)
+{
+	char zn[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
+	uint8_t zm[FIRE_UI_MAX_ZONES];
+	uint8_t zr[FIRE_UI_MAX_ZONES];
+	uint8_t zones[FIRE_UI_MAX_ZONES];
+	uint8_t nzn = 0u;
+	uint8_t nz_can;
+	uint8_t i;
+
+	if (out == 0) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	if (g_fire.state == FIRE_STATE_IDLE &&
+	    !(g_fire.all_hold_active && g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS)) {
+		return;
+	}
+	Fire_FillZoneNamesForUi(zn, &nzn);
+	nz_can = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
+	if (nz_can > nzn) {
+		nz_can = nzn;
+	}
+	for (i = 0u; i < nz_can; i++) {
+		Fire_UiStatusForZone(zones[i], now_ms, &zm[i], &zr[i]);
+	}
+	if (g_fire.all_hold_active != 0u && g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS) {
+		out->count = 0u;
+		return;
+	}
+	out->count = nzn;
+	if (out->count > RS_PANEL_V3_MAX_ZONES) {
+		out->count = RS_PANEL_V3_MAX_ZONES;
+	}
+	for (i = 0u; i < out->count; i++) {
+		out->items[i].zone = (i < nz_can) ? zones[i] : (uint8_t)(i + 1u);
+		out->items[i].status = (i < nz_can) ? zm[i] : 0u;
+		out->items[i].remaining_s = (i < nz_can) ? zr[i] : 0u;
+		if (i < nzn) {
+			strncpy(out->items[i].name, zn[i], RS_PANEL_V3_ZONE_NAME_LEN - 1u);
+			out->items[i].name[RS_PANEL_V3_ZONE_NAME_LEN - 1u] = '\0';
+		}
+	}
 }

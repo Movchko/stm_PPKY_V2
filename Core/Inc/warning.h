@@ -2,6 +2,7 @@
 #define INC_WARNING_H_
 
 #include <stdint.h>
+#include "rs_panel_protocol_v3.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,6 +14,8 @@ void WarningProcess1ms(void);
 void Warning_SetPowerFaultMask(uint8_t mask);
 /* Ошибки входов питания ППКУ: bits0..1 => ПИТАНИЕ1/2 */
 void Warning_SetPpkuInputFaultMask(uint8_t mask);
+/* Текущая (после debounce) маска входов питания — для SYS POLL v3 / LED_POWER. */
+uint8_t Warning_GetPpkuInputFaultMask(void);
 /* Ошибки несоответствия физической позиции МКУ (бит h_adr-1 => МКУ с адресом h_adr). */
 void Warning_SetMkuPositionFaultMask(uint32_t mask);
 /* Ошибка доставки журнала на панели (бит panel_addr-1 => панель addr 1..8). */
@@ -27,6 +30,8 @@ void Warning_ResetPanelUiCache(void);
 uint8_t Warning_GetLastUiBuildCount(void);
 /* 1, пока действует стартовая пауза warning_process_delay (список ещё не собран). */
 uint8_t Warning_IsProcessDelayActive(void);
+/* Снимок активных неисправностей v3 (коды + ключи) для RsPanelV3Master_SetFaultSnapshot. */
+uint16_t Warning_BuildV3FaultSnapshot(RsPanelV3FaultEvtItem *out, uint16_t max_out);
 
 #ifdef __cplusplus
 }

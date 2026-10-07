@@ -17,6 +17,7 @@
 #include "menu_ui.h"
 #include "rs_panel_master_debug.h"
 #include "rs_panel_proto.h"
+#include "rs_panel_v3_master.h"
 
 #define WARN_TITLE_LEN 24
 
@@ -1398,7 +1399,188 @@ static void RepublishUiNow(void)
 	}
 }
 
+static void Warning_FillV3McuKey(RsPanelV3McuKey *k, const WarningItem& it)
+{
+	if (k == nullptr) {
+		return;
+	}
+	memset(k, 0, sizeof(*k));
+	k->h_adr = it.h_adr;
+	for (uint8_t i = 0u; i < 32u; i++) {
+		const Device *dv = &PPKYConfig.CfgDevices[i].UId.devId;
+		if (dv->h_adr == it.h_adr && dv->d_type == it.mcu_d_type) {
+			k->l_adr = dv->l_adr;
+			k->uid0 = PPKYConfig.CfgDevices[i].UId.UId0;
+			k->uid1 = PPKYConfig.CfgDevices[i].UId.UId1;
+			k->uid2 = PPKYConfig.CfgDevices[i].UId.UId2;
+			return;
+		}
+	}
+}
+
+static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3FaultEvtItem *out)
+{
+	RsPanelV3FaultEvtItem fe = {};
+	fe.flags = 0u;
+
+	if (it.kind == WARN_KIND_LSWITCH_OPEN_ATTN) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_ATTN_LSWITCH;
+		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_ATTENTION | RS_PANEL_V3_FAULT_FLAG_HAS_MCU |
+				     RS_PANEL_V3_FAULT_FLAG_HAS_CHANNEL);
+		Warning_FillV3McuKey(&fe.mcu, it);
+		fe.ch_type = it.v_d_type;
+		fe.ch_l_adr = it.v_l_adr;
+	} else if (it.kind == WARN_KIND_DPT_WARNING_ATTN) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_ATTN_DPT;
+		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_ATTENTION | RS_PANEL_V3_FAULT_FLAG_HAS_MCU |
+				     RS_PANEL_V3_FAULT_FLAG_HAS_CHANNEL | RS_PANEL_V3_FAULT_FLAG_HAS_EXTRA);
+		Warning_FillV3McuKey(&fe.mcu, it);
+		fe.ch_type = it.v_d_type;
+		fe.ch_l_adr = it.v_l_adr;
+		fe.extra = it.extra;
+	} else if (it.kind == WARN_KIND_VDEV_FAULT) {
+		if (it.line_state == 2u) {
+			fe.code = (uint8_t)RS_PANEL_V3_FAULT_LINE_SHORT;
+		} else if (it.line_state == 5u) {
+			fe.code = (uint8_t)RS_PANEL_V3_FAULT_LINE_OTHER;
+		} else {
+			fe.code = (uint8_t)RS_PANEL_V3_FAULT_LINE_BREAK;
+		}
+		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_MCU | RS_PANEL_V3_FAULT_FLAG_HAS_CHANNEL);
+		Warning_FillV3McuKey(&fe.mcu, it);
+		fe.ch_type = it.v_d_type;
+		fe.ch_l_adr = it.v_l_adr;
+	} else if (it.kind == WARN_KIND_MCU_CAN_FAULT) {
+		fe.code = (it.line_state == 2u) ? (uint8_t)RS_PANEL_V3_FAULT_MCU_CAN_SHORT
+						: (uint8_t)RS_PANEL_V3_FAULT_MCU_CAN_BREAK;
+		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_MCU | RS_PANEL_V3_FAULT_FLAG_HAS_CAN);
+		Warning_FillV3McuKey(&fe.mcu, it);
+		fe.can_idx = it.can_idx;
+	} else if (it.kind == WARN_KIND_PPKU_CAN_FAULT) {
+		fe.code = (it.line_state == 2u) ? (uint8_t)RS_PANEL_V3_FAULT_PPKU_CAN_SHORT
+						: (uint8_t)RS_PANEL_V3_FAULT_PPKU_CAN_BREAK;
+		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_CAN | RS_PANEL_V3_FAULT_FLAG_HAS_MCU);
+		fe.can_idx = it.can_idx;
+		fe.mcu.h_adr = PPKYConfig.UId.devId.h_adr;
+		fe.mcu.l_adr = PPKYConfig.UId.devId.l_adr;
+		fe.mcu.uid0 = PPKYConfig.UId.UId0;
+		fe.mcu.uid1 = PPKYConfig.UId.UId1;
+		fe.mcu.uid2 = PPKYConfig.UId.UId2;
+	} else if (it.kind == WARN_KIND_MCU_POSITION_FAULT) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_MCU_POSITION;
+		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		Warning_FillV3McuKey(&fe.mcu, it);
+	} else if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_PANEL_JOURNAL;
+		fe.panel_addr = it.h_adr;
+	} else if (it.kind == WARN_KIND_DEVICE_MISSING) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_DEVICE_MISSING;
+		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		Warning_FillV3McuKey(&fe.mcu, it);
+	} else if (it.kind == WARN_KIND_DEVICE_FOUND) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_DEVICE_FOUND;
+		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_MCU | RS_PANEL_V3_FAULT_FLAG_HAS_CHANNEL);
+		Warning_FillV3McuKey(&fe.mcu, it);
+		fe.ch_type = it.v_d_type;
+		fe.ch_l_adr = it.v_l_adr;
+	} else if (it.kind == WARN_KIND_CONFIG_MISMATCH) {
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_CONFIG_MISMATCH;
+		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		Warning_FillV3McuKey(&fe.mcu, it);
+	} else {
+		return 0u;
+	}
+
+	*out = fe;
+	return 1u;
+}
+
+static uint16_t BuildV3FaultSnapshotCore(RsPanelV3FaultEvtItem *out, uint16_t max_out)
+{
+	uint16_t count = 0u;
+	uint8_t order[WARN_MAX_ITEMS];
+	uint8_t on = 0u;
+
+	if (out == nullptr || max_out == 0u) {
+		return 0u;
+	}
+
+	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
+		if (!g_items[i].used || !g_items[i].fault_now) {
+			continue;
+		}
+		order[on++] = i;
+	}
+	for (uint8_t a = 1u; a < on; a++) {
+		uint8_t key = order[a];
+		uint8_t b = a;
+		while (b > 0u && g_items[order[b - 1u]].appeared_ms < g_items[key].appeared_ms) {
+			order[b] = order[b - 1u];
+			b--;
+		}
+		order[b] = key;
+	}
+
+	if (AttentionEventsEnabled() != 0u) {
+		for (uint8_t i = 0u; i < on && count < max_out; i++) {
+			const WarningItem& it = g_items[order[i]];
+			if (!IsAttentionKind(it.kind)) {
+				continue;
+			}
+			if (Warning_AppendV3FaultFromItem(it, &out[count]) != 0u) {
+				count++;
+			}
+		}
+	}
+
+	for (uint8_t ch = 0u; ch < 2u && count < max_out; ch++) {
+		if ((g_power_fault_mask & (1u << ch)) == 0u) {
+			continue;
+		}
+		memset(&out[count], 0, sizeof(out[count]));
+		out[count].code = (uint8_t)(RS_PANEL_V3_FAULT_PPKU_POWER_OUT1 + ch);
+		/* UID ППКУ в mcu — на панели PPKYConfig.UId пустой. */
+		out[count].flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		out[count].mcu.h_adr = PPKYConfig.UId.devId.h_adr;
+		out[count].mcu.l_adr = PPKYConfig.UId.devId.l_adr;
+		out[count].mcu.uid0 = PPKYConfig.UId.UId0;
+		out[count].mcu.uid1 = PPKYConfig.UId.UId1;
+		out[count].mcu.uid2 = PPKYConfig.UId.UId2;
+		count++;
+	}
+	for (uint8_t ch = 0u; ch < 2u && count < max_out; ch++) {
+		if ((g_ppku_input_fault_mask & (1u << ch)) == 0u) {
+			continue;
+		}
+		memset(&out[count], 0, sizeof(out[count]));
+		out[count].code = (uint8_t)(RS_PANEL_V3_FAULT_PPKU_POWER_IN1 + ch);
+		out[count].flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		out[count].mcu.h_adr = PPKYConfig.UId.devId.h_adr;
+		out[count].mcu.l_adr = PPKYConfig.UId.devId.l_adr;
+		out[count].mcu.uid0 = PPKYConfig.UId.UId0;
+		out[count].mcu.uid1 = PPKYConfig.UId.UId1;
+		out[count].mcu.uid2 = PPKYConfig.UId.UId2;
+		count++;
+	}
+
+	for (uint8_t i = 0u; i < on && count < max_out; i++) {
+		const WarningItem& it = g_items[order[i]];
+		if (!IsFaultKind(it.kind)) {
+			continue;
+		}
+		if (Warning_AppendV3FaultFromItem(it, &out[count]) != 0u) {
+			count++;
+		}
+	}
+	return count;
+}
+
 } // namespace
+
+extern "C" uint16_t Warning_BuildV3FaultSnapshot(RsPanelV3FaultEvtItem *out, uint16_t max_out)
+{
+	return BuildV3FaultSnapshotCore(out, max_out);
+}
 
 /* Главный 1мс-тик модуля: сбор, фильтрация, LED и публикация предупреждений. */
 extern "C" void WarningProcess1ms(void)
@@ -1408,8 +1590,12 @@ extern "C" void WarningProcess1ms(void)
 	}
 
 	uint32_t now_ms = HAL_GetTick();
-	char big_titles[WARN_MAX_ITEMS][WARN_TITLE_LEN] = {{0}};
-	char details[WARN_MAX_ITEMS][ZONE_NAME_SIZE + 1] = {{0}};
+	/* Не на стеке: MSP до _end ~3KB, эти массивы уже ~1.4KB. */
+	static char big_titles[WARN_MAX_ITEMS][WARN_TITLE_LEN];
+	static char details[WARN_MAX_ITEMS][ZONE_NAME_SIZE + 1];
+
+	memset(big_titles, 0, sizeof(big_titles));
+	memset(details, 0, sizeof(details));
 
 	ConsumeChangedStatuses(now_ms);
 	SyncMissingFaultItems(now_ms);
@@ -1430,6 +1616,14 @@ extern "C" void WarningProcess1ms(void)
 	g_last_build_count = count;
 	g_rs_master_dbg.last_warn_build_count = count;
 	PushUiIfChanged((count > 0u) ? 1u : 0u, count, big_titles, details);
+
+	if (RsPanelV3Master_IsV3PollActive() != 0u) {
+		/* Пишем прямо в буфер master — без второго массива в BSS (~896 байт). */
+		uint16_t max_n = 0u;
+		RsPanelV3FaultEvtItem *v3_items = RsPanelV3Master_FaultItemsWritable(&max_n);
+		uint16_t v3_n = Warning_BuildV3FaultSnapshot(v3_items, max_n);
+		RsPanelV3Master_CommitFaultSnapshot(v3_n);
+	}
 }
 
 extern "C" void Warning_SetPowerFaultMask(uint8_t mask)
@@ -1440,6 +1634,11 @@ extern "C" void Warning_SetPowerFaultMask(uint8_t mask)
 extern "C" void Warning_SetPpkuInputFaultMask(uint8_t mask)
 {
 	g_raw_ppku_input_fault_mask = (uint8_t)(mask & 0x03u);
+}
+
+extern "C" uint8_t Warning_GetPpkuInputFaultMask(void)
+{
+	return g_ppku_input_fault_mask;
 }
 
 extern "C" void Warning_SetMkuPositionFaultMask(uint32_t mask)

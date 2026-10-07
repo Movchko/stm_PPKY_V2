@@ -135,6 +135,8 @@ static uint8_t EraseUpdateSlot(void)
 
 void Boot_WriteProgramWatchDog(void)
 {
+	//TODO: delete return
+		return;
 	uint32_t quad_word[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, WATCHDOG };
 
 	if (*(volatile uint32_t *)BOOT_PROGRAM_WD_ADDR == WATCHDOG) {
