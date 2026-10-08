@@ -174,6 +174,7 @@ static void PositionRx_StoreWeight(uint8_t h_adr, uint8_t weight, uint8_t can_bu
 
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
+extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 extern uint8_t isMainInit;
 extern Device BoardDevicesList[];
@@ -1239,6 +1240,13 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+	/* USART1 (RS панели, DMA IDLE): раньше return → после ORE RX мёртв,
+	 * а при залипшем ORE/EIE IRQ крутится с errorflags=8 (HAL_UART_ERROR_ORE). */
+	if (huart == &huart1) {
+		RsPanelMaster_OnUartError(huart);
+		return;
+	}
+
 	if (huart != &huart2) {
 		return;
 	}
@@ -1248,12 +1256,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 	uart_rx_reset();
 	LogTransport_OnUartError(huart);
 
-	/* Сброс FE/NE/ORE и слив RDR — иначе Receive_IT часто не встаёт снова. */
+	/* Сброс FE/NE/ORE + RX flush — иначе Receive_IT не встаёт / ORE-шторм. */
 	__HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_PEF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_OREF);
-	if (__HAL_UART_GET_FLAG(huart, UART_FLAG_RXNE) != 0u) {
-		volatile uint32_t discard = huart->Instance->RDR;
-		(void)discard;
-	}
+	__HAL_UART_SEND_REQ(huart, UART_RXDATA_FLUSH_REQUEST);
 	huart->ErrorCode = HAL_UART_ERROR_NONE;
 	huart->RxState = HAL_UART_STATE_READY;
 

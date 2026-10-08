@@ -48,6 +48,8 @@ void RsPanelMaster_Init(RsPanelMaster *master,
                         uint16_t de_pin);
 void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms);
 void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_t len);
+/** Из HAL_UART_ErrorCallback (USART1): сброс ORE и перезапуск RX DMA. */
+void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart);
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
 /* Синхронизировать текущее состояние Beeper на все готовые панели. */
 void RsPanelMaster_PushSound(void);

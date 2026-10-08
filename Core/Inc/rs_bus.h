@@ -27,6 +27,8 @@ void RsBus_Init(RsBusContext *ctx,
                 uint16_t de_pin,
                 RsBusFrameHandler handler,
                 void *handler_ctx);
+/** ORE/FE в HAL_UART_ErrorCallback — сброс + снова ReceiveToIdle_DMA. */
+void RsBus_RecoverFromError(RsBusContext *ctx);
 void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len);
 HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
                                   uint8_t addr,

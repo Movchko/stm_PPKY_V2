@@ -2099,13 +2099,8 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
                 } break;
 
                 case 6u: {
-                    /* Общая команда запуска теста индикации/экрана.
-                     * Что именно делает тест, определяет сама панель. */
-                    static const uint8_t k_no_payload = 0u;
-                    rs_panel_master_send_ui_data_to_ready_panels(master,
-                                                                 RS_PANEL_UI_DATA_MENU_SELF_TEST,
-                                                                 &k_no_payload,
-                                                                 1u);
+                    /* ТЕСТ: выбор подтестов — локально на панели (TestSelectScreen).
+                     * SELF_TEST с хоста больше не шлём при входе в пункт меню. */
                 } break;
 
                 default:
@@ -3728,18 +3723,65 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
                           payload_len);
 }
 
-static uint16_t rs_panel_v3_put_journal_list_payload(uint8_t *dst, uint16_t cap)
+/* Сколько записей журнала в одном event_reply (лимит 200 байт → текст режется). */
+#define RS_V3_JOURNAL_BATCH 3u
+/* Мин. размер одной записи: rec+ts+code + 3×(len=0). */
+#define RS_V3_JOURNAL_ITEM_MIN 13u
+
+static uint16_t rs_panel_v3_put_one_journal_item(uint8_t *dst,
+                                                uint16_t pos,
+                                                uint16_t item_cap,
+                                                uint32_t rec_idx)
 {
-    EventLogTierInfo_t info;
     EventLogRecord_t rec;
     EventLogRecStatus_t st = EVENT_LOG_REC_EMPTY;
     EventLogRecord_t *rec_ptr = 0;
     EventLogUiLines_t lines;
+    uint16_t code;
+    uint32_t ts = 0u;
+
+    if (dst == 0 || (uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN) > item_cap) {
+        return pos;
+    }
+    if (EventLogReader_ReadLogical(0u, rec_idx, &st, &rec) && st == EVENT_LOG_REC_VALID) {
+        rec_ptr = &rec;
+    } else {
+        rec.event_code = 0u;
+    }
+    rs_panel_master_format_journal_lines(rec_ptr, rec_idx, &lines);
+    code = rec.event_code;
+
+    dst[pos++] = (uint8_t)(rec_idx & 0xFFu);
+    dst[pos++] = (uint8_t)((rec_idx >> 8) & 0xFFu);
+    dst[pos++] = (uint8_t)((rec_idx >> 16) & 0xFFu);
+    dst[pos++] = (uint8_t)((rec_idx >> 24) & 0xFFu);
+    dst[pos++] = (uint8_t)(ts & 0xFFu);
+    dst[pos++] = (uint8_t)((ts >> 8) & 0xFFu);
+    dst[pos++] = (uint8_t)((ts >> 16) & 0xFFu);
+    dst[pos++] = (uint8_t)((ts >> 24) & 0xFFu);
+    dst[pos++] = (uint8_t)(code & 0xFFu);
+    dst[pos++] = (uint8_t)((code >> 8) & 0xFFu);
+    /* Строки укладываются в item_cap: put_counted_str сам усечёт. */
+    pos = rs_journal_put_counted_str(dst, pos, item_cap, lines.header, RS_JOURNAL_HDR_MAX);
+    pos = rs_journal_put_counted_str(dst, pos, item_cap, lines.title, RS_JOURNAL_TITLE_MAX);
+    pos = rs_journal_put_counted_str(dst, pos, item_cap, lines.detail, RS_JOURNAL_DETAIL_MAX);
+    return pos;
+}
+
+/**
+ * Упаковать окно журнала: window_first..+n_want (усечётся по cap / total).
+ * selected в заголовке — g_journal_selected.
+ */
+static uint16_t rs_panel_v3_put_journal_list_payload(uint8_t *dst, uint16_t cap,
+                                                    uint32_t window_first,
+                                                    uint8_t n_want)
+{
+    EventLogTierInfo_t info;
     uint16_t pos = 0u;
     uint32_t total;
-    uint32_t rec_idx;
-    uint16_t code;
-    uint32_t ts;
+    uint8_t n_items = 0u;
+    uint8_t i;
+    uint8_t n_pos;
 
     if (dst == 0 || cap < 14u) {
         return 0u;
@@ -3749,24 +3791,34 @@ static uint16_t rs_panel_v3_put_journal_list_payload(uint8_t *dst, uint16_t cap)
     }
     total = info.count;
     g_journal_total = total;
-    if (total == 0u) {
-        rec.event_code = 0u;
-    } else {
-        if (g_journal_selected >= total) {
-            g_journal_selected = total - 1u;
-        }
-        rec_idx = g_journal_selected;
-        if (!EventLogReader_ReadLogical(0u, rec_idx, &st, &rec) || st != EVENT_LOG_REC_VALID) {
-            rec.event_code = 0u;
-        } else {
-            rec_ptr = &rec;
-        }
-        rs_panel_master_format_journal_lines(rec_ptr, rec_idx, &lines);
+    if (total > 0u && g_journal_selected >= total) {
+        g_journal_selected = total - 1u;
     }
 
-    if ((uint16_t)(pos + 13u) > cap) {
-        return 0u;
+    if (total == 0u) {
+        window_first = 0u;
+        n_items = 0u;
+    } else {
+        if (window_first >= total) {
+            window_first = total - 1u;
+        }
+        if (n_want == 0u) {
+            n_want = 1u;
+        }
+        if (n_want > RS_V3_JOURNAL_BATCH) {
+            n_want = RS_V3_JOURNAL_BATCH;
+        }
+        {
+            uint32_t avail = total - window_first;
+            n_items = n_want;
+            if ((uint32_t)n_items > avail) {
+                n_items = (uint8_t)avail;
+            }
+        }
+        g_journal_window_first = window_first;
+        g_journal_window_size = n_items;
     }
+
     dst[pos++] = (uint8_t)(total & 0xFFu);
     dst[pos++] = (uint8_t)((total >> 8) & 0xFFu);
     dst[pos++] = (uint8_t)((total >> 16) & 0xFFu);
@@ -3775,31 +3827,30 @@ static uint16_t rs_panel_v3_put_journal_list_payload(uint8_t *dst, uint16_t cap)
     dst[pos++] = (uint8_t)((g_journal_selected >> 8) & 0xFFu);
     dst[pos++] = (uint8_t)((g_journal_selected >> 16) & 0xFFu);
     dst[pos++] = (uint8_t)((g_journal_selected >> 24) & 0xFFu);
-    dst[pos++] = 0u;
-    dst[pos++] = 0u;
-    dst[pos++] = 0u;
-    dst[pos++] = 0u;
-    dst[pos++] = (total > 0u) ? 1u : 0u;
+    dst[pos++] = (uint8_t)(window_first & 0xFFu);
+    dst[pos++] = (uint8_t)((window_first >> 8) & 0xFFu);
+    dst[pos++] = (uint8_t)((window_first >> 16) & 0xFFu);
+    dst[pos++] = (uint8_t)((window_first >> 24) & 0xFFu);
+    n_pos = (uint8_t)pos;
+    dst[pos++] = n_items;
 
-    if (total > 0u) {
-        code = rec.event_code;
-        ts = 0u;
-        if ((uint16_t)(pos + 10u) > cap) {
-            return 0u;
+    for (i = 0u; i < n_items; i++) {
+        uint32_t rec_idx = window_first + (uint32_t)i;
+        uint8_t left = (uint8_t)(n_items - 1u - i);
+        uint16_t reserve = (uint16_t)((uint16_t)left * RS_V3_JOURNAL_ITEM_MIN);
+        uint16_t item_cap;
+
+        if ((uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN) > cap) {
+            n_items = i;
+            dst[n_pos] = n_items;
+            break;
         }
-        dst[pos++] = (uint8_t)(rec_idx & 0xFFu);
-        dst[pos++] = (uint8_t)((rec_idx >> 8) & 0xFFu);
-        dst[pos++] = (uint8_t)((rec_idx >> 16) & 0xFFu);
-        dst[pos++] = (uint8_t)((rec_idx >> 24) & 0xFFu);
-        dst[pos++] = (uint8_t)(ts & 0xFFu);
-        dst[pos++] = (uint8_t)((ts >> 8) & 0xFFu);
-        dst[pos++] = (uint8_t)((ts >> 16) & 0xFFu);
-        dst[pos++] = (uint8_t)((ts >> 24) & 0xFFu);
-        dst[pos++] = (uint8_t)(code & 0xFFu);
-        dst[pos++] = (uint8_t)((code >> 8) & 0xFFu);
-        pos = rs_journal_put_counted_str(dst, pos, cap, lines.header, RS_JOURNAL_HDR_MAX);
-        pos = rs_journal_put_counted_str(dst, pos, cap, lines.title, RS_JOURNAL_TITLE_MAX);
-        pos = rs_journal_put_counted_str(dst, pos, cap, lines.detail, RS_JOURNAL_DETAIL_MAX);
+        if ((uint16_t)(cap - reserve) < (uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN)) {
+            item_cap = (uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN);
+        } else {
+            item_cap = (uint16_t)(cap - reserve);
+        }
+        pos = rs_panel_v3_put_one_journal_item(dst, pos, item_cap, rec_idx);
     }
     return pos;
 }
@@ -3831,32 +3882,57 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
         reply->payload_len = 4u;
         return 1u;
     }
-    case RS_PANEL_V3_EVT_JOURNAL_GET:
-    case RS_PANEL_V3_EVT_JOURNAL_GET_N: {
+    case RS_PANEL_V3_EVT_JOURNAL_GET: {
+        /* Одна запись. u8_a: 0/1 nav, 2=новейшая, 3=refresh; иначе u16_a=index. */
         EventLogTierInfo_t jinfo;
         if (EventLogReader_GetTierInfo(0u, &jinfo) != false) {
             g_journal_total = jinfo.count;
         }
         if (g_journal_total > 0u) {
             if (ev->u8_a == 0u && (g_journal_selected + 1u) < g_journal_total) {
-                /* UP / next: новее */
                 g_journal_selected++;
             } else if (ev->u8_a == 1u && g_journal_selected > 0u) {
-                /* DOWN / prev: старее */
                 g_journal_selected--;
             } else if (ev->u8_a == 2u) {
-                /* ENTER / вход в журнал: новейшая */
                 g_journal_selected = g_journal_total - 1u;
             } else if (ev->u8_a == 3u) {
-                /* Обновить текущую без сдвига */
-            } else if (ev->u16_a < g_journal_total) {
-                g_journal_selected = ev->u16_a;
+                /* refresh текущей */
+            } else if ((uint32_t)ev->u16_a < g_journal_total) {
+                g_journal_selected = (uint32_t)ev->u16_a;
             }
         } else {
             g_journal_selected = 0u;
         }
-        reply->payload_len = rs_panel_v3_put_journal_list_payload(reply->payload,
-                                                                  RS_PANEL_V3_EVENT_REPLY_MAX);
+        reply->payload_len = rs_panel_v3_put_journal_list_payload(
+            reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, g_journal_selected, 1u);
+        return (reply->payload_len > 0u) ? 1u : 0u;
+    }
+    case RS_PANEL_V3_EVT_JOURNAL_GET_N: {
+        /* Протокол: u16_a = index (начало окна), u16_b = n. */
+        EventLogTierInfo_t jinfo;
+        uint32_t idx;
+        uint8_t n;
+
+        if (EventLogReader_GetTierInfo(0u, &jinfo) != false) {
+            g_journal_total = jinfo.count;
+        }
+        if (g_journal_total == 0u) {
+            g_journal_selected = 0u;
+            reply->payload_len = rs_panel_v3_put_journal_list_payload(
+                reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, 0u, 0u);
+            return (reply->payload_len > 0u) ? 1u : 0u;
+        }
+        idx = (uint32_t)ev->u16_a;
+        if (idx >= g_journal_total) {
+            idx = g_journal_total - 1u;
+        }
+        n = (uint8_t)ev->u16_b;
+        if (n == 0u) {
+            n = 1u;
+        }
+        /* selected на мастере не трогаем — GET_N только догрузка окна. */
+        reply->payload_len = rs_panel_v3_put_journal_list_payload(
+            reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, idx, n);
         return (reply->payload_len > 0u) ? 1u : 0u;
     }
     case RS_PANEL_V3_EVT_DEVICES_COUNT: {
@@ -3975,6 +4051,9 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
+    static uint8_t s_rx_shadow[RS_BUS_RX_DMA_SIZE];
+    uint16_t n;
+
     if (g_active_master == 0 || huart == 0 || size == 0u) {
         return;
     }
@@ -3982,12 +4061,30 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
         return;
     }
 
-    RsPanelMasterDebug_OnRxDma(size);
-    RsPanelMaster_OnRxBytes(g_active_master, g_active_master->bus.rx_dma_buf, size);
+    /* Сначала копия + сразу re-arm DMA: разбор кадра в IRQ дольше байта @2 Мбод → ORE. */
+    n = size;
+    if (n > (uint16_t)sizeof(s_rx_shadow)) {
+        n = (uint16_t)sizeof(s_rx_shadow);
+    }
+    memcpy(s_rx_shadow, g_active_master->bus.rx_dma_buf, n);
     (void)HAL_UARTEx_ReceiveToIdle_DMA(huart,
                                        g_active_master->bus.rx_dma_buf,
                                        sizeof(g_active_master->bus.rx_dma_buf));
     if (huart->hdmarx != 0) {
         __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
     }
+
+    RsPanelMasterDebug_OnRxDma(n);
+    RsPanelMaster_OnRxBytes(g_active_master, s_rx_shadow, n);
+}
+
+void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart)
+{
+    if (g_active_master == 0 || huart == 0) {
+        return;
+    }
+    if (huart != g_active_master->bus.uart) {
+        return;
+    }
+    RsBus_RecoverFromError(&g_active_master->bus);
 }

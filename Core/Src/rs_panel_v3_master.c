@@ -48,6 +48,11 @@ static RsPanelV3PanelCtx s_ctx[RS_PANEL_MAX_PANELS];
 static RsPanelV3EventReply s_pending_reply;
 static uint8_t s_pending_reply_panel;
 static uint8_t s_has_pending_reply;
+/* После отдачи POLL pending очищается; при дубле seq не читать SPI снова. */
+static RsPanelV3EventReply s_cached_data_reply;
+static uint8_t s_cached_data_reply_seq;
+static uint8_t s_cached_data_reply_panel;
+static uint8_t s_has_cached_data_reply;
 
 static RsPanelV3FaultEvtItem s_fault_items[RS_PANEL_V3_MAX_FAULTS];
 static uint16_t s_fault_item_count;
@@ -612,42 +617,53 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
     }
     if (ctx->last_event_seq == ev->seq) {
         /*
-         * Панель ещё шлёт тот же seq (ACK/reply не дошли). ACK-only без reply
-         * очищает PostEvent на панели → журнал остаётся пустым. Пересобрать
-         * данные без повторного nav (u8_a=3 для JOURNAL_GET*).
+         * Панель ещё шлёт тот же seq (ACK/reply не дошли).
+         * Не вызывать Dispatch снова (JOURNAL_GET_N = до 3× SPI) — отдать кэш.
          */
         ctx->pending_ack_seq = ev->seq;
         ctx->pending_ack_result = (uint8_t)RS_PANEL_V3_ACK_OK;
         ctx->has_pending_ack = 1u;
-        if (s_has_pending_reply == 0u || s_pending_reply_panel != panel_idx) {
-            switch (ev->type) {
-            case RS_PANEL_V3_EVT_JOURNAL_COUNT:
-            case RS_PANEL_V3_EVT_JOURNAL_GET:
-            case RS_PANEL_V3_EVT_JOURNAL_GET_N:
-            case RS_PANEL_V3_EVT_ZONE_BLOCK_LIST:
-            case RS_PANEL_V3_EVT_ZONE_BLOCK_SET:
-            case RS_PANEL_V3_EVT_DEVICES_COUNT:
-            case RS_PANEL_V3_EVT_DEVICES_GET:
-            case RS_PANEL_V3_EVT_DEVICES_GET_N:
-            case RS_PANEL_V3_EVT_EXT_CAN_SET: {
-                RsPanelV3Event refresh = *ev;
-                if (ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET ||
-                    ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET_N) {
-                    refresh.u8_a = 3u;
-                }
-                if (RsPanelV3Proto_DispatchDataEvent(panel_idx, &refresh,
-                                                     &s_pending_reply) != 0u) {
-                    s_pending_reply.seq = ev->seq;
-                    s_pending_reply.type = ev->type;
-                    s_pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
-                    s_pending_reply_panel = panel_idx;
-                    s_has_pending_reply = 1u;
-                }
-                break;
+        if (s_has_pending_reply != 0u && s_pending_reply_panel == panel_idx) {
+            return;
+        }
+        if (s_has_cached_data_reply != 0u &&
+            s_cached_data_reply_panel == panel_idx &&
+            s_cached_data_reply_seq == ev->seq) {
+            s_pending_reply = s_cached_data_reply;
+            s_pending_reply_panel = panel_idx;
+            s_has_pending_reply = 1u;
+            return;
+        }
+        switch (ev->type) {
+        case RS_PANEL_V3_EVT_JOURNAL_COUNT:
+        case RS_PANEL_V3_EVT_JOURNAL_GET:
+        case RS_PANEL_V3_EVT_JOURNAL_GET_N:
+        case RS_PANEL_V3_EVT_ZONE_BLOCK_LIST:
+        case RS_PANEL_V3_EVT_ZONE_BLOCK_SET:
+        case RS_PANEL_V3_EVT_DEVICES_COUNT:
+        case RS_PANEL_V3_EVT_DEVICES_GET:
+        case RS_PANEL_V3_EVT_DEVICES_GET_N:
+        case RS_PANEL_V3_EVT_EXT_CAN_SET: {
+            RsPanelV3Event refresh = *ev;
+            if (ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET) {
+                refresh.u8_a = 3u;
             }
-            default:
-                break;
+            if (RsPanelV3Proto_DispatchDataEvent(panel_idx, &refresh,
+                                                 &s_pending_reply) != 0u) {
+                s_pending_reply.seq = ev->seq;
+                s_pending_reply.type = ev->type;
+                s_pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
+                s_pending_reply_panel = panel_idx;
+                s_has_pending_reply = 1u;
+                s_cached_data_reply = s_pending_reply;
+                s_cached_data_reply_seq = ev->seq;
+                s_cached_data_reply_panel = panel_idx;
+                s_has_cached_data_reply = 1u;
             }
+            break;
+        }
+        default:
+            break;
         }
         return;
     }
@@ -695,6 +711,10 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
             s_pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
             s_pending_reply_panel = panel_idx;
             s_has_pending_reply = 1u;
+            s_cached_data_reply = s_pending_reply;
+            s_cached_data_reply_seq = ev->seq;
+            s_cached_data_reply_panel = panel_idx;
+            s_has_cached_data_reply = 1u;
             result = (uint8_t)RS_PANEL_V3_ACK_OK;
         } else {
             result = (uint8_t)RS_PANEL_V3_ACK_IGNORED;

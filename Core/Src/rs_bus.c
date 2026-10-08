@@ -67,6 +67,24 @@ static void rs_bus_rx_arm(RsBusContext *ctx)
     }
 }
 
+/** После ORE/FE: сброс флагов + слив RDR/FIFO, иначе IRQ крутится с ErrorCode=ORE. */
+void RsBus_RecoverFromError(RsBusContext *ctx)
+{
+    UART_HandleTypeDef *uart;
+
+    if (ctx == 0 || ctx->uart == 0) {
+        return;
+    }
+    uart = ctx->uart;
+    __HAL_UART_CLEAR_FLAG(uart, UART_CLEAR_PEF | UART_CLEAR_FEF |
+                                UART_CLEAR_NEF | UART_CLEAR_OREF);
+    __HAL_UART_SEND_REQ(uart, UART_RXDATA_FLUSH_REQUEST);
+    uart->ErrorCode = HAL_UART_ERROR_NONE;
+    uart->RxState = HAL_UART_STATE_READY;
+    uart->ReceptionType = HAL_UART_RECEPTION_STANDARD;
+    rs_bus_rx_arm(ctx);
+}
+
 uint16_t RsBus_Checksum16(const uint8_t *data, uint16_t len)
 {
     uint32_t sum = 0u;
