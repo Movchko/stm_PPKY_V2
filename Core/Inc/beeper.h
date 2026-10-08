@@ -120,7 +120,8 @@ void Beeper_PlayConfigSuccess(void);
 void Beeper_SoundOnOff(bool soundOn);
 /**
  * @brief GOST: возобновить звук при новом извещении, если был вручную выключен.
- * Вне GOST_MODE - no-op.
+ * Пишет PPKYConfig.beep, пушит панели (SYS v3 / CMD_SOUND+MENU legacy).
+ * Вне GOST_MODE — no-op. При beep_block — no-op.
  */
 void Beeper_ResumeSoundOnNewEvent(void);
 /**

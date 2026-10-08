@@ -2610,8 +2610,15 @@ static uint8_t rs_panel_should_forward_to_host(const RsBusFrameView *frame)
     if (frame == 0) {
         return 0u;
     }
+    /* Инвентаризация панелей на WiFi/ПО: addr в заголовке RS, тип в payload. */
     if (frame->cmd == RS_PANEL_RSP_ACTIVITY) {
-        return 1u;
+        return 1u; /* payload[0]=DEVICE_PANEL_TYPE(30) / BOOTLOADER(31) */
+    }
+    if (frame->cmd == RS_PANEL_RSP_CAPS) {
+        return 1u; /* ui_profile = PANEL_TYPE_1/2/3 */
+    }
+    if (frame->cmd == RS_PANEL_RSP_DISCOVER) {
+        return 1u; /* uid + current_addr */
     }
     if (frame->cmd == RS_PANEL_RSP_ACK) {
         return 1u;
@@ -2630,6 +2637,8 @@ static void rs_panel_forward_frame_to_esp(const RsBusFrameView *frame)
     uint8_t raw[ESP_UART_BODY_MAX];
     uint16_t len;
 
+    /* ESP под питанием (сессия WiFi/сниффер). Не ждём TCP — иначе панель
+     * не видна на этапе поднятия линка. */
     if (frame == 0 || Esp32_IsEnabled() == 0u) {
         return;
     }
@@ -3177,6 +3186,18 @@ void RsPanelMaster_PushSound(void)
 {
     /* Не TX сразу из fire/warning — отложим в Process10ms (half-duplex RS). */
     s_sound_push_pending = 1u;
+}
+
+void RsPanelMaster_PushMenuSoundState(void)
+{
+    if (g_active_master == 0) {
+        return;
+    }
+    /* v3: beep/beep_block идут в SYS flags POLL; legacy — UI_DATA MENU_TOGGLE. */
+    if (RsPanelV3Master_IsV3PollActive() != 0u) {
+        return;
+    }
+    rs_panel_master_send_menu_state_to_ready_panels(g_active_master);
 }
 
 void RsPanelMaster_InvalidateSoundDedup(void)

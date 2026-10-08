@@ -8,6 +8,11 @@
 #include "beeper.h"
 #include "main.h"
 #include "rs_panel_proto.h"
+#include "device_config.h"
+#include "event_log.h"
+#include "gost_mode.h"
+
+extern PPKYCfg PPKYConfig;
 
 /***********************************************************************************************************/
 /* Внутренние типы и переменные */
@@ -494,7 +499,8 @@ void Beeper_Process(void)
 }
 
 void Beeper_SoundOnOff(bool soundOn) {
-	beep_sound = soundOn;
+	beep_sound = soundOn ? 1u : 0u;
+	PPKYConfig.beep = beep_sound;
 	if (g_sound_state_ui_cb != 0) {
 		g_sound_state_ui_cb(soundOn);
 	}
@@ -537,7 +543,25 @@ void Beeper_PlayIndicationTest(void)
 
 void Beeper_ResumeSoundOnNewEvent(void)
 {
-	/* В V2-реализации флагов ресьюма может не быть — оставляем no-op. */
+#if GOST_MODE
+	if (beep_sound != 0u) {
+		return;
+	}
+	if (PPKYConfig.beep_block != 0u) {
+		return;
+	}
+	beep_sound = 1u;
+	PPKYConfig.beep = 1u;
+	if (g_sound_state_ui_cb != 0) {
+		g_sound_state_ui_cb(true);
+	}
+	EventLog_LogSoundToggle(1u, 1u); /* source: auto (новое событие) */
+	/* Панели: v3 — SYS_SOUND_ON в следующем POLL; legacy — CMD_SOUND + MENU_TOGGLE. */
+	RsPanelMaster_PushSound();
+	RsPanelMaster_PushMenuSoundState();
+#else
+	(void)0;
+#endif
 }
 
 void Beeper_SetSoundStateUiCallback(Beeper_SoundStateUiCallback cb)

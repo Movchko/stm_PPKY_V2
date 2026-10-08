@@ -7,6 +7,8 @@
 #include "device_config.h"
 #include "backend.h"
 #include "warning.h"
+#include "event_log.h"
+#include "rs_panel_proto.h"
 #include "main.h"
 #include <string.h>
 
@@ -463,6 +465,12 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
     if (Warning_GetPpkuInputFaultMask() != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_POWER_INPUT_FAULT;
     }
+    if (PPKYConfig.beep != 0u) {
+        out->sys.flags |= RS_PANEL_V3_SYS_SOUND_ON;
+    }
+    if (PPKYConfig.beep_block != 0u) {
+        out->sys.flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
+    }
 
     /*
      * Журнал/данные: ACK без event_reply освобождает PostEvent на панели —
@@ -536,6 +544,12 @@ static uint16_t rs_v3_encode_sys_only(uint8_t *dst, uint16_t dst_size)
     }
     if (Warning_GetPpkuInputFaultMask() != 0u) {
         flags |= RS_PANEL_V3_SYS_POWER_INPUT_FAULT;
+    }
+    if (PPKYConfig.beep != 0u) {
+        flags |= RS_PANEL_V3_SYS_SOUND_ON;
+    }
+    if (PPKYConfig.beep_block != 0u) {
+        flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
     }
     dst[0] = RS_PANEL_V3_VERSION;
     dst[1] = (uint8_t)RS_PANEL_V3_TAG_SYS;
@@ -685,8 +699,15 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
         if (PPKYConfig.beep_block != 0u) {
             result = (uint8_t)RS_PANEL_V3_ACK_DENIED;
         } else {
-            PPKYConfig.beep = (ev->u8_a != 0u) ? 1u : 0u;
-            Beeper_SoundOnOff(ev->u8_a != 0u);
+            const uint8_t on = (ev->u8_a != 0u) ? 1u : 0u;
+            if (PPKYConfig.beep != on) {
+                PPKYConfig.beep = on;
+                Beeper_SoundOnOff(on != 0u);
+                EventLog_LogSoundToggle(on, 0u); /* source: panel */
+                /* Legacy CMD_SOUND + MENU_TOGGLE; в v3 панели берут SYS flags. */
+                RsPanelMaster_PushSound();
+                RsPanelMaster_PushMenuSoundState();
+            }
         }
         break;
     case RS_PANEL_V3_EVT_WIFI_SET:

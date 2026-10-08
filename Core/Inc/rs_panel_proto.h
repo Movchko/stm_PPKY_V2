@@ -53,6 +53,8 @@ void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart);
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
 /* Синхронизировать текущее состояние Beeper на все готовые панели. */
 void RsPanelMaster_PushSound(void);
+/* MENU_TOGGLE: beep + beep_block на готовые панели (legacy UI_DATA). */
+void RsPanelMaster_PushMenuSoundState(void);
 /* Сбросить dedup SOUND — следующий PushSound уйдёт даже при том же профиле (стоп hold). */
 void RsPanelMaster_InvalidateSoundDedup(void);
 /* Синхронизировать LED (в т.ч. NORM/ERR) на готовые панели. */
