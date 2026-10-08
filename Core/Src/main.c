@@ -63,6 +63,7 @@ SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -90,6 +91,7 @@ static void MX_TIM1_Init(void);
 static void MX_FLASH_Init(void);
 static void MX_ICACHE_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t isMainInit = 0;
@@ -111,6 +113,8 @@ const char *GetAppVersion(void)
 
 uint32_t is1ms = 0;
 uint8_t is10ms = 0;
+/* TIM3 @ 2 кГц: флаг опроса RS485 (панель). Не копим очередь — один pending. */
+volatile uint8_t isRsBusPoll = 0;
 
 
 
@@ -120,6 +124,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 		is1ms++;
 	if(htim->Instance == TIM2)
 		is10ms++;
+	if(htim->Instance == TIM3)
+		isRsBusPoll = 1u;
 }
 
 /* USER CODE END 0 */
@@ -168,6 +174,7 @@ int main(void)
   MX_FLASH_Init();
   MX_ICACHE_Init();
   MX_TIM2_Init();
+  MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_DTS_Init();
   /* USER CODE BEGIN 2 */
@@ -204,6 +211,7 @@ int main(void)
 
 	  HAL_TIM_Base_Start_IT(&htim1);
 	  HAL_TIM_Base_Start_IT(&htim2);
+	  HAL_TIM_Base_Start_IT(&htim3);
   } else {
 
   }
@@ -234,6 +242,11 @@ int main(void)
 	 if(is10ms) {
 		 is10ms--;
 		 AppTimer10ms();
+	 }
+
+	 if(isRsBusPoll) {
+		 isRsBusPoll = 0u;
+		 AppTimerRsBus();
 	 }
 
 	 CanProcess();
@@ -937,6 +950,38 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 2 */
 
+}
+
+/**
+  * @brief TIM3 Initialization Function — 2 кГц (опрос RS панели)
+  * APB1 timer clk 250 МГц: 250e6 / (50 * 2500) = 2000 Гц
+  */
+static void MX_TIM3_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 50 - 1;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 2500 - 1;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**

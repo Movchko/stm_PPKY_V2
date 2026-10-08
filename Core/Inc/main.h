@@ -59,6 +59,8 @@ void TGFX_SignalVSync(void);
 
 void AppTimer1ms();
 void AppTimer10ms();
+/** TIM3 @ 2 кГц: опрос RS-шины панели (RsPanelMaster). */
+void AppTimerRsBus();
 
 void AppInit();
 void AppProcess();

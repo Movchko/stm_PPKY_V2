@@ -420,6 +420,7 @@ static uint8_t rs_v3_emit_stream_op(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx)
 void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t now_ms)
 {
     RsPanelV3PanelCtx *ctx;
+    uint8_t need_reply;
     if (out == 0) {
         return;
     }
@@ -428,12 +429,7 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
         return;
     }
     ctx = &s_ctx[panel_idx];
-
-    if (ctx->has_pending_ack != 0u) {
-        out->ack.seq = ctx->pending_ack_seq;
-        out->ack.result = ctx->pending_ack_result;
-        ctx->has_pending_ack = 0u;
-    }
+    need_reply = (s_has_pending_reply != 0u && s_pending_reply_panel == panel_idx) ? 1u : 0u;
 
     if (RsPanelV3Master_IsSysReady() != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_READY;
@@ -463,10 +459,38 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
         out->sys.flags |= RS_PANEL_V3_SYS_POWER_INPUT_FAULT;
     }
 
+    /*
+     * Журнал/данные: ACK без event_reply освобождает PostEvent на панели —
+     * следующее нажатие снова двигает selected, а reply ещё в очереди → UI
+     * прыгает на 2. Пока reply pending — не шлём стрим/config и отдаём ACK+reply вместе.
+     */
+    if (need_reply != 0u) {
+        out->has_config = 0u;
+        memset(&out->config, 0, sizeof(out->config));
+        if (ctx->has_pending_ack != 0u) {
+            out->ack.seq = ctx->pending_ack_seq;
+            out->ack.result = ctx->pending_ack_result;
+            ctx->has_pending_ack = 0u;
+        }
+        out->has_event_reply = 1u;
+        out->event_reply = s_pending_reply;
+        s_has_pending_reply = 0u;
+        s_pending_reply_panel = 0xFFu;
+        memset(&s_pending_reply, 0, sizeof(s_pending_reply));
+        (void)s_fault_snapshot_dirty;
+        (void)now_ms;
+        return;
+    }
+
+    if (ctx->has_pending_ack != 0u) {
+        out->ack.seq = ctx->pending_ack_seq;
+        out->ack.result = ctx->pending_ack_result;
+        ctx->has_pending_ack = 0u;
+    }
+
     (void)rs_v3_emit_stream_op(out, ctx);
 
-    /* Пока в кадре TLV стрима — не добавлять time/zones/reply (лимит 251).
-     * Иначе Encode падает, стрим откатывается и каталог ползёт минутами. */
+    /* Пока в кадре TLV стрима — не добавлять time/zones (лимит 251). */
     {
         const uint8_t stream_tlv =
             (out->has_zone_names != 0u || out->has_devices != 0u ||
@@ -483,14 +507,6 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
 
             Fire_FillV3Zones(&out->zones, now_ms);
             out->has_zones = (out->zones.count > 0u) ? 1u : 0u;
-
-            if (s_has_pending_reply != 0u && s_pending_reply_panel == panel_idx) {
-                out->has_event_reply = 1u;
-                out->event_reply = s_pending_reply;
-                s_has_pending_reply = 0u;
-                s_pending_reply_panel = 0xFFu;
-                memset(&s_pending_reply, 0, sizeof(s_pending_reply));
-            }
         }
     }
 
@@ -546,17 +562,20 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         return len;
     }
 
+    /* Reply не влез — не отдавать кадр без него (иначе следующий дубликат
+     * события раньше слал только ACK → журнал пустой). Откат + SYS, retry. */
+    if (poll.has_event_reply != 0u) {
+        *ctx = saved_ctx;
+        s_last_time_ms = saved_time_ms;
+        s_has_pending_reply = 1u;
+        s_pending_reply = poll.event_reply;
+        s_pending_reply_panel = panel_idx;
+        return rs_v3_encode_sys_only(dst, dst_size);
+    }
+
     /* Стрим уже сдвинут в BuildPoll — сначала срезать опциональные TLV и
      * повторить Encode, не откатывая фазу каталога. */
-    if (poll.has_zones != 0u || poll.has_time != 0u ||
-        poll.has_event_reply != 0u || poll.has_config != 0u) {
-        if (poll.has_event_reply != 0u) {
-            s_has_pending_reply = 1u;
-            s_pending_reply = poll.event_reply;
-            s_pending_reply_panel = panel_idx;
-            poll.has_event_reply = 0u;
-            memset(&poll.event_reply, 0, sizeof(poll.event_reply));
-        }
+    if (poll.has_zones != 0u || poll.has_time != 0u || poll.has_config != 0u) {
         if (poll.has_time != 0u) {
             s_last_time_ms = saved_time_ms;
             poll.has_time = 0u;
@@ -576,11 +595,6 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
     /* Совсем не влезло (даже стрим) — откатить фазу и отдать SYS. */
     *ctx = saved_ctx;
     s_last_time_ms = saved_time_ms;
-    if (poll.has_event_reply != 0u) {
-        s_has_pending_reply = 1u;
-        s_pending_reply = poll.event_reply;
-        s_pending_reply_panel = panel_idx;
-    }
     return rs_v3_encode_sys_only(dst, dst_size);
 }
 
@@ -597,9 +611,44 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
         return;
     }
     if (ctx->last_event_seq == ev->seq) {
+        /*
+         * Панель ещё шлёт тот же seq (ACK/reply не дошли). ACK-only без reply
+         * очищает PostEvent на панели → журнал остаётся пустым. Пересобрать
+         * данные без повторного nav (u8_a=3 для JOURNAL_GET*).
+         */
         ctx->pending_ack_seq = ev->seq;
         ctx->pending_ack_result = (uint8_t)RS_PANEL_V3_ACK_OK;
         ctx->has_pending_ack = 1u;
+        if (s_has_pending_reply == 0u || s_pending_reply_panel != panel_idx) {
+            switch (ev->type) {
+            case RS_PANEL_V3_EVT_JOURNAL_COUNT:
+            case RS_PANEL_V3_EVT_JOURNAL_GET:
+            case RS_PANEL_V3_EVT_JOURNAL_GET_N:
+            case RS_PANEL_V3_EVT_ZONE_BLOCK_LIST:
+            case RS_PANEL_V3_EVT_ZONE_BLOCK_SET:
+            case RS_PANEL_V3_EVT_DEVICES_COUNT:
+            case RS_PANEL_V3_EVT_DEVICES_GET:
+            case RS_PANEL_V3_EVT_DEVICES_GET_N:
+            case RS_PANEL_V3_EVT_EXT_CAN_SET: {
+                RsPanelV3Event refresh = *ev;
+                if (ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET ||
+                    ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET_N) {
+                    refresh.u8_a = 3u;
+                }
+                if (RsPanelV3Proto_DispatchDataEvent(panel_idx, &refresh,
+                                                     &s_pending_reply) != 0u) {
+                    s_pending_reply.seq = ev->seq;
+                    s_pending_reply.type = ev->type;
+                    s_pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
+                    s_pending_reply_panel = panel_idx;
+                    s_has_pending_reply = 1u;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
         return;
     }
 

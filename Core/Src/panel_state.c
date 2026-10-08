@@ -27,7 +27,9 @@ void PanelState_Reset(PanelState *state)
         return;
     }
     memset(state, 0, sizeof(*state));
-    state->cfg.poll_ms = 10u;
+    /* 1 мс: быстрее прежних 10 мс, но с запасом на half-duplex RSP.
+     * 0 / каждый тик TIM3@2кГц — ломает связь (POLL раньше ответа панели). */
+    state->cfg.poll_ms = 1u;
     /* ACTIVITY панели — 1 Гц. 500 мс давали CAPS-флап при задержке POLL
      * (WARN/LED/SOUND) → PushSound рестартил дежурный звук ~раз в секунду. */
     state->watchdog_ms = 3000u;
@@ -42,7 +44,7 @@ void PanelState_BindConfig(PanelState *state, const PanelConfig *cfg)
     state->cfg = *cfg;
     state->link_state = cfg->enabled ? PANEL_LINK_CAPS_PENDING : PANEL_LINK_OFFLINE;
     if (state->cfg.poll_ms == 0u) {
-        state->cfg.poll_ms = 10u;
+        state->cfg.poll_ms = 1u;
     }
     if (state->watchdog_ms == 0u) {
         state->watchdog_ms = 3000u;

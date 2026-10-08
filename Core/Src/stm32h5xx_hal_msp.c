@@ -658,6 +658,19 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
 
     /* USER CODE END TIM2_MspInit 1 */
   }
+  else if(htim_base->Instance==TIM3)
+  {
+    /* USER CODE BEGIN TIM3_MspInit 0 */
+
+    /* USER CODE END TIM3_MspInit 0 */
+    __HAL_RCC_TIM3_CLK_ENABLE();
+    /* RS bus poll 2 кГц — приоритет между 1 мс и 10 мс */
+    HAL_NVIC_SetPriority(TIM3_IRQn, 12, 0);
+    HAL_NVIC_EnableIRQ(TIM3_IRQn);
+    /* USER CODE BEGIN TIM3_MspInit 1 */
+
+    /* USER CODE END TIM3_MspInit 1 */
+  }
 
 }
 
@@ -696,6 +709,17 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
     /* USER CODE BEGIN TIM2_MspDeInit 1 */
 
     /* USER CODE END TIM2_MspDeInit 1 */
+  }
+  else if(htim_base->Instance==TIM3)
+  {
+    /* USER CODE BEGIN TIM3_MspDeInit 0 */
+
+    /* USER CODE END TIM3_MspDeInit 0 */
+    __HAL_RCC_TIM3_CLK_DISABLE();
+    HAL_NVIC_DisableIRQ(TIM3_IRQn);
+    /* USER CODE BEGIN TIM3_MspDeInit 1 */
+
+    /* USER CODE END TIM3_MspDeInit 1 */
   }
 
 }

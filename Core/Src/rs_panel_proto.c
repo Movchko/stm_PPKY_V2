@@ -2802,7 +2802,7 @@ static void rs_panel_master_apply_discovered_panels(RsPanelMaster *master)
         cfg.enabled = 1u;
         cfg.addr = e->assigned_addr;
         cfg.role = (n == 0u) ? RS_PANEL_ROLE_PRIMARY : RS_PANEL_ROLE_NORMAL;
-        cfg.poll_ms = 10u;
+        cfg.poll_ms = 1u; /* TIM3@2кГц, POLL не чаще 1 мс (half-duplex) */
         cfg.expected_hw_id = 0u;
         PanelState_Reset(&master->panels[n]);
         PanelState_BindConfig(&master->panels[n], &cfg);
@@ -3150,7 +3150,7 @@ void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master)
     cfg.enabled = 1u;
     cfg.addr = 0x01u;
     cfg.role = RS_PANEL_ROLE_PRIMARY;
-    cfg.poll_ms = 10u;
+    cfg.poll_ms = 1u; /* TIM3@2кГц, POLL не чаще 1 мс (half-duplex) */
     cfg.expected_hw_id = 0u;
 
     master->panel_count = 1u;
@@ -3833,14 +3833,27 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
     }
     case RS_PANEL_V3_EVT_JOURNAL_GET:
     case RS_PANEL_V3_EVT_JOURNAL_GET_N: {
+        EventLogTierInfo_t jinfo;
+        if (EventLogReader_GetTierInfo(0u, &jinfo) != false) {
+            g_journal_total = jinfo.count;
+        }
         if (g_journal_total > 0u) {
             if (ev->u8_a == 0u && (g_journal_selected + 1u) < g_journal_total) {
+                /* UP / next: новее */
                 g_journal_selected++;
             } else if (ev->u8_a == 1u && g_journal_selected > 0u) {
+                /* DOWN / prev: старее */
                 g_journal_selected--;
+            } else if (ev->u8_a == 2u) {
+                /* ENTER / вход в журнал: новейшая */
+                g_journal_selected = g_journal_total - 1u;
+            } else if (ev->u8_a == 3u) {
+                /* Обновить текущую без сдвига */
             } else if (ev->u16_a < g_journal_total) {
                 g_journal_selected = ev->u16_a;
             }
+        } else {
+            g_journal_selected = 0u;
         }
         reply->payload_len = rs_panel_v3_put_journal_list_payload(reply->payload,
                                                                   RS_PANEL_V3_EVENT_REPLY_MAX);

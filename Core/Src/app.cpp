@@ -1193,6 +1193,12 @@ void AppTimer1ms() {
 	}
 }
 
+void AppTimerRsBus()
+{
+	/* TIM3 даёт 2 кГц флаг; сам POLL ограничен poll_ms (1 мс) внутри Process. */
+	RsPanelMaster_Process10ms(&g_rs_panel_master, HAL_GetTick());
+}
+
 void AppTimer10ms() {
 	uint32_t now = HAL_GetTick();
 	static uint16_t s_app_wd_ticks = 0u;
@@ -1233,7 +1239,7 @@ void AppTimer10ms() {
 	Fire_Timer10ms();
 	Beeper_Process();
 	Led_Process();
-	RsPanelMaster_Process10ms(&g_rs_panel_master, HAL_GetTick());
+	/* RS-опрос панели — AppTimerRsBus() (TIM3 @ 2 кГц), не здесь. */
 
 	/* 300 * 10 мс = 3 с после старта приложения — app WD для бутлоадера ППКУ. */
 	if (s_app_wd_done == 0u) {
