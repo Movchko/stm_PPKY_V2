@@ -9,6 +9,7 @@
 #include "warning.h"
 #include "event_log.h"
 #include "rs_panel_proto.h"
+#include "rs_panel_master_debug.h"
 #include "main.h"
 #include <string.h>
 
@@ -29,32 +30,49 @@ typedef struct {
     uint8_t pending_ack_result;
     uint8_t has_pending_ack;
     uint8_t last_event_seq;
+    uint16_t expected_zones_crc;
     uint16_t expected_devices_crc;
     uint16_t expected_faults_crc;
     uint8_t stream_active;
     RsV3StreamPhase stream_phase;
     uint16_t stream_idx;
     uint16_t fault_piggy_idx; /* SET неисправностей во время стрима зон/устройств */
-    uint32_t last_full_resync_ms; /* анти-флап полного каталога */
+    uint32_t last_catalog_resync_ms; /* анти-флап catalog CRC rewrite */
+    uint8_t stream_need_devices; /* 1 = после ZONE продолжить DEV */
+    uint8_t catalog_crc_ok_latched; /* 1 = уже учли skip при совпадении CRC */
+    uint8_t catalog_after_faults; /* 1 = после FAULT_SET продолжить ZONE/DEV */
+    /* TIME TLV — per-panel (раньше один s_last_time_ms → вторая панель без часов). */
+    uint32_t last_time_ms;
+    /* Reply/journal — per-panel (глобальный pending затирал ответ соседней панели). */
+    RsPanelV3EventReply pending_reply;
+    uint8_t has_pending_reply;
+    uint32_t pending_reply_since_ms; /* для yield journal поверх длинного FAULT stream */
+    RsPanelV3EventReply cached_data_reply;
+    uint8_t cached_data_reply_seq;
+    uint8_t has_cached_data_reply;
 } RsPanelV3PanelCtx;
+
+/* FAULT важнее prefetch журнала, но не дольше этого — иначе GET зависает на весь SET. */
+#define RS_V3_REPLY_YIELD_MS 120u
 
 extern uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
                                                 const RsPanelV3Event *ev,
                                                 RsPanelV3EventReply *reply);
 
+static void rs_v3_latch_pending_reply(RsPanelV3PanelCtx *ctx, uint32_t now_ms)
+{
+    if (ctx == 0) {
+        return;
+    }
+    ctx->has_pending_reply = 1u;
+    if (ctx->pending_reply_since_ms == 0u) {
+        ctx->pending_reply_since_ms = (now_ms != 0u) ? now_ms : 1u;
+    }
+}
+
 static uint32_t s_boot_ms;
 static uint8_t s_boot_valid;
-static uint32_t s_last_time_ms;
 static RsPanelV3PanelCtx s_ctx[RS_PANEL_MAX_PANELS];
-
-static RsPanelV3EventReply s_pending_reply;
-static uint8_t s_pending_reply_panel;
-static uint8_t s_has_pending_reply;
-/* После отдачи POLL pending очищается; при дубле seq не читать SPI снова. */
-static RsPanelV3EventReply s_cached_data_reply;
-static uint8_t s_cached_data_reply_seq;
-static uint8_t s_cached_data_reply_panel;
-static uint8_t s_has_cached_data_reply;
 
 static RsPanelV3FaultEvtItem s_fault_items[RS_PANEL_V3_MAX_FAULTS];
 static uint16_t s_fault_item_count;
@@ -63,22 +81,36 @@ static uint8_t s_fault_snapshot_dirty;
 static uint16_t s_devices_catalog_crc;
 static uint16_t s_zones_catalog_crc;
 
-static void rs_v3_panel_begin_stream(uint8_t panel_idx)
+/* need_zones / need_devices — раздельный rewrite по CRC; FAULT отдельно. */
+static void rs_v3_panel_begin_catalog(uint8_t panel_idx,
+                                     uint8_t need_zones,
+                                     uint8_t need_devices)
 {
+    RsPanelV3PanelCtx *ctx;
     if (panel_idx >= RS_PANEL_MAX_PANELS) {
         return;
     }
-    s_ctx[panel_idx].stream_active = 1u;
-    s_ctx[panel_idx].stream_phase = RS_V3_STREAM_ZONE_CLEAR;
-    s_ctx[panel_idx].stream_idx = 0u;
-    s_ctx[panel_idx].fault_piggy_idx = 0u;
-}
-
-static void rs_v3_all_panels_begin_stream(void)
-{
-    uint8_t i;
-    for (i = 0u; i < RS_PANEL_MAX_PANELS; i++) {
-        rs_v3_panel_begin_stream(i);
+    if (need_zones == 0u && need_devices == 0u) {
+        return;
+    }
+    ctx = &s_ctx[panel_idx];
+    ctx->stream_active = 1u;
+    ctx->stream_idx = 0u;
+    ctx->fault_piggy_idx = 0u;
+    ctx->stream_need_devices = (need_devices != 0u) ? 1u : 0u;
+    ctx->catalog_crc_ok_latched = 0u;
+    ctx->catalog_after_faults = 0u;
+    ctx->stream_phase = (need_zones != 0u) ? RS_V3_STREAM_ZONE_CLEAR
+                                           : RS_V3_STREAM_DEV_CLEAR;
+    /* NEED_CATALOG / reboot: панель могла потерять RTC — не ждать PERIOD. */
+    if (need_zones != 0u && need_devices != 0u) {
+        ctx->last_time_ms = 0u;
+    }
+    if (need_zones != 0u) {
+        g_rs_master_dbg.catalog_rewrite_zones++;
+    }
+    if (need_devices != 0u) {
+        g_rs_master_dbg.catalog_rewrite_devices++;
     }
 }
 
@@ -215,6 +247,7 @@ static void rs_v3_update_expected_fault_crc(void)
     uint8_t i;
     s_ctx[0].expected_faults_crc = RsPanelV3_FaultEvtCrc(s_fault_items, s_fault_item_count);
     for (i = 0u; i < RS_PANEL_MAX_PANELS; i++) {
+        s_ctx[i].expected_zones_crc = s_zones_catalog_crc;
         s_ctx[i].expected_devices_crc = s_devices_catalog_crc;
         s_ctx[i].expected_faults_crc = s_ctx[0].expected_faults_crc;
     }
@@ -224,16 +257,12 @@ void RsPanelV3Master_Init(void)
 {
     memset(s_ctx, 0, sizeof(s_ctx));
     memset(s_fault_items, 0, sizeof(s_fault_items));
-    memset(&s_pending_reply, 0, sizeof(s_pending_reply));
     s_fault_item_count = 0u;
     s_fault_snapshot_dirty = 1u;
     s_boot_valid = 0u;
-    s_last_time_ms = 0u;
-    s_has_pending_reply = 0u;
-    s_pending_reply_panel = 0xFFu;
     rs_v3_refresh_catalog_crcs();
     rs_v3_update_expected_fault_crc();
-    rs_v3_all_panels_begin_stream();
+    /* Каталог на панели — по CRC в RSP при опросе, не force stream на Init. */
 }
 
 void RsPanelV3Master_OnBoot(uint32_t boot_ms)
@@ -244,8 +273,42 @@ void RsPanelV3Master_OnBoot(uint32_t boot_ms)
 
 void RsPanelV3Master_RequestCatalogResync(void)
 {
+    uint8_t i;
     rs_v3_refresh_catalog_crcs();
-    rs_v3_all_panels_begin_stream();
+    rs_v3_update_expected_fault_crc();
+    /* Сброс анти-флапа: следующий RSP сравнит CRC и перепишет только mismatch. */
+    for (i = 0u; i < RS_PANEL_MAX_PANELS; i++) {
+        s_ctx[i].last_catalog_resync_ms = 0u;
+    }
+}
+
+void RsPanelV3Master_RequestCatalogResyncPanel(uint8_t panel_idx)
+{
+    rs_v3_refresh_catalog_crcs();
+    rs_v3_update_expected_fault_crc();
+    if (panel_idx < RS_PANEL_MAX_PANELS) {
+        s_ctx[panel_idx].last_catalog_resync_ms = 0u;
+    }
+}
+
+void RsPanelV3Master_ForceTimeSyncPanel(uint8_t panel_idx)
+{
+    if (panel_idx >= RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    s_ctx[panel_idx].last_time_ms = 0u;
+}
+
+void RsPanelV3Master_RemovePanelSlot(uint8_t panel_idx)
+{
+    uint8_t j;
+    if (panel_idx >= RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    for (j = panel_idx; (uint8_t)(j + 1u) < RS_PANEL_MAX_PANELS; j++) {
+        s_ctx[j] = s_ctx[j + 1u];
+    }
+    memset(&s_ctx[RS_PANEL_MAX_PANELS - 1u], 0, sizeof(s_ctx[0]));
 }
 
 uint8_t RsPanelV3Master_IsV3PollActive(void)
@@ -258,8 +321,20 @@ uint8_t RsPanelV3Master_IsSysReady(void)
     if (s_boot_valid == 0u) {
         return 0u;
     }
-    return ((int32_t)(HAL_GetTick() - s_boot_ms) >=
-            (int32_t)RS_PANEL_V3_SYS_READY_DELAY_MS) ? 1u : 0u;
+    /* SYS_READY: пауза ~10 с окончена И был ≥1 WarningProcess+CommitFaultSnapshot.
+     * Иначе панель снимает «ПРОВЕРКА» → «НОРМА», а FAULT_SET ещё не ушёл. */
+    if (Warning_IsProcessDelayActive() != 0u) {
+        return 0u;
+    }
+    return Warning_IsFaultPipelinePrimed();
+}
+
+uint32_t RsPanelV3Master_GetBootAgeMs(void)
+{
+    if (s_boot_valid == 0u) {
+        return 0u;
+    }
+    return (uint32_t)(HAL_GetTick() - s_boot_ms);
 }
 
 RsPanelV3FaultEvtItem *RsPanelV3Master_FaultItemsWritable(uint16_t *max_count)
@@ -268,6 +343,38 @@ RsPanelV3FaultEvtItem *RsPanelV3Master_FaultItemsWritable(uint16_t *max_count)
         *max_count = RS_PANEL_V3_MAX_FAULTS;
     }
     return s_fault_items;
+}
+
+static uint8_t rs_v3_phase_is_catalog(RsV3StreamPhase phase)
+{
+    return (phase == RS_V3_STREAM_ZONE_CLEAR ||
+            phase == RS_V3_STREAM_ZONE_ADD ||
+            phase == RS_V3_STREAM_DEV_CLEAR ||
+            phase == RS_V3_STREAM_DEV_ADD) ? 1u : 0u;
+}
+
+/* FAULT_CLEAR/SET для слота; ZONE/DEV прерываем и возобновляем после faults. */
+static void rs_v3_panel_schedule_fault_resync(uint8_t panel_idx, uint8_t need_clear)
+{
+    RsPanelV3PanelCtx *ctx;
+    if (panel_idx >= RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    ctx = &s_ctx[panel_idx];
+    if (ctx->stream_active != 0u && rs_v3_phase_is_catalog(ctx->stream_phase) != 0u) {
+        /* Каталог больше НЕ заканчивается FAULT_SET — нельзя skip'ать forever.
+         * Прерываем: после FAULT_* catalog_after_faults вернёт ZONE_CLEAR. */
+        ctx->catalog_after_faults = 1u;
+        if (ctx->stream_phase == RS_V3_STREAM_DEV_CLEAR ||
+            ctx->stream_phase == RS_V3_STREAM_DEV_ADD) {
+            ctx->stream_need_devices = 1u;
+        }
+    }
+    ctx->stream_active = 1u;
+    ctx->stream_phase = (need_clear != 0u) ? RS_V3_STREAM_FAULT_CLEAR
+                                            : RS_V3_STREAM_FAULT_SET;
+    ctx->stream_idx = 0u;
+    ctx->fault_piggy_idx = 0u;
 }
 
 void RsPanelV3Master_CommitFaultSnapshot(uint16_t count)
@@ -280,26 +387,24 @@ void RsPanelV3Master_CommitFaultSnapshot(uint16_t count)
     if (n > RS_PANEL_V3_MAX_FAULTS) {
         n = RS_PANEL_V3_MAX_FAULTS;
     }
+    /* Warning пишет прямо в s_fault_items — второй буфер не влезает в RAM. */
     new_crc = RsPanelV3_FaultEvtCrc(s_fault_items, n);
     if (n == s_fault_item_count && new_crc == s_ctx[0].expected_faults_crc) {
         return;
     }
     old_n = s_fault_item_count;
-    /* CLEAR_ALL только если список реально укоротился. При том же n / росте —
-     * только SET (дубликаты на панели игнорируются), без обнуления UI. */
-    need_clear = (n < old_n) ? 1u : 0u;
+    /*
+     * SET на панели только добавляет / игнорит дубликаты — не удаляет.
+     * Укорочение / замена при том же n → CLEAR_ALL+SET.
+     * Рост n → только SET (быстро; панель вставит новую в начало списка).
+     * n==0 → CLEAR_ALL каждой панели (иначе sticky UI при CRC уже empty).
+     */
+    need_clear = (n <= old_n) ? 1u : 0u;
     s_fault_item_count = n;
     s_fault_snapshot_dirty = 1u;
     rs_v3_update_expected_fault_crc();
     for (i = 0u; i < RS_PANEL_MAX_PANELS; i++) {
-        if (s_ctx[i].stream_active != 0u) {
-            continue;
-        }
-        s_ctx[i].stream_active = 1u;
-        s_ctx[i].stream_phase = (need_clear != 0u) ? RS_V3_STREAM_FAULT_CLEAR
-                                                    : RS_V3_STREAM_FAULT_SET;
-        s_ctx[i].stream_idx = 0u;
-        s_ctx[i].fault_piggy_idx = 0u;
+        rs_v3_panel_schedule_fault_resync(i, need_clear);
     }
 }
 
@@ -313,7 +418,6 @@ void RsPanelV3Master_SetFaultSnapshot(const RsPanelV3FaultEvtItem *items, uint16
     if (n > RS_PANEL_V3_MAX_FAULTS) {
         n = RS_PANEL_V3_MAX_FAULTS;
     }
-    /* Если пишут прямо в наш буфер — только commit. */
     if (items == s_fault_items) {
         RsPanelV3Master_CommitFaultSnapshot(n);
         return;
@@ -339,6 +443,24 @@ static void rs_v3_fill_time(RsPanelV3Time *t)
     t->day = date.Date;
     t->month = date.Month;
     t->year = date.Year;
+}
+
+/* TIME в POLL: сразу (last_time_ms==0) / период / каждый POLL во время
+ * каталога (панель могла пропустить ранние кадры, пока поднималась). */
+static void rs_v3_maybe_attach_time(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx,
+                                   uint32_t now_ms)
+{
+    if (out == 0 || ctx == 0) {
+        return;
+    }
+    if (ctx->stream_active != 0u ||
+        ctx->last_time_ms == 0u ||
+        (now_ms - ctx->last_time_ms) >= RS_PANEL_V3_TIME_SYNC_PERIOD_MS) {
+        ctx->last_time_ms = now_ms;
+        out->has_time = 1u;
+        out->sys.flags |= RS_PANEL_V3_SYS_TIME_VALID;
+        rs_v3_fill_time(&out->time);
+    }
 }
 
 static uint8_t rs_v3_emit_stream_op(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx)
@@ -367,6 +489,15 @@ static uint8_t rs_v3_emit_stream_op(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx)
             rs_v3_copy_zone_name(out->zone_names.name, PPKYConfig.zone_name[zone - 1u]);
             return 1u;
         }
+        if (ctx->stream_need_devices == 0u) {
+            /* Только зоны: FAULT синхронизируется отдельно по faults_crc. */
+            ctx->stream_active = 0u;
+            ctx->stream_phase = RS_V3_STREAM_IDLE;
+            ctx->stream_idx = 0u;
+            /* TIME снова: кадры с TIME во время stream могли потеряться на шине. */
+            ctx->last_time_ms = 0u;
+            return 0u;
+        }
         ctx->stream_phase = RS_V3_STREAM_DEV_CLEAR;
         ctx->stream_idx = 0u;
         /* fallthrough */
@@ -388,17 +519,14 @@ static uint8_t rs_v3_emit_stream_op(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx)
             out->device.op = (uint8_t)RS_PANEL_V3_STREAM_OP_ADD;
             return 1u;
         }
-        /* CLEAR_ALL только если неисправностей нет (сброс панели).
-         * Иначе сразу SET — дубликаты на панели игнорируются, UI не скачет 0→1→n. */
+        /* Каталог ZONE/DEV завершён. FAULT не форсируем здесь: Commit/OnRsp
+         * ставят FAULT_* (в т.ч. прерывая каталог). Idle — ок при совпадении CRC. */
+        ctx->stream_active = 0u;
+        ctx->stream_phase = RS_V3_STREAM_IDLE;
         ctx->stream_idx = 0u;
-        if (s_fault_item_count == 0u) {
-            out->has_fault_evt = 1u;
-            out->fault_evt.op = (uint8_t)RS_PANEL_V3_FAULT_EVT_CLEAR_ALL;
-            ctx->stream_phase = RS_V3_STREAM_FAULT_SET;
-            return 1u;
-        }
-        ctx->stream_phase = RS_V3_STREAM_FAULT_SET;
-        goto rs_v3_stream_fault_set;
+        ctx->stream_need_devices = 0u;
+        ctx->last_time_ms = 0u;
+        return 0u;
     case RS_V3_STREAM_FAULT_CLEAR:
         out->has_fault_evt = 1u;
         out->fault_evt.op = (uint8_t)RS_PANEL_V3_FAULT_EVT_CLEAR_ALL;
@@ -414,9 +542,16 @@ static uint8_t rs_v3_emit_stream_op(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx)
             ctx->stream_idx++;
             return 1u;
         }
+        if (ctx->catalog_after_faults != 0u) {
+            ctx->catalog_after_faults = 0u;
+            ctx->stream_phase = RS_V3_STREAM_ZONE_CLEAR;
+            ctx->stream_idx = 0u;
+            return rs_v3_emit_stream_op(out, ctx);
+        }
         ctx->stream_active = 0u;
         ctx->stream_phase = RS_V3_STREAM_IDLE;
         ctx->stream_idx = 0u;
+        ctx->last_time_ms = 0u;
         return 0u;
     default:
         ctx->stream_active = 0u;
@@ -436,7 +571,7 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
         return;
     }
     ctx = &s_ctx[panel_idx];
-    need_reply = (s_has_pending_reply != 0u && s_pending_reply_panel == panel_idx) ? 1u : 0u;
+    need_reply = (ctx->has_pending_reply != 0u) ? 1u : 0u;
 
     if (RsPanelV3Master_IsSysReady() != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_READY;
@@ -471,12 +606,40 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
     if (PPKYConfig.beep_block != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
     }
+    if (EspManager_IsUserWifiOn() != 0u) {
+        out->sys.flags |= RS_PANEL_V3_SYS_WIFI_ON;
+    }
+    if (EspManager_IsLinkActive() != 0u) {
+        out->sys.flags |= RS_PANEL_V3_SYS_WIFI_LINK;
+    }
 
     /*
      * Журнал/данные: ACK без event_reply освобождает PostEvent на панели —
      * следующее нажатие снова двигает selected, а reply ещё в очереди → UI
-     * прыгает на 2. Пока reply pending — не шлём стрим/config и отдаём ACK+reply вместе.
+     * прыгает на 2. Пока reply pending — обычно отдаём ACK+reply и не шлём
+     * каталог. Исключение: FAULT_CLEAR/SET важнее prefetch журнала — иначе
+     * «лишняя» неисправность на панели залипает, пока идёт JOURNAL_GET_N.
+     * Но не дольше RS_V3_REPLY_YIELD_MS: иначе при 2 панелях + длинном FAULT
+     * JOURNAL_GET не получает ACK → пустой журнал до конца stream.
      */
+    if (need_reply != 0u &&
+        ctx->stream_active != 0u &&
+        (ctx->stream_phase == RS_V3_STREAM_FAULT_CLEAR ||
+         ctx->stream_phase == RS_V3_STREAM_FAULT_SET)) {
+        uint32_t reply_age = 0u;
+        if (ctx->pending_reply_since_ms != 0u) {
+            reply_age = now_ms - ctx->pending_reply_since_ms;
+        }
+        if (reply_age < RS_V3_REPLY_YIELD_MS) {
+            /* Не трогаем ACK/reply: ACK без reply освободит слот на панели. */
+            (void)rs_v3_emit_stream_op(out, ctx);
+            rs_v3_maybe_attach_time(out, ctx, now_ms);
+            (void)s_fault_snapshot_dirty;
+            return;
+        }
+        /* yield → отдать reply; FAULT продолжится со следующего POLL. */
+    }
+
     if (need_reply != 0u) {
         out->has_config = 0u;
         memset(&out->config, 0, sizeof(out->config));
@@ -486,12 +649,12 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
             ctx->has_pending_ack = 0u;
         }
         out->has_event_reply = 1u;
-        out->event_reply = s_pending_reply;
-        s_has_pending_reply = 0u;
-        s_pending_reply_panel = 0xFFu;
-        memset(&s_pending_reply, 0, sizeof(s_pending_reply));
+        out->event_reply = ctx->pending_reply;
+        ctx->has_pending_reply = 0u;
+        ctx->pending_reply_since_ms = 0u;
+        memset(&ctx->pending_reply, 0, sizeof(ctx->pending_reply));
+        rs_v3_maybe_attach_time(out, ctx, now_ms);
         (void)s_fault_snapshot_dirty;
-        (void)now_ms;
         return;
     }
 
@@ -503,21 +666,22 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
 
     (void)rs_v3_emit_stream_op(out, ctx);
 
-    /* Пока в кадре TLV стрима — не добавлять time/zones (лимит 251). */
+    /* TIME — с первых POLL (last_time_ms==0) и далее по периоду, в т.ч. во
+     * время каталога. EncodePollToBuf при нехватке места优先рует TIME над
+     * стримом (не срезает TIME в пользу zone/MCU TLV).
+     * ZONES fire — только без stream TLV. TIME — per-panel. */
     {
-        const uint8_t stream_tlv =
-            (out->has_zone_names != 0u || out->has_devices != 0u ||
-             out->has_fault_evt != 0u) ? 1u : 0u;
+        const uint8_t fire_active = (Fire_IsActive() != 0u) ? 1u : 0u;
 
-        if (stream_tlv == 0u) {
-            if (s_last_time_ms == 0u ||
-                (now_ms - s_last_time_ms) >= RS_PANEL_V3_TIME_SYNC_PERIOD_MS) {
-                s_last_time_ms = now_ms;
-                out->has_time = 1u;
-                out->sys.flags |= RS_PANEL_V3_SYS_TIME_VALID;
-                rs_v3_fill_time(&out->time);
-            }
+        if (fire_active != 0u) {
+            out->has_zone_names = 0u;
+            out->has_devices = 0u;
+        }
 
+        rs_v3_maybe_attach_time(out, ctx, now_ms);
+
+        if (out->has_zone_names == 0u && out->has_devices == 0u &&
+            out->has_fault_evt == 0u) {
             Fire_FillV3Zones(&out->zones, now_ms);
             out->has_zones = (out->zones.count > 0u) ? 1u : 0u;
         }
@@ -527,7 +691,7 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
 }
 
 /* Минимальный POLL без RsPanelV3Poll на стеке повторно — только SYS flags. */
-static uint16_t rs_v3_encode_sys_only(uint8_t *dst, uint16_t dst_size)
+uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size)
 {
     uint16_t flags = 0u;
     if (dst == 0 || dst_size < 5u) {
@@ -551,6 +715,12 @@ static uint16_t rs_v3_encode_sys_only(uint8_t *dst, uint16_t dst_size)
     if (PPKYConfig.beep_block != 0u) {
         flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
     }
+    if (EspManager_IsUserWifiOn() != 0u) {
+        flags |= RS_PANEL_V3_SYS_WIFI_ON;
+    }
+    if (EspManager_IsLinkActive() != 0u) {
+        flags |= RS_PANEL_V3_SYS_WIFI_LINK;
+    }
     dst[0] = RS_PANEL_V3_VERSION;
     dst[1] = (uint8_t)RS_PANEL_V3_TAG_SYS;
     dst[2] = 2u;
@@ -565,19 +735,23 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
     RsPanelV3Poll poll;
     RsPanelV3PanelCtx *ctx;
     RsPanelV3PanelCtx saved_ctx;
-    uint32_t saved_time_ms;
     uint16_t len;
+    uint8_t want_time;
+    uint8_t has_stream_tlv;
 
     if (dst == 0 || panel_idx >= RS_PANEL_MAX_PANELS) {
         return 0u;
     }
     ctx = &s_ctx[panel_idx];
     saved_ctx = *ctx;
-    saved_time_ms = s_last_time_ms;
 
     RsPanelV3Master_BuildPoll(&poll, panel_idx, now_ms);
+    want_time = poll.has_time;
     len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
     if (len != 0u) {
+        if (want_time != 0u && panel_idx < 8u) {
+            g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
+        }
         return len;
     }
 
@@ -585,43 +759,84 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
      * события раньше слал только ACK → журнал пустой). Откат + SYS, retry. */
     if (poll.has_event_reply != 0u) {
         *ctx = saved_ctx;
-        s_last_time_ms = saved_time_ms;
-        s_has_pending_reply = 1u;
-        s_pending_reply = poll.event_reply;
-        s_pending_reply_panel = panel_idx;
-        return rs_v3_encode_sys_only(dst, dst_size);
+        ctx->pending_reply = poll.event_reply;
+        rs_v3_latch_pending_reply(ctx, now_ms);
+        return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
     }
 
-    /* Стрим уже сдвинут в BuildPoll — сначала срезать опциональные TLV и
-     * повторить Encode, не откатывая фазу каталога. */
-    if (poll.has_zones != 0u || poll.has_time != 0u || poll.has_config != 0u) {
-        if (poll.has_time != 0u) {
-            s_last_time_ms = saved_time_ms;
-            poll.has_time = 0u;
-            poll.sys.flags = (uint16_t)(poll.sys.flags &
-                                       (uint16_t)(~RS_PANEL_V3_SYS_TIME_VALID));
-        }
+    has_stream_tlv = (poll.has_zone_names != 0u || poll.has_devices != 0u ||
+                      poll.has_fault_evt != 0u) ? 1u : 0u;
+
+    /* 1) Срезать ZONES/CONFIG, TIME+стрим оставить. */
+    if (poll.has_zones != 0u || poll.has_config != 0u) {
         poll.has_zones = 0u;
         poll.has_config = 0u;
         memset(&poll.zones, 0, sizeof(poll.zones));
         memset(&poll.config, 0, sizeof(poll.config));
         len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
         if (len != 0u) {
+            if (want_time != 0u && panel_idx < 8u) {
+                g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
+            }
             return len;
         }
     }
 
-    /* Совсем не влезло (даже стрим) — откатить фазу и отдать SYS. */
+    /* 2) TIME важнее каталога: откат фазы стрима, кадр SYS+TIME (+ACK).
+     * Иначе TIME срезался на весь ZONE/MCU stream → часы 00:00 при NORMA.
+     * Следующий POLL продолжит каталог с той же позиции. */
+    if (want_time != 0u && has_stream_tlv != 0u) {
+        ctx->stream_active = saved_ctx.stream_active;
+        ctx->stream_phase = saved_ctx.stream_phase;
+        ctx->stream_idx = saved_ctx.stream_idx;
+        ctx->fault_piggy_idx = saved_ctx.fault_piggy_idx;
+        ctx->stream_need_devices = saved_ctx.stream_need_devices;
+        ctx->catalog_after_faults = saved_ctx.catalog_after_faults;
+
+        poll.has_zone_names = 0u;
+        poll.has_devices = 0u;
+        poll.has_fault_evt = 0u;
+        poll.has_zones = 0u;
+        poll.has_config = 0u;
+        memset(&poll.zone_names, 0, sizeof(poll.zone_names));
+        memset(&poll.device, 0, sizeof(poll.device));
+        memset(&poll.fault_evt, 0, sizeof(poll.fault_evt));
+        memset(&poll.zones, 0, sizeof(poll.zones));
+        memset(&poll.config, 0, sizeof(poll.config));
+
+        len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+        if (len != 0u) {
+            if (panel_idx < 8u) {
+                g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
+            }
+            return len;
+        }
+        /* TIME не влез — полный откат (в т.ч. last_time_ms / ACK). */
+        *ctx = saved_ctx;
+        return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
+    }
+
+    /* 3) Без TIME или без стрима: срезать TIME, оставить стрим (resync). */
+    if (want_time != 0u) {
+        ctx->last_time_ms = saved_ctx.last_time_ms;
+        poll.has_time = 0u;
+        poll.sys.flags = (uint16_t)(poll.sys.flags &
+                                   (uint16_t)(~RS_PANEL_V3_SYS_TIME_VALID));
+        len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+        if (len != 0u) {
+            return len;
+        }
+    }
+
+    /* Совсем не влезло — откатить фазу и отдать SYS. */
     *ctx = saved_ctx;
-    s_last_time_ms = saved_time_ms;
-    return rs_v3_encode_sys_only(dst, dst_size);
+    return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
 }
 
 static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint32_t now_ms)
 {
     RsPanelV3PanelCtx *ctx;
     uint8_t result = (uint8_t)RS_PANEL_V3_ACK_OK;
-    (void)now_ms;
     if (ev == 0 || panel_idx >= RS_PANEL_MAX_PANELS) {
         return;
     }
@@ -637,15 +852,13 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
         ctx->pending_ack_seq = ev->seq;
         ctx->pending_ack_result = (uint8_t)RS_PANEL_V3_ACK_OK;
         ctx->has_pending_ack = 1u;
-        if (s_has_pending_reply != 0u && s_pending_reply_panel == panel_idx) {
+        if (ctx->has_pending_reply != 0u) {
             return;
         }
-        if (s_has_cached_data_reply != 0u &&
-            s_cached_data_reply_panel == panel_idx &&
-            s_cached_data_reply_seq == ev->seq) {
-            s_pending_reply = s_cached_data_reply;
-            s_pending_reply_panel = panel_idx;
-            s_has_pending_reply = 1u;
+        if (ctx->has_cached_data_reply != 0u &&
+            ctx->cached_data_reply_seq == ev->seq) {
+            ctx->pending_reply = ctx->cached_data_reply;
+            rs_v3_latch_pending_reply(ctx, now_ms);
             return;
         }
         switch (ev->type) {
@@ -663,16 +876,14 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
                 refresh.u8_a = 3u;
             }
             if (RsPanelV3Proto_DispatchDataEvent(panel_idx, &refresh,
-                                                 &s_pending_reply) != 0u) {
-                s_pending_reply.seq = ev->seq;
-                s_pending_reply.type = ev->type;
-                s_pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
-                s_pending_reply_panel = panel_idx;
-                s_has_pending_reply = 1u;
-                s_cached_data_reply = s_pending_reply;
-                s_cached_data_reply_seq = ev->seq;
-                s_cached_data_reply_panel = panel_idx;
-                s_has_cached_data_reply = 1u;
+                                                 &ctx->pending_reply) != 0u) {
+                ctx->pending_reply.seq = ev->seq;
+                ctx->pending_reply.type = ev->type;
+                ctx->pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
+                rs_v3_latch_pending_reply(ctx, now_ms);
+                ctx->cached_data_reply = ctx->pending_reply;
+                ctx->cached_data_reply_seq = ev->seq;
+                ctx->has_cached_data_reply = 1u;
             }
             break;
         }
@@ -716,6 +927,8 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
         } else {
             EspManager_RequestWifiDisable();
         }
+        /* Панель рисует «Вкл/Выкл» из кэша CONNECTION_STATUS — сразу подтвердить. */
+        RsPanelMaster_PushConnectionStatus();
         break;
     case RS_PANEL_V3_EVT_JOURNAL_COUNT:
     case RS_PANEL_V3_EVT_JOURNAL_GET:
@@ -726,16 +939,14 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev, uint
     case RS_PANEL_V3_EVT_DEVICES_GET:
     case RS_PANEL_V3_EVT_DEVICES_GET_N:
     case RS_PANEL_V3_EVT_EXT_CAN_SET:
-        if (RsPanelV3Proto_DispatchDataEvent(panel_idx, ev, &s_pending_reply) != 0u) {
-            s_pending_reply.seq = ev->seq;
-            s_pending_reply.type = ev->type;
-            s_pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
-            s_pending_reply_panel = panel_idx;
-            s_has_pending_reply = 1u;
-            s_cached_data_reply = s_pending_reply;
-            s_cached_data_reply_seq = ev->seq;
-            s_cached_data_reply_panel = panel_idx;
-            s_has_cached_data_reply = 1u;
+        if (RsPanelV3Proto_DispatchDataEvent(panel_idx, ev, &ctx->pending_reply) != 0u) {
+            ctx->pending_reply.seq = ev->seq;
+            ctx->pending_reply.type = ev->type;
+            ctx->pending_reply.result = (uint8_t)RS_PANEL_V3_ACK_OK;
+            rs_v3_latch_pending_reply(ctx, now_ms);
+            ctx->cached_data_reply = ctx->pending_reply;
+            ctx->cached_data_reply_seq = ev->seq;
+            ctx->has_cached_data_reply = 1u;
             result = (uint8_t)RS_PANEL_V3_ACK_OK;
         } else {
             result = (uint8_t)RS_PANEL_V3_ACK_IGNORED;
@@ -761,23 +972,39 @@ void RsPanelV3Master_OnRsp(uint8_t panel_idx, const RsPanelV3Rsp *rsp, uint32_t 
     }
     ctx = &s_ctx[panel_idx];
 
-    /* Пока стрим уже идёт — не начинать заново.
-     * Полный каталог — NEED_CATALOG / devices_crc (пауза 2 с).
-     * faults_crc — только досылка SET, без CLEAR_ALL (иначе список скачет). */
-    if (ctx->stream_active == 0u) {
-        if ((rsp->flags & RS_PANEL_V3_RSP_FLAG_NEED_CATALOG) != 0u ||
-            rsp->devices_crc != ctx->expected_devices_crc) {
-            if (ctx->last_full_resync_ms == 0u ||
-                (now_ms - ctx->last_full_resync_ms) >= 2000u) {
-                ctx->last_full_resync_ms = now_ms;
-                rs_v3_panel_begin_stream(panel_idx);
+    /*
+     * faults_crc mismatch → CLEAR_ALL+SET. ZONE/DEV прерываем (каталог сам
+     * FAULT больше не шлёт). Уже идущий FAULT_CLEAR/SET не перезапускаем.
+     */
+    if (rsp->faults_crc != ctx->expected_faults_crc) {
+        if (ctx->stream_active == 0u ||
+            rs_v3_phase_is_catalog(ctx->stream_phase) != 0u) {
+            rs_v3_panel_schedule_fault_resync(panel_idx, 1u);
+        }
+    } else if (ctx->stream_active == 0u) {
+        uint8_t need_zones;
+        uint8_t need_devices;
+        /* NEED_CATALOG = нет валидного каталога → оба потока.
+         * Иначе раздельно zones_crc / devices_crc (пауза 2 с). */
+        if ((rsp->flags & RS_PANEL_V3_RSP_FLAG_NEED_CATALOG) != 0u) {
+            need_zones = 1u;
+            need_devices = 1u;
+        } else {
+            need_zones = (rsp->zones_crc != ctx->expected_zones_crc) ? 1u : 0u;
+            need_devices = (rsp->devices_crc != ctx->expected_devices_crc) ? 1u : 0u;
+        }
+        if (need_zones != 0u || need_devices != 0u) {
+            ctx->catalog_crc_ok_latched = 0u;
+            if (ctx->last_catalog_resync_ms == 0u ||
+                (now_ms - ctx->last_catalog_resync_ms) >= 2000u) {
+                ctx->last_catalog_resync_ms = now_ms;
+                rs_v3_panel_begin_catalog(panel_idx, need_zones, need_devices);
             }
-        } else if (rsp->faults_crc != ctx->expected_faults_crc) {
-            ctx->stream_active = 1u;
-            ctx->stream_phase = (s_fault_item_count > 0u) ? RS_V3_STREAM_FAULT_SET
-                                                          : RS_V3_STREAM_FAULT_CLEAR;
-            ctx->stream_idx = 0u;
-            ctx->fault_piggy_idx = 0u;
+        } else if (ctx->catalog_crc_ok_latched == 0u) {
+            /* One-shot: оба CRC совпали — rewrite пропущен. */
+            ctx->catalog_crc_ok_latched = 1u;
+            g_rs_master_dbg.catalog_skip_zones++;
+            g_rs_master_dbg.catalog_skip_devices++;
         }
     }
 

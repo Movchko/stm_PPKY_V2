@@ -1036,6 +1036,8 @@ void AppInit() {
 
 	/* Инициализация FSM пожара */
 	Fire_Init();
+	/* Fault pipeline / SYS_READY: ровно ~10 с wall-time с этого момента. */
+	Warning_ArmProcessDelay(HAL_GetTick());
 	RsPanelMaster_Init(&g_rs_panel_master, &huart1, BRP_485_EN_GPIO_Port, BRP_485_EN_Pin);
 }
 
@@ -1063,8 +1065,6 @@ void AppProcess(uint32_t now_ms) {
 }
 
 uint32_t counter1s = 0;
-
-uint32_t warning_process_delay = 10000;
 
 uint32_t led_power_toogle_cnt = 0;
 uint8_t led_power_is_toogle = 0;
@@ -1174,10 +1174,8 @@ void AppTimer1ms() {
 	Fire_Timer1ms();
 	BackendProcess();
 
-	/* Grace перед warning/relay/log: счётчик в мс остаётся здесь. */
-	if (warning_process_delay) {
-		warning_process_delay--;
-	}
+	/* Grace перед warning/relay/log: wall-time в Warning_IsProcessDelayActive. */
+	(void)Warning_IsProcessDelayActive();
 
 	if (!MenuUi_IsConfigSessionActive()) {
 		CheckMkuConfigMismatch();
@@ -1228,7 +1226,7 @@ void AppTimer10ms() {
 	EspManager_Process(now);
 	MenuConfig_Process1ms(now);
 
-	if (warning_process_delay == 0) {
+	if (Warning_IsProcessDelayActive() == 0u) {
 		WarningProcess1ms();
 		RelayAuto_Process();
 		if (PPKYConfig.rs485_on != 0u) {

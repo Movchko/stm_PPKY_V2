@@ -17,13 +17,22 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
 void RsPanelV3Master_OnRsp(uint8_t panel_idx, const RsPanelV3Rsp *rsp, uint32_t now_ms);
 
 uint8_t RsPanelV3Master_IsSysReady(void);
+uint32_t RsPanelV3Master_GetBootAgeMs(void);
 uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
                                         uint8_t panel_idx, uint32_t now_ms);
+/* Короткий POLL только SYS (addr_scan probe) — с реальными flags, в т.ч. READY. */
+uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size);
 
 void RsPanelV3Master_SetFaultSnapshot(const RsPanelV3FaultEvtItem *items, uint16_t count);
 RsPanelV3FaultEvtItem *RsPanelV3Master_FaultItemsWritable(uint16_t *max_count);
 void RsPanelV3Master_CommitFaultSnapshot(uint16_t count);
 void RsPanelV3Master_RequestCatalogResync(void);
+/* Каталог только для одной панели (hot-plug) — не сбрасывать соседние слоты. */
+void RsPanelV3Master_RequestCatalogResyncPanel(uint8_t panel_idx);
+/* Сброс last_time_ms → TIME в ближайшем POLL (после CAPS/reboot панели). */
+void RsPanelV3Master_ForceTimeSyncPanel(uint8_t panel_idx);
+/* Сдвиг s_ctx[] при prune слота (иначе индекс панелей и ctx разъезжаются). */
+void RsPanelV3Master_RemovePanelSlot(uint8_t panel_idx);
 
 uint8_t RsPanelV3Master_IsV3PollActive(void);
 

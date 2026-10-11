@@ -1418,6 +1418,18 @@ static void Warning_FillV3McuKey(RsPanelV3McuKey *k, const WarningItem& it)
 	}
 }
 
+static void Warning_FillV3Zone(RsPanelV3FaultEvtItem *fe, const WarningItem& it)
+{
+	if (fe == nullptr) {
+		return;
+	}
+	if (it.zone == 0u || it.zone > ZONE_NUMBER) {
+		return;
+	}
+	fe->zone = it.zone;
+	fe->flags = (uint8_t)(fe->flags | RS_PANEL_V3_FAULT_FLAG_HAS_ZONE);
+}
+
 static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3FaultEvtItem *out)
 {
 	RsPanelV3FaultEvtItem fe = {};
@@ -1430,6 +1442,7 @@ static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3Fau
 		Warning_FillV3McuKey(&fe.mcu, it);
 		fe.ch_type = it.v_d_type;
 		fe.ch_l_adr = it.v_l_adr;
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_DPT_WARNING_ATTN) {
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_ATTN_DPT;
 		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_ATTENTION | RS_PANEL_V3_FAULT_FLAG_HAS_MCU |
@@ -1438,6 +1451,7 @@ static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3Fau
 		fe.ch_type = it.v_d_type;
 		fe.ch_l_adr = it.v_l_adr;
 		fe.extra = it.extra;
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_VDEV_FAULT) {
 		if (it.line_state == 2u) {
 			fe.code = (uint8_t)RS_PANEL_V3_FAULT_LINE_SHORT;
@@ -1450,12 +1464,14 @@ static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3Fau
 		Warning_FillV3McuKey(&fe.mcu, it);
 		fe.ch_type = it.v_d_type;
 		fe.ch_l_adr = it.v_l_adr;
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_MCU_CAN_FAULT) {
 		fe.code = (it.line_state == 2u) ? (uint8_t)RS_PANEL_V3_FAULT_MCU_CAN_SHORT
 						: (uint8_t)RS_PANEL_V3_FAULT_MCU_CAN_BREAK;
 		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_MCU | RS_PANEL_V3_FAULT_FLAG_HAS_CAN);
 		Warning_FillV3McuKey(&fe.mcu, it);
 		fe.can_idx = it.can_idx;
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_PPKU_CAN_FAULT) {
 		fe.code = (it.line_state == 2u) ? (uint8_t)RS_PANEL_V3_FAULT_PPKU_CAN_SHORT
 						: (uint8_t)RS_PANEL_V3_FAULT_PPKU_CAN_BREAK;
@@ -1470,6 +1486,7 @@ static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3Fau
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_MCU_POSITION;
 		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
 		Warning_FillV3McuKey(&fe.mcu, it);
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_PANEL_JOURNAL;
 		fe.panel_addr = it.h_adr;
@@ -1477,16 +1494,19 @@ static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3Fau
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_DEVICE_MISSING;
 		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
 		Warning_FillV3McuKey(&fe.mcu, it);
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_DEVICE_FOUND) {
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_DEVICE_FOUND;
 		fe.flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_MCU | RS_PANEL_V3_FAULT_FLAG_HAS_CHANNEL);
 		Warning_FillV3McuKey(&fe.mcu, it);
 		fe.ch_type = it.v_d_type;
 		fe.ch_l_adr = it.v_l_adr;
+		Warning_FillV3Zone(&fe, it);
 	} else if (it.kind == WARN_KIND_CONFIG_MISMATCH) {
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_CONFIG_MISMATCH;
 		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
 		Warning_FillV3McuKey(&fe.mcu, it);
+		Warning_FillV3Zone(&fe, it);
 	} else {
 		return 0u;
 	}
@@ -1582,6 +1602,9 @@ extern "C" uint16_t Warning_BuildV3FaultSnapshot(RsPanelV3FaultEvtItem *out, uin
 	return BuildV3FaultSnapshotCore(out, max_out);
 }
 
+/* После стартовой паузы: ≥1 WarningProcess с CommitFaultSnapshot (для SYS_READY). */
+static uint8_t s_fault_pipeline_primed = 0u;
+
 /* Главный 1мс-тик модуля: сбор, фильтрация, LED и публикация предупреждений. */
 extern "C" void WarningProcess1ms(void)
 {
@@ -1623,6 +1646,8 @@ extern "C" void WarningProcess1ms(void)
 		RsPanelV3FaultEvtItem *v3_items = RsPanelV3Master_FaultItemsWritable(&max_n);
 		uint16_t v3_n = Warning_BuildV3FaultSnapshot(v3_items, max_n);
 		RsPanelV3Master_CommitFaultSnapshot(v3_n);
+		/* SYS_READY только после этого — иначе панель мигнёт «НОРМА» до FAULT_SET. */
+		s_fault_pipeline_primed = 1u;
 	}
 }
 
@@ -1674,11 +1699,40 @@ extern "C" uint8_t Warning_GetLastUiBuildCount(void)
 	return g_last_build_count;
 }
 
-extern uint32_t warning_process_delay;
+/* Live Watch: оставшиеся мс паузы (обновляется в Warning_IsProcessDelayActive). */
+uint32_t warning_process_delay = 10000u;
+
+#define WARNING_PROCESS_DELAY_MS 10000u
+static uint32_t s_warning_delay_start_ms = 0u;
+static uint8_t s_warning_delay_armed = 0u;
+
+extern "C" void Warning_ArmProcessDelay(uint32_t now_ms)
+{
+	s_warning_delay_start_ms = now_ms;
+	s_warning_delay_armed = 1u;
+	s_fault_pipeline_primed = 0u;
+	warning_process_delay = WARNING_PROCESS_DELAY_MS;
+}
 
 extern "C" uint8_t Warning_IsProcessDelayActive(void)
 {
-	return (warning_process_delay != 0u) ? 1u : 0u;
+	uint32_t elapsed;
+
+	if (s_warning_delay_armed == 0u) {
+		return 1u;
+	}
+	elapsed = (uint32_t)(HAL_GetTick() - s_warning_delay_start_ms);
+	if (elapsed >= WARNING_PROCESS_DELAY_MS) {
+		warning_process_delay = 0u;
+		return 0u;
+	}
+	warning_process_delay = WARNING_PROCESS_DELAY_MS - elapsed;
+	return 1u;
+}
+
+extern "C" uint8_t Warning_IsFaultPipelinePrimed(void)
+{
+	return s_fault_pipeline_primed;
 }
 
 extern "C" void Warning_RepublishUiNow(void)

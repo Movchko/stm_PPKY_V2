@@ -40,6 +40,8 @@ typedef struct {
     RsPanelDiscoverEntry discover[RS_PANEL_MAX_PANELS];
     uint8_t collision_pending;
     uint8_t first_boot_discover_done;
+    /* Конец последнего цикла DISCOVER/ASSIGN — cooldown повторных коллизий. */
+    uint32_t last_addr_cycle_ms;
 } RsPanelMaster;
 
 void RsPanelMaster_Init(RsPanelMaster *master,
@@ -59,6 +61,8 @@ void RsPanelMaster_PushMenuSoundState(void);
 void RsPanelMaster_InvalidateSoundDedup(void);
 /* Синхронизировать LED (в т.ч. NORM/ERR) на готовые панели. */
 void RsPanelMaster_PushLeds(void);
+/* UI_DATA CONNECTION_STATUS (wifi_on / rs485_on) — отложить TX в Process10ms. */
+void RsPanelMaster_PushConnectionStatus(void);
 /* Удержание ПУСК ОБЩИЙ: MAIN на панели + сброс dedup UI (вызывать при старте hold). */
 void RsPanelMaster_OnStartAllHoldBegin(void);
 /* 1 = подключена малая панель (нет ПУСК ОБЩИЙ). */

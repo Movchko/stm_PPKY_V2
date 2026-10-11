@@ -28,8 +28,12 @@ void Warning_RepublishUiNow(void);
 void Warning_ResetPanelUiCache(void);
 /* Последний count из BuildUiPayload (Live Watch на ППКУ). */
 uint8_t Warning_GetLastUiBuildCount(void);
-/* 1, пока действует стартовая пауза warning_process_delay (список ещё не собран). */
+/* Стартовая пауза fault pipeline: 10000 = ~10 с wall-time (HAL_GetTick). */
+void Warning_ArmProcessDelay(uint32_t now_ms);
+/* 1, пока действует стартовая пауза (WarningProcess не крутится). */
 uint8_t Warning_IsProcessDelayActive(void);
+/* 1 после первого полного WarningProcess после паузы (снимок faults уже Commit). */
+uint8_t Warning_IsFaultPipelinePrimed(void);
 /* Снимок активных неисправностей v3 (коды + ключи) для RsPanelV3Master_SetFaultSnapshot. */
 uint16_t Warning_BuildV3FaultSnapshot(RsPanelV3FaultEvtItem *out, uint16_t max_out);
 

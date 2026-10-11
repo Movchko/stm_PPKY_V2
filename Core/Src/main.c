@@ -101,7 +101,7 @@ uint8_t isMainInit = 0;
 /* USER CODE BEGIN 0 */
 
 
-#define APP_VERSION_U32 16u
+#define APP_VERSION_U32 17u
 
 const char *GetAppVersion(void)
 {
@@ -181,7 +181,7 @@ int main(void)
   /* Как на ППКУ 1: до AppInit держим ESP выключенным (EN/BOOT = 0).
    * Включение — Esp32_SetEnabled(1) в AppInit: BOOT↑, затем EN↑, 100 ms. */
   Esp32_SetEnabled(0);
-
+  //HAL_Delay(1000);
   uint8_t isFlash = 0;
   isFlash = SPIF_Init(&hFlash, &hspi1, FLASH_CS_GPIO_Port, FLASH_CS_Pin);
   //TODO:: вывести ошибку FLASH на экран, критичная неисправность
@@ -489,7 +489,7 @@ static void MX_DTS_Init(void)
   /* USER CODE END DTS_Init 1 */
   hdts.Instance = DTS;
   hdts.Init.QuickMeasure = DTS_QUICKMEAS_DISABLE;
-  hdts.Init.RefClock = DTS_REFCLKSEL_LSE;
+  hdts.Init.RefClock = DTS_REFCLKSEL_PCLK;
   hdts.Init.TriggerInput = DTS_TRIGGER_HW_NONE;
   hdts.Init.SamplingTime = DTS_SMP_TIME_15_CYCLE;
   hdts.Init.Divider = 0;

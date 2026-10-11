@@ -34,6 +34,8 @@ static uint16_t g_esp_uart_fwd_seq = 1u;
 static uint8_t g_rs_frag_id = 1u;
 static uint32_t g_journal_total = 0u;
 static uint32_t g_journal_selected = 0u;
+/* v3 JOURNAL_GET cursor — независимо на каждую панель. */
+static uint32_t s_v3_journal_selected[RS_PANEL_MAX_PANELS];
 static uint32_t g_journal_window_first = 0u;
 static uint8_t g_journal_window_size = 0u;
 static uint8_t g_journal_detail_open = 0u;
@@ -86,14 +88,49 @@ static uint8_t rs_panel_master_accept_menu_root_evt(void)
 }
 
 #define RS_PANEL_CAPS_RETRY_MS 50u
-#define RS_PANEL_ADDR_BOOT_DELAY_MS 2000u
-#define RS_PANEL_ADDR_DISCOVER_WINDOW_MS 700u
+/* Окно > max PanelCfg_DiscoverDelayMs (40..1040) + запас на TX (только коллизии). */
+#define RS_PANEL_ADDR_DISCOVER_WINDOW_MS 1500u
 #define RS_PANEL_ADDR_ASSIGN_GAP_MS 80u
 #define RS_PANEL_ADDR_SETTLE_MS 500u
+/* Не крутить DISCOVER по ACTIVITY-коллизии чаще: иначе POLL/WiFi ACTIVITY глушатся. */
+#define RS_PANEL_ADDR_COLLISION_COOLDOWN_MS 8000u
+/* Скан 1..MAX: адреса не захардкожены — любой набор до 8.
+ * Интервал ≈ turnaround: полный проход 8 addr ~0.3 с. */
+#define RS_PANEL_ADDR_SCAN_INTERVAL_MS 40u
 /* Синхронизация RTC панелей: не чаще 1 раза в 10 минут. */
 #define RS_PANEL_TIME_SYNC_PERIOD_MS (10u * 60u * 1000u)
+/* ПО (bus_monitor) держит панель только по ESP_UART ACTIVITY (~60 с таймаут).
+ * Панель больше не шлёт ACTIVITY сама — мастер запрашивает ACTIVITY_REQ (unicast)
+ * и синтезирует presence в WiFi из слотов с свежим last_rx. */
+#define RS_PANEL_WIFI_PRESENCE_PERIOD_MS 1500u
+#define RS_PANEL_WIFI_PRESENCE_ALIVE_MS  5000u
+/* Unicast ACTIVITY_REQ: 1 кадр/с RR по слотам (не голодать POLL). */
+#define RS_PANEL_ACTIVITY_REQ_PERIOD_MS 1000u
+/*
+ * Half-duplex: после TX не слать новый кадр, пока не придёт любой DIR=1
+ * или не истечёт окно. Без RecoverFromError/Abort в таймауте — только
+ * следующий SendFrame AbortReceive перед своим TX.
+ */
+/* Ответ панели: короткий RSP сразу, apply после. 40 мс — запас на half-duplex. */
+#define RS_PANEL_BUS_TURNAROUND_MS 40u
+/*
+ * Если у любого слота gap POLL ≥ этого — addr_scan/ACTIVITY/can_mirror откладываем.
+ */
+#define RS_PANEL_POLL_MAX_GAP_MS 120u
+/* При 2+ панелях мин. период POLL на слот (wall) — не долбить шину каждые 1 мс. */
+#define RS_PANEL_MULTI_POLL_MS 40u
 
 static uint32_t s_last_caps_req_ms = 0u;
+/* До этого tick не слать новый master TX (ждём RSP / turnaround). */
+static uint32_t s_bus_quiet_until_ms = 0u;
+static void rs_panel_master_arm_bus_quiet(uint32_t now_ms);
+static void rs_panel_master_clear_bus_quiet_from_rx(void);
+static uint8_t rs_panel_master_bus_is_quiet(RsPanelMaster *master, uint32_t now_ms);
+static void rs_panel_master_dbg_sync_rx_decode(RsPanelMaster *master);
+static uint8_t rs_panel_master_any_poll_due(RsPanelMaster *master, uint32_t now_ms);
+static uint8_t rs_panel_master_poll_starving(RsPanelMaster *master, uint32_t now_ms);
+/* CAPS retry per slot — глобальный s_last_caps_req_ms голодал 2-ю панель. */
+static uint32_t s_caps_req_ms[RS_PANEL_MAX_PANELS];
 static uint8_t g_block_zone_selected = 0u;
 static uint8_t g_connection_selected = 0u;
 
@@ -120,10 +157,19 @@ static RsPanelInjectQItem s_inject_q[RS_PANEL_INJECT_Q_DEPTH];
 static volatile uint8_t s_inject_q_head = 0u;
 static volatile uint8_t s_inject_q_tail = 0u;
 static volatile uint8_t s_inject_q_count = 0u;
-static volatile uint8_t s_inject_pause_poll = 0u;
 static uint32_t s_inject_pause_until_ms = 0u;
+/* Скан RS-адресов 1..MAX: probe POLL каждые 500 мс (2 addr/s). */
+static uint8_t s_addr_scan_next = 1u;
+static uint32_t s_addr_scan_next_ms = 0u;
+static uint8_t s_addr_scan_probe_addr = 0u;
 /* Запрос WiFi с RS (sniffer): не вызывать EspManager из UART RX IRQ. */
 static volatile uint8_t s_wifi_enable_req = 0u;
+static uint32_t s_wifi_presence_next_ms = 0u;
+static uint8_t s_wifi_presence_seq = 1u;
+/* ACTIVITY_REQ RR + срочный запрос UID после POLL-scan ADD без UID. */
+static uint32_t s_activity_req_next_ms = 0u;
+static uint8_t s_activity_req_rr_idx = 0u;
+static uint8_t s_activity_req_urgent_idx = 0xFFu;
 
 /* CAN→RS485 mirror (default OFF). Очередь полных BSU CAN (22 байта). */
 #define RS_PANEL_CAN_MIRROR_Q_DEPTH 64u
@@ -405,35 +451,15 @@ static void rs_panel_master_send_ui_nav_to_ready_panels(RsPanelMaster *master,
                                                          uint16_t screen_id,
                                                          uint8_t action)
 {
+    /* v3 smart-panel: навигацию экранов ведёт сама панель.
+     * Legacy UI_NAV (глупая панель) больше не шлём — забивал half-duplex. */
+    (void)action;
     if (master == 0u) {
         return;
     }
-
     g_ui_current_screen_id = screen_id;
-
-    uint8_t payload[5u];
-    RsPanelUiNavCmd nav_cmd = {
-        .screen_id = screen_id,
-        .action = action,
-        .param = 0u,
-    };
-    uint16_t payload_len = RsPanel_EncodeUiNavCmd(payload, sizeof(payload), &nav_cmd);
-    if (payload_len == 0u) {
+    if (RsPanelV3Master_IsV3PollActive() != 0u) {
         return;
-    }
-
-    for (uint8_t i = 0u; i < master->panel_count; i++) {
-        PanelState *panel = &master->panels[i];
-        if (panel->cfg.enabled == 0u || PanelState_IsReady(panel) == 0u) {
-            continue;
-        }
-        (void)RsBus_SendFrame(&master->bus,
-                               panel->cfg.addr,
-                               master->next_seq++,
-                               0u, /* flags: master->panel (no DIR) */
-                               RS_PANEL_CMD_UI_NAV,
-                               payload,
-                               payload_len);
     }
 }
 
@@ -741,6 +767,11 @@ static uint8_t rs_panel_master_send_ui_data_to_ready_panels(RsPanelMaster *maste
     uint8_t delivered = 0u;
 
     if (master == 0u || data == 0u || data_len == 0u) {
+        return 0u;
+    }
+    /* v3: UI_DATA (меню/warn/fire/…) — legacy dumb-panel; журнал идёт через v3 EVT. */
+    if (RsPanelV3Master_IsV3PollActive() != 0u) {
+        (void)sub_id;
         return 0u;
     }
 
@@ -1230,6 +1261,7 @@ static uint8_t rs_panel_master_send_leds_to_ready_panels(RsPanelMaster *master)
 
 static volatile uint8_t s_sound_push_pending = 0u;
 static volatile uint8_t s_led_push_pending = 0u;
+static volatile uint8_t s_connection_push_pending = 0u;
 /* Сколько тиков подряд ушли в SOUND/LED/UI без POLL (см. Process10ms). */
 static uint8_t s_nonpoll_streak = 0u;
 /* При удержании пусковых: чередование POLL↔LED/SOUND (POLL сбрасывает streak). */
@@ -1446,6 +1478,13 @@ static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
     s_panel_ui_resync_pending = 1u;
     /* Сразу после READY — RTC / LED / SOUND (UI WARN/FIRE — после логотипа). */
     s_last_time_sync_ms = 0u;
+    /* v3: legacy CMD_TIME не шлётся (IsV3PollActive==1) — сбросить per-panel TIME. */
+    {
+        uint8_t pi;
+        for (pi = 0u; pi < master->panel_count && pi < RS_PANEL_MAX_PANELS; pi++) {
+            RsPanelV3Master_ForceTimeSyncPanel(pi);
+        }
+    }
     /* Переслать SOUND только после реального reboot панели (uptime↓).
      * Краткий CAPS-флап не должен сбрасывать dedup — иначе duty рестартится. */
     if (s_force_sound_resync != 0u) {
@@ -1713,6 +1752,11 @@ static void rs_panel_master_handle_ui_events(RsPanelMaster *master,
     const RsPanelPollRsp *use = rsp;
 
     if (master == 0 || rsp == 0) {
+        return;
+    }
+    /* v3: меню/экраны на панели; master-driven UI_NAV/MENU_LIST — legacy «глупой» панели. */
+    if (RsPanelV3Master_IsV3PollActive() != 0u) {
+        (void)panel;
         return;
     }
 
@@ -2656,6 +2700,74 @@ static void rs_panel_forward_frame_to_esp(const RsBusFrameView *frame)
     (void)UartBridge_SendBsuPacket(BSU_PKT_TYPE_ESP_UART, g_esp_uart_fwd_seq++, raw, len);
 }
 
+/* Только WiFi/ПО — на RS не кладём (иначе лишний трафик/коллизии). */
+static void rs_panel_master_wifi_presence_tick(RsPanelMaster *master, uint32_t now_ms)
+{
+    uint8_t i;
+
+    if (master == 0 || Esp32_IsEnabled() == 0u || master->panel_count == 0u) {
+        return;
+    }
+    if (s_wifi_presence_next_ms != 0u &&
+        (int32_t)(now_ms - s_wifi_presence_next_ms) < 0) {
+        return;
+    }
+    s_wifi_presence_next_ms = now_ms + RS_PANEL_WIFI_PRESENCE_PERIOD_MS;
+
+    for (i = 0u; i < master->panel_count; i++) {
+        PanelState *panel = &master->panels[i];
+        RsPanelActivity act;
+        uint8_t payload[RS_PANEL_ACTIVITY_PAYLOAD_SIZE_UID];
+        uint16_t plen;
+        RsBusFrameView view;
+
+        if (panel->cfg.enabled == 0u || panel->cfg.addr == 0u) {
+            continue;
+        }
+        if (panel->last_rx_ms == 0u ||
+            (now_ms - panel->last_rx_ms) > RS_PANEL_WIFI_PRESENCE_ALIVE_MS) {
+            continue;
+        }
+
+        memset(&act, 0, sizeof(act));
+        act.dev_type = (uint8_t)DEVICE_PANEL_TYPE;
+        if (panel->caps_valid != 0u) {
+            act.fw_ver = panel->caps.fw_ver;
+            /* Как панель: ACTIVITY.hw_id = формфактор PANEL_TYPE_1/2/3. */
+            act.hw_id = (uint16_t)panel->caps.ui_profile;
+            if (act.hw_id == 0u) {
+                act.hw_id = panel->caps.hw_id;
+            }
+            act.status = panel->caps.status;
+        }
+        if (panel->uptime_valid != 0u) {
+            act.uptime_sec = panel->last_uptime_sec;
+        }
+        if (panel->uid_valid != 0u) {
+            act.uid0 = panel->uid0;
+            act.uid1 = panel->uid1;
+            act.uid2 = panel->uid2;
+            act.uid_valid = 1u;
+        }
+
+        plen = RsPanel_EncodeActivity(payload, (uint16_t)sizeof(payload), &act);
+        if (plen < RS_PANEL_ACTIVITY_PAYLOAD_SIZE) {
+            continue;
+        }
+
+        view.addr = panel->cfg.addr;
+        view.seq = s_wifi_presence_seq++;
+        if (s_wifi_presence_seq == 0u) {
+            s_wifi_presence_seq = 1u;
+        }
+        view.flags = (uint8_t)RS_BUS_FLAG_DIR;
+        view.cmd = (uint8_t)RS_PANEL_RSP_ACTIVITY;
+        view.payload_len = plen;
+        view.payload = payload;
+        rs_panel_forward_frame_to_esp(&view);
+    }
+}
+
 static uint8_t rs_panel_uid_eq(uint32_t a0, uint32_t a1, uint32_t a2,
                                uint32_t b0, uint32_t b1, uint32_t b2)
 {
@@ -2787,41 +2899,106 @@ static void rs_panel_master_plan_assigns(RsPanelMaster *master)
     }
 }
 
+static void rs_panel_master_prune_dead_slots(RsPanelMaster *master);
+
+/* ADD-only: новый слот или привязка UID к пустому слоту того же addr. */
+static uint8_t rs_panel_master_add_or_bind_panel(RsPanelMaster *master,
+                                                uint8_t addr,
+                                                uint32_t uid0,
+                                                uint32_t uid1,
+                                                uint32_t uid2,
+                                                uint8_t uid_valid)
+{
+    uint8_t i;
+    uint8_t addr_slot = 0xFFu;
+
+    if (master == 0 || addr < 1u || addr > RS_PANEL_MAX_PANELS) {
+        return 0xFFu;
+    }
+    for (i = 0u; i < master->panel_count; i++) {
+        PanelState *panel = &master->panels[i];
+        if (uid_valid != 0u && panel->uid_valid != 0u &&
+            rs_panel_uid_eq(panel->uid0, panel->uid1, panel->uid2,
+                            uid0, uid1, uid2) != 0u) {
+            if (panel->cfg.addr != addr) {
+                panel->cfg.addr = addr;
+                RsPanelV3Master_RequestCatalogResyncPanel(i);
+            }
+            return i;
+        }
+        if (panel->cfg.addr == addr) {
+            addr_slot = i;
+        }
+    }
+    if (addr_slot != 0xFFu) {
+        PanelState *slot = &master->panels[addr_slot];
+        if (slot->uid_valid == 0u && uid_valid != 0u) {
+            slot->uid0 = uid0;
+            slot->uid1 = uid1;
+            slot->uid2 = uid2;
+            slot->uid_valid = 1u;
+            RsPanelV3Master_RequestCatalogResyncPanel(addr_slot);
+        }
+        return addr_slot;
+    }
+    if (master->panel_count >= RS_PANEL_MAX_PANELS) {
+        return 0xFFu;
+    }
+    {
+        PanelConfig cfg;
+        uint8_t n = master->panel_count;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.enabled = 1u;
+        cfg.addr = addr;
+        cfg.role = (n == 0u) ? RS_PANEL_ROLE_PRIMARY : RS_PANEL_ROLE_NORMAL;
+        /* 1 панель: poll_ms=1; 2+: 40 мс — иначе RR+turnaround всё равно ~50+ мс. */
+        /* Даже 1 панель: MULTI_POLL — иначе poll_ms=1 вечно due и душит scan. */
+        cfg.poll_ms = RS_PANEL_MULTI_POLL_MS;
+        cfg.expected_hw_id = 0u;
+        PanelState_Reset(&master->panels[n]);
+        PanelState_BindConfig(&master->panels[n], &cfg);
+        if (uid_valid != 0u) {
+            master->panels[n].uid0 = uid0;
+            master->panels[n].uid1 = uid1;
+            master->panels[n].uid2 = uid2;
+            master->panels[n].uid_valid = 1u;
+        }
+        master->panel_count = (uint8_t)(n + 1u);
+        if (master->panel_count >= 2u) {
+            uint8_t pi;
+            for (pi = 0u; pi < master->panel_count; pi++) {
+                if (master->panels[pi].cfg.poll_ms < RS_PANEL_MULTI_POLL_MS) {
+                    master->panels[pi].cfg.poll_ms = RS_PANEL_MULTI_POLL_MS;
+                }
+            }
+        }
+        RsPanelV3Master_RequestCatalogResyncPanel(n);
+        /* TIME в ближайшем RR POLL — иначе панель сидит на 00:00 после ADD. */
+        RsPanelV3Master_ForceTimeSyncPanel(n);
+        g_rs_master_dbg.addr_scan_found++;
+        return n;
+    }
+}
+
+/* После collision ASSIGN: обновить addr по UID / ADD — без PanelState_Reset известных. */
 static void rs_panel_master_apply_discovered_panels(RsPanelMaster *master)
 {
     uint8_t i;
-    uint8_t n = 0u;
 
     if (master == 0) {
         return;
     }
-    for (i = 0u; i < master->discover_count && n < RS_PANEL_MAX_PANELS; i++) {
-        PanelConfig cfg;
+    for (i = 0u; i < master->discover_count; i++) {
         RsPanelDiscoverEntry *e = &master->discover[i];
-
         if (e->assigned_addr == 0u) {
             continue;
         }
-        memset(&cfg, 0, sizeof(cfg));
-        cfg.enabled = 1u;
-        cfg.addr = e->assigned_addr;
-        cfg.role = (n == 0u) ? RS_PANEL_ROLE_PRIMARY : RS_PANEL_ROLE_NORMAL;
-        cfg.poll_ms = 1u; /* TIM3@2кГц, POLL не чаще 1 мс (half-duplex) */
-        cfg.expected_hw_id = 0u;
-        PanelState_Reset(&master->panels[n]);
-        PanelState_BindConfig(&master->panels[n], &cfg);
-        master->panels[n].uid0 = e->uid0;
-        master->panels[n].uid1 = e->uid1;
-        master->panels[n].uid2 = e->uid2;
-        master->panels[n].uid_valid = 1u;
-        n++;
+        (void)rs_panel_master_add_or_bind_panel(master,
+                                                e->assigned_addr,
+                                                e->uid0, e->uid1, e->uid2,
+                                                1u);
     }
-    if (n == 0u) {
-        /* Нет ответов — оставляем дефолт addr=1. */
-        return;
-    }
-    master->panel_count = n;
-    master->round_robin_idx = 0u;
+    rs_panel_master_prune_dead_slots(master);
 }
 
 static void rs_panel_master_start_discover(RsPanelMaster *master, uint32_t now_ms)
@@ -2842,14 +3019,198 @@ static void rs_panel_master_start_discover(RsPanelMaster *master, uint32_t now_m
                           0u);
 }
 
-static void rs_panel_master_send_next_assign(RsPanelMaster *master, uint32_t now_ms)
+/* Слоты только по RSP (ADD). Пустые addr в таблице не держим — нечего prune.
+ * Известный addr (даже offline) оставляем в RR: reconnect без ожидания scan. */
+static void rs_panel_master_prune_dead_slots(RsPanelMaster *master)
+{
+    (void)master;
+}
+
+/* Подхватить новые UID из discover[] (collision DISCOVER) — ADD-only. */
+static void rs_panel_master_adopt_new_from_discover(RsPanelMaster *master)
+{
+    uint8_t di;
+
+    if (master == 0) {
+        return;
+    }
+    for (di = 0u; di < master->discover_count; di++) {
+        RsPanelDiscoverEntry *e = &master->discover[di];
+        uint8_t cur = e->current_addr;
+        if (cur < 1u || cur > RS_PANEL_MAX_PANELS) {
+            continue;
+        }
+        (void)rs_panel_master_add_or_bind_panel(master, cur,
+                                                e->uid0, e->uid1, e->uid2, 1u);
+    }
+    rs_panel_master_prune_dead_slots(master);
+}
+
+/*
+ * Скан адресов 1..MAX @ 2 addr/s. Известный addr — не крадём тик (RR POLL).
+ * Неизвестный — короткий SYS POLL; RSP → ADD слот. Не паузит POLL известных
+ * кроме этого одного half-duplex тика.
+ * Возвращает 1, если в этом тике ушёл TX probe.
+ */
+static uint8_t rs_panel_master_addr_scan_tick(RsPanelMaster *master, uint32_t now_ms)
+{
+    uint8_t addr;
+    uint8_t i;
+    uint8_t try_n;
+    uint8_t payload[8];
+
+    if (master == 0) {
+        return 0u;
+    }
+    if (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE ||
+        master->collision_pending != 0u) {
+        return 0u;
+    }
+    if (master->panel_count >= RS_PANEL_MAX_PANELS) {
+        return 0u; /* все 8 слотов заняты — сканировать нечего */
+    }
+    if (s_addr_scan_next_ms != 0u &&
+        (int32_t)(now_ms - s_addr_scan_next_ms) < 0) {
+        return 0u;
+    }
+
+    /* Пропуск известных addr в том же тике — не ждать INTERVAL×N. */
+    for (try_n = 0u; try_n < RS_PANEL_MAX_PANELS; try_n++) {
+        uint8_t known = 0u;
+
+        addr = s_addr_scan_next;
+        if (addr < 1u || addr > RS_PANEL_MAX_PANELS) {
+            addr = 1u;
+        }
+        s_addr_scan_next = (uint8_t)(addr + 1u);
+        if (s_addr_scan_next > RS_PANEL_MAX_PANELS) {
+            s_addr_scan_next = 1u;
+        }
+        g_rs_master_dbg.addr_scan_next = s_addr_scan_next;
+
+        for (i = 0u; i < master->panel_count; i++) {
+            if (master->panels[i].cfg.addr == addr) {
+                known = 1u;
+                break;
+            }
+        }
+        if (known != 0u) {
+            continue; /* RR POLL обслужит — ищем следующий неизвестный */
+        }
+
+        /* Реальные SYS flags (в т.ч. READY). Панель не сбрасывает READY на
+         * SYS-only probe с flags=0; после ADD RR POLL несёт TIME. */
+        {
+            uint16_t plen = RsPanelV3Master_EncodeSysOnlyPoll(payload, sizeof(payload));
+            if (plen == 0u) {
+                continue;
+            }
+            s_addr_scan_next_ms = now_ms + RS_PANEL_ADDR_SCAN_INTERVAL_MS;
+            s_addr_scan_probe_addr = addr;
+            g_rs_master_dbg.addr_scan_probe_addr = addr;
+            g_rs_master_dbg.addr_scan_tx++;
+            (void)RsBus_SendFrame(&master->bus,
+                                  addr,
+                                  master->next_seq++,
+                                  0u,
+                                  RS_PANEL_CMD_POLL,
+                                  payload,
+                                  plen);
+        }
+        rs_panel_master_arm_bus_quiet(now_ms);
+        return 1u;
+    }
+
+    /* Все addr 1..MAX уже в слотах. */
+    s_addr_scan_next_ms = now_ms + RS_PANEL_ADDR_SCAN_INTERVAL_MS;
+    return 0u;
+}
+
+/*
+ * Unicast ACTIVITY_REQ: 1 кадр/~1 с RR по известным слотам.
+ * Приоритет — слоты без UID (hot-plug после POLL-scan ADD).
+ * Не broadcast. Возвращает 1, если TX ушёл в этом тике.
+ */
+static uint8_t rs_panel_master_activity_req_tick(RsPanelMaster *master, uint32_t now_ms)
+{
+    uint8_t i;
+    uint8_t chosen = 0xFFu;
+    PanelState *panel;
+
+    if (master == 0 || master->panel_count == 0u) {
+        return 0u;
+    }
+
+    /* Срочный bind UID после ADD без UID — один кадр, не шторм. */
+    if (s_activity_req_urgent_idx < master->panel_count) {
+        chosen = s_activity_req_urgent_idx;
+        s_activity_req_urgent_idx = 0xFFu;
+    } else {
+        if (s_activity_req_next_ms != 0u &&
+            (int32_t)(now_ms - s_activity_req_next_ms) < 0) {
+            return 0u;
+        }
+        /* Сначала слоты без UID. */
+        for (i = 0u; i < master->panel_count; i++) {
+            uint8_t idx =
+                (uint8_t)((s_activity_req_rr_idx + i) % master->panel_count);
+            PanelState *cand = &master->panels[idx];
+            if (cand->cfg.enabled == 0u || cand->cfg.addr == 0u) {
+                continue;
+            }
+            if (cand->uid_valid == 0u) {
+                chosen = idx;
+                break;
+            }
+        }
+        if (chosen == 0xFFu) {
+            for (i = 0u; i < master->panel_count; i++) {
+                uint8_t idx =
+                    (uint8_t)((s_activity_req_rr_idx + i) % master->panel_count);
+                PanelState *cand = &master->panels[idx];
+                if (cand->cfg.enabled == 0u || cand->cfg.addr == 0u) {
+                    continue;
+                }
+                chosen = idx;
+                break;
+            }
+        }
+        if (chosen == 0xFFu) {
+            s_activity_req_next_ms = now_ms + RS_PANEL_ACTIVITY_REQ_PERIOD_MS;
+            return 0u;
+        }
+        s_activity_req_rr_idx = (uint8_t)((chosen + 1u) % master->panel_count);
+    }
+
+    panel = &master->panels[chosen];
+    if (panel->cfg.enabled == 0u || panel->cfg.addr == 0u) {
+        return 0u;
+    }
+    /* Всегда ставить период (в т.ч. urgent). Иначе next_ms==0 → ACTIVITY каждый
+     * тик Process10ms (~2 кГц) и POLL голодает → «НЕТ СВЯЗИ» на панели. */
+    s_activity_req_next_ms = now_ms + RS_PANEL_ACTIVITY_REQ_PERIOD_MS;
+    g_rs_master_dbg.activity_req_tx++;
+    g_rs_master_dbg.activity_req_addr = panel->cfg.addr;
+    (void)RsBus_SendFrame(&master->bus,
+                          panel->cfg.addr,
+                          master->next_seq++,
+                          0u,
+                          RS_PANEL_CMD_ACTIVITY_REQ,
+                          0,
+                          0u);
+    rs_panel_master_arm_bus_quiet(now_ms);
+    return 1u;
+}
+
+/* 1 = TX ASSIGN ушёл; 0 = только переход в SETTLE (без TX). */
+static uint8_t rs_panel_master_send_next_assign(RsPanelMaster *master, uint32_t now_ms)
 {
     uint8_t payload[RS_PANEL_ASSIGN_BY_UID_SIZE];
     uint16_t len;
     RsPanelAssignByUidCmd cmd;
 
     if (master == 0) {
-        return;
+        return 0u;
     }
     while (master->addr_assign_idx < master->discover_count) {
         RsPanelDiscoverEntry *e = &master->discover[master->addr_assign_idx];
@@ -2878,68 +3239,68 @@ static void rs_panel_master_send_next_assign(RsPanelMaster *master, uint32_t now
                               payload,
                               len);
         master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_ASSIGN_GAP_MS;
-        return;
+        return 1u;
     }
     rs_panel_master_apply_discovered_panels(master);
     master->addr_fsm = RS_PANEL_ADDR_FSM_SETTLE;
     master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_SETTLE_MS;
     master->first_boot_discover_done = 1u;
+    return 0u;
 }
 
-static void rs_panel_master_addr_fsm_tick(RsPanelMaster *master, uint32_t now_ms)
+/* 1 = в этом тике ушёл TX (DISCOVER/ASSIGN) — не слать POLL в том же тике. */
+static uint8_t rs_panel_master_addr_fsm_tick(RsPanelMaster *master, uint32_t now_ms)
 {
     if (master == 0) {
-        return;
+        return 0u;
     }
 
     if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
         if (master->collision_pending != 0u) {
+            if (master->last_addr_cycle_ms != 0u &&
+                (int32_t)(now_ms - master->last_addr_cycle_ms) <
+                    (int32_t)RS_PANEL_ADDR_COLLISION_COOLDOWN_MS) {
+                /* Cooldown: POLL идёт, ACTIVITY видна по WiFi. */
+                return 0u;
+            }
             rs_panel_master_start_discover(master, now_ms);
-            return;
+            return 1u;
         }
-        if (master->first_boot_discover_done == 0u) {
-            master->addr_fsm = RS_PANEL_ADDR_FSM_WAIT_BOOT;
-            master->addr_fsm_deadline_ms = now_ms + RS_PANEL_ADDR_BOOT_DELAY_MS;
-        }
-        return;
+        /* first_boot: Init ставит done=1 — WAIT_BOOT/DISCOVER не гейтят шину.
+         * Новые панели: addr_scan 1..MAX + ACTIVITY ADD-only (не periodic DISCOVER). */
+        return 0u;
     }
 
     if ((int32_t)(now_ms - master->addr_fsm_deadline_ms) < 0) {
-        return;
+        return 0u;
     }
 
     switch (master->addr_fsm) {
     case RS_PANEL_ADDR_FSM_WAIT_BOOT:
         rs_panel_master_start_discover(master, now_ms);
-        break;
+        return 1u;
     case RS_PANEL_ADDR_FSM_DISCOVER:
         if (master->discover_count == 0u) {
-            /* Уже есть панель из LoadDefaultConfig — не крутить discover вечно:
-             * иначе POLL/SYS_READY не идут и на OLED минутами «ПРОВЕРКА». */
-            if (master->panel_count > 0u) {
-                master->first_boot_discover_done = 1u;
-                master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
-                break;
-            }
-            /* Панели ещё не ответили — повторить через 3 с. */
-            master->addr_fsm = RS_PANEL_ADDR_FSM_WAIT_BOOT;
-            master->addr_fsm_deadline_ms = now_ms + 3000u;
-            break;
+            /* Пустой DISCOVER — IDLE. Повтор только по collision_pending. */
+            master->first_boot_discover_done = 1u;
+            master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
+            master->last_addr_cycle_ms = now_ms;
+            return 0u;
         }
         rs_panel_master_plan_assigns(master);
         master->addr_fsm = RS_PANEL_ADDR_FSM_ASSIGN;
         master->addr_assign_idx = 0u;
-        rs_panel_master_send_next_assign(master, now_ms);
-        break;
+        return rs_panel_master_send_next_assign(master, now_ms);
     case RS_PANEL_ADDR_FSM_ASSIGN:
-        rs_panel_master_send_next_assign(master, now_ms);
-        break;
+        return rs_panel_master_send_next_assign(master, now_ms);
     case RS_PANEL_ADDR_FSM_SETTLE:
         master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
-        break;
+        master->last_addr_cycle_ms = now_ms;
+        return 0u;
     default:
         master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
-        break;
+        master->last_addr_cycle_ms = now_ms;
+        return 0u;
     }
 }
 
@@ -2972,7 +3333,9 @@ static void rs_panel_master_on_activity_uid(RsPanelMaster *master,
         }
         if (rs_panel_uid_eq(panel->uid0, panel->uid1, panel->uid2,
                             act->uid0, act->uid1, act->uid2) == 0u) {
-            /* Тот же addr, другой UID — коллизия. */
+            /* Тот же addr, другой UID — коллизия: сбросить UID слота и
+             * перезапустить DISCOVER (v3: POLL не паузим — см. Process10ms). */
+            panel->uid_valid = 0u;
             if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
                 master->collision_pending = 1u;
             }
@@ -2981,19 +3344,50 @@ static void rs_panel_master_on_activity_uid(RsPanelMaster *master,
         return;
     }
 
-    /* ACTIVITY с известным addr слота нет, но UID уже есть в другом слоте — ок.
-     * ACTIVITY на addr, которого нет в конфиге: запомним коллизию/новое устройство. */
+    /* ACTIVITY на addr, которого нет в слотах. */
     (void)matched;
-    if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
-        for (i = 0u; i < master->panel_count; i++) {
-            PanelState *panel = &master->panels[i];
-            if (panel->uid_valid != 0u &&
-                rs_panel_uid_eq(panel->uid0, panel->uid1, panel->uid2,
-                                act->uid0, act->uid1, act->uid2) != 0u) {
-                /* UID уже известен — возможно после assign ещё старый кадр. */
-                return;
+    if (frame_addr < 1u || frame_addr > RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    /* PROFILE_SET сменил RS-addr: тот же UID, новый addr — перенести слот. */
+    for (i = 0u; i < master->panel_count; i++) {
+        PanelState *panel = &master->panels[i];
+        uint8_t j;
+        uint8_t addr_taken = 0u;
+
+        if (panel->uid_valid == 0u ||
+            rs_panel_uid_eq(panel->uid0, panel->uid1, panel->uid2,
+                            act->uid0, act->uid1, act->uid2) == 0u) {
+            continue;
+        }
+        if (panel->cfg.addr == frame_addr) {
+            return;
+        }
+        for (j = 0u; j < master->panel_count; j++) {
+            if (j != i && master->panels[j].cfg.addr == frame_addr) {
+                addr_taken = 1u;
+                break;
             }
         }
+        if (addr_taken != 0u) {
+            if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
+                master->collision_pending = 1u;
+            }
+            return;
+        }
+        panel->cfg.addr = frame_addr;
+        RsPanelV3Master_RequestCatalogResyncPanel(i);
+        return;
+    }
+
+    /* Неизвестный addr / UID: ADD-only (скан + ACTIVITY hot-plug). */
+    if (rs_panel_master_add_or_bind_panel(master, frame_addr,
+                                         act->uid0, act->uid1, act->uid2,
+                                         1u) != 0xFFu) {
+        rs_panel_master_prune_dead_slots(master);
+        return;
+    }
+    if (master->addr_fsm == RS_PANEL_ADDR_FSM_IDLE) {
         master->collision_pending = 1u;
     }
 }
@@ -3038,6 +3432,8 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
         return;
     }
     g_rs_master_dbg.rx_frames_ok++;
+    /* RSP ожидаемого addr — линия свободна раньше turnaround. */
+    rs_panel_master_clear_bus_quiet_from_rx();
 
     /* Прокидка в WiFi/ПО: activity + ответы boot-команд (тот же addr панели). */
     if (rs_panel_should_forward_to_host(frame) != 0u) {
@@ -3047,6 +3443,7 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
     if (frame->cmd == RS_PANEL_RSP_DISCOVER) {
         RsPanelDiscoverRsp drsp;
         if (RsPanel_DecodeDiscoverRsp(frame->payload, frame->payload_len, &drsp) != 0u) {
+            /* Только во время collision DISCOVER FSM. */
             if (master->addr_fsm == RS_PANEL_ADDR_FSM_DISCOVER) {
                 rs_panel_master_discover_add(master, &drsp);
             }
@@ -3061,12 +3458,16 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
         }
     }
 
-    for (i = 0u; i < master->panel_count; i++) {
+    {
+        uint8_t matched = 0u;
+
+        for (i = 0u; i < master->panel_count; i++) {
         PanelState *panel = &master->panels[i];
         if (panel->cfg.addr != frame->addr) {
             g_rs_master_dbg.rx_frames_wrong_addr++;
             continue;
         }
+        matched = 1u;
 
         if (frame->cmd == RS_PANEL_RSP_CAPS) {
             RsPanelCaps caps;
@@ -3133,6 +3534,8 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                     panel->link_state = PANEL_LINK_CAPS_PENDING;
                     panel->caps_valid = 0u;
                     s_force_sound_resync = 1u;
+                    /* Панель сбросила RTC — TIME в ближайших POLL, не ждать PERIOD. */
+                    RsPanelV3Master_ForceTimeSyncPanel(i);
                 }
                 panel->last_uptime_sec = act.uptime_sec;
                 panel->uptime_valid = 1u;
@@ -3140,26 +3543,53 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
         }
         break;
     }
+
+        /* Скан: RSP_POLL с неизвестного addr 1..MAX → ADD слот + каталог. */
+        if (matched == 0u && frame->cmd == RS_PANEL_RSP_POLL &&
+            frame->addr >= 1u && frame->addr <= RS_PANEL_MAX_PANELS) {
+            uint8_t idx = rs_panel_master_add_or_bind_panel(master, frame->addr,
+                                                           0u, 0u, 0u, 0u);
+            if (idx != 0xFFu) {
+                PanelState *panel = &master->panels[idx];
+                g_rs_master_dbg.rsp_poll_rx++;
+                panel->last_rx_ms = HAL_GetTick();
+                s_v3_poll_seen[idx] = 1u;
+                /* POLL-scan ADD без UID — срочный ACTIVITY_REQ для bind UID. */
+                if (panel->uid_valid == 0u) {
+                    s_activity_req_urgent_idx = idx;
+                }
+                if (frame->payload_len > 0u &&
+                    frame->payload[0] == RS_PANEL_V3_VERSION) {
+                    RsPanelV3Rsp v3rsp;
+                    if (panel->link_state == PANEL_LINK_CAPS_PENDING &&
+                        panel->caps_valid != 0u) {
+                        panel->link_state = PANEL_LINK_READY;
+                    }
+                    if (RsPanelV3_DecodeRsp(frame->payload, frame->payload_len,
+                                            &v3rsp) != 0u) {
+                        RsPanelV3Master_OnRsp(idx, &v3rsp, HAL_GetTick());
+                    }
+                }
+                if (s_addr_scan_probe_addr == frame->addr) {
+                    s_addr_scan_probe_addr = 0u;
+                }
+            }
+        }
+    }
 }
 
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master)
 {
-    PanelConfig cfg;
-
     if (master == 0) {
         return;
     }
-
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.enabled = 1u;
-    cfg.addr = 0x01u;
-    cfg.role = RS_PANEL_ROLE_PRIMARY;
-    cfg.poll_ms = 1u; /* TIM3@2кГц, POLL не чаще 1 мс (half-duplex) */
-    cfg.expected_hw_id = 0u;
-
-    master->panel_count = 1u;
-    PanelState_Reset(&master->panels[0]);
-    PanelState_BindConfig(&master->panels[0], &cfg);
+    /*
+     * Адреса не захардкожены: любой набор 1..MAX (до 8).
+     * Слоты создаёт только RSP (addr_scan / ACTIVITY / DISCOVER) → ADD.
+     * RR POLL — только живые слоты; пустые addr не занимают шину.
+     */
+    master->panel_count = 0u;
+    master->round_robin_idx = 0u;
 }
 
 void RsPanelMaster_Init(RsPanelMaster *master,
@@ -3173,13 +3603,23 @@ void RsPanelMaster_Init(RsPanelMaster *master,
     memset(master, 0, sizeof(*master));
     master->next_seq = 1u;
     master->addr_fsm = RS_PANEL_ADDR_FSM_IDLE;
-    master->first_boot_discover_done = 0u;
+    /* Скан адресов с первого тика; collision DISCOVER — только в фоне. */
+    master->first_boot_discover_done = 1u;
     RsBus_Init(&master->bus, uart, de_port, de_pin, rs_panel_master_on_frame, master);
     RsPanelMaster_LoadDefaultConfig(master);
     g_active_master = master;
     memset(s_v3_poll_seen, 0, sizeof(s_v3_poll_seen));
     RsPanelV3Master_Init();
     RsPanelV3Master_OnBoot(HAL_GetTick());
+    s_addr_scan_next = 1u;
+    s_addr_scan_next_ms = 0u;
+    s_addr_scan_probe_addr = 0u;
+    s_wifi_presence_next_ms = 0u;
+    s_wifi_presence_seq = 1u;
+    s_activity_req_next_ms = 0u;
+    s_activity_req_rr_idx = 0u;
+    s_activity_req_urgent_idx = 0xFFu;
+    s_bus_quiet_until_ms = 0u;
 }
 
 void RsPanelMaster_PushSound(void)
@@ -3210,6 +3650,11 @@ void RsPanelMaster_InvalidateSoundDedup(void)
 void RsPanelMaster_PushLeds(void)
 {
     s_led_push_pending = 1u;
+}
+
+void RsPanelMaster_PushConnectionStatus(void)
+{
+    s_connection_push_pending = 1u;
 }
 
 void RsPanelMaster_OnStartAllHoldBegin(void)
@@ -3285,6 +3730,53 @@ void RsPanelMaster_PushCanMirrorBsu(const uint8_t *bsu_pkt, uint16_t len)
     __set_PRIMASK(primask);
 }
 
+static void rs_panel_master_arm_bus_quiet(uint32_t now_ms)
+{
+    s_bus_quiet_until_ms = now_ms + RS_PANEL_BUS_TURNAROUND_MS;
+}
+
+static void rs_panel_master_clear_bus_quiet_from_rx(void)
+{
+    /* Любой DIR=1 (в т.ч. до match слота) — линия свободна. */
+    if (s_bus_quiet_until_ms == 0u) {
+        return;
+    }
+    s_bus_quiet_until_ms = 0u;
+    g_rs_master_dbg.bus_quiet_cleared_rx++;
+}
+
+static uint8_t rs_panel_master_bus_is_quiet(RsPanelMaster *master, uint32_t now_ms)
+{
+    (void)master;
+    if (s_bus_quiet_until_ms == 0u) {
+        return 0u;
+    }
+    if ((int32_t)(now_ms - s_bus_quiet_until_ms) < 0) {
+        return 1u;
+    }
+    /* Таймаут: НЕ Abort/Recover — только снять флаг. IRQ RX продолжает
+     * копить кадр; следующий SendFrame AbortReceive только перед своим TX. */
+    g_rs_master_dbg.bus_quiet_timeout_flush++;
+    s_bus_quiet_until_ms = 0u;
+    return 0u;
+}
+
+static void rs_panel_master_dbg_sync_rx_decode(RsPanelMaster *master)
+{
+    if (master == 0) {
+        return;
+    }
+    g_rs_master_dbg.rx_decode_crc_fail = master->bus.rx_decode_crc_fail;
+    g_rs_master_dbg.rx_decode_bad_hdr = master->bus.rx_decode_bad_hdr;
+    g_rs_master_dbg.rx_decode_short_hold = master->bus.rx_decode_short_hold;
+    g_rs_master_dbg.rx_resync_bytes = master->bus.rx_resync_bytes;
+    g_rs_master_dbg.rx_err_count = master->bus.rx_err_count;
+    g_rs_master_dbg.rx_last_err_code = master->bus.rx_last_err_code;
+    g_rs_master_dbg.rx_rearm_wd = master->bus.rx_rearm_wd;
+}
+
+/* POLL due: все enabled (не только READY). Иначе CAPS_PENDING → ACTIVITY
+ * съедает тики, пока v3-POLL ещё нужен для SYS/каталога. */
 static uint8_t rs_panel_master_any_poll_due(RsPanelMaster *master, uint32_t now_ms)
 {
     uint8_t i;
@@ -3293,10 +3785,43 @@ static uint8_t rs_panel_master_any_poll_due(RsPanelMaster *master, uint32_t now_
     }
     for (i = 0u; i < master->panel_count; i++) {
         PanelState *p = &master->panels[i];
-        if (p->cfg.enabled == 0u || PanelState_IsReady(p) == 0u) {
+        if (p->cfg.enabled == 0u || p->cfg.addr == 0u) {
             continue;
         }
-        if ((now_ms - p->last_poll_ms) >= p->cfg.poll_ms) {
+        if (p->last_poll_ms == 0u ||
+            (now_ms - p->last_poll_ms) >= p->cfg.poll_ms) {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+/* 1 = POLL голодает: нельзя отдавать тик скану/ACTIVITY/mirror. */
+static uint8_t rs_panel_master_poll_starving(RsPanelMaster *master, uint32_t now_ms)
+{
+    uint8_t i;
+    if (master == 0) {
+        return 0u;
+    }
+    for (i = 0u; i < master->panel_count; i++) {
+        PanelState *p = &master->panels[i];
+        uint32_t gap;
+        if (p->cfg.enabled == 0u || p->cfg.addr == 0u) {
+            continue;
+        }
+        if (p->last_poll_ms == 0u) {
+            return 1u;
+        }
+        gap = now_ms - p->last_poll_ms;
+        if (i < 8u) {
+            g_rs_master_dbg.poll_gap_ms_by_panel[i] = (uint16_t)((gap > 0xFFFFu) ? 0xFFFFu : gap);
+            if (g_rs_master_dbg.poll_gap_ms_by_panel[i] >
+                g_rs_master_dbg.poll_gap_max_ms_by_panel[i]) {
+                g_rs_master_dbg.poll_gap_max_ms_by_panel[i] =
+                    g_rs_master_dbg.poll_gap_ms_by_panel[i];
+            }
+        }
+        if (gap >= RS_PANEL_POLL_MAX_GAP_MS) {
             return 1u;
         }
     }
@@ -3339,15 +3864,20 @@ void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_
         return;
     }
     RsBus_ProcessRxBytes(&master->bus, data, len);
+    rs_panel_master_dbg_sync_rx_decode(master);
 }
 
 static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cmd)
 {
-    uint32_t add_ms = 2000u;
+    uint32_t add_ms = 0u;
 
-    /* Во время erase слова 0 бутлоадер занят десятки секунд. Если за это время
-     * снова пойдёт POLL — RX-кольцо панели забьётся, ACK пропадут. */
+    /* Только команды прошивки/бутлоадера требуют тишины POLL.
+     * РАНЬШЕ: любой InjectRawRsFrame ставил s_inject_pause_poll, а Process10ms
+     * всегда вызывал extend(BOOT_SET_UPD_WORD) → 45 с без POLL даже для
+     * PROFILE_SET / GET_VERSION → «нет связи» после проверки (~15 с AFTER_OK),
+     * восстановление через ~45–90 с. */
     if (cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD) {
+        /* erase слова 0 — десятки секунд; POLL забивает RX бутлоадера. */
         add_ms = 45000u;
     } else if (cmd == RS_PANEL_CMD_ENTER_BOOTLOADER) {
         add_ms = 5000u;
@@ -3356,6 +3886,9 @@ static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cm
     } else if (cmd == RS_PANEL_CMD_BOOT_GET_VERSION ||
                cmd == RS_PANEL_CMD_BOOT_RESET_MCU) {
         add_ms = 2000u;
+    } else {
+        /* PROFILE_SET и пр.: только skip POLL в тике TX очереди, без паузы. */
+        return;
     }
     {
         uint32_t until = now_ms + add_ms;
@@ -3364,7 +3897,9 @@ static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cm
             s_inject_pause_until_ms = until;
         }
     }
-    s_inject_pause_poll = 0u;
+    g_rs_master_dbg.inject_pause_until_ms = s_inject_pause_until_ms;
+    g_rs_master_dbg.inject_pause_armed_count++;
+    g_rs_master_dbg.last_inject_pause_cmd = cmd;
 }
 
 static void rs_panel_master_inject_process_pending(RsPanelMaster *master, uint32_t now_ms)
@@ -3412,37 +3947,86 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         EspManager_RequestWifiEnable();
     }
 
-    /* Без панелей всё равно можно сливать CAN-зеркало на RS (sniffer). */
+    RsBus_RxWatchdog(&master->bus);
+
+    /* Presence в ПО — до early-return (inject/addr_scan), не зависит от RS TX. */
+    rs_panel_master_wifi_presence_tick(master, now_ms);
+
+    /* Fallback: seed пуст — только POLL-scan 1..MAX. Один TX → quiet → ждём RSP.
+     * IRQ RX не трогаем (нет Abort/Recover в quiet). can_mirror не режем RSP. */
     if (master->panel_count == 0u) {
-        if (s_can_mirror_enable != 0u && s_can_mirror_q_count != 0u) {
-            (void)rs_panel_master_drain_can_mirror(master);
+        if (rs_panel_master_bus_is_quiet(master, now_ms) != 0u) {
+            /* Не ждать IDLE: harvest DMA → on_frame → ADD (иначе forever scan). */
+            RsBus_RxHarvest(&master->bus);
+            if (master->panel_count != 0u) {
+                rs_panel_master_dbg_sync_rx_decode(master);
+                RsPanelMasterDebug_Timer10ms();
+                g_rs_master_dbg.panel_count = master->panel_count;
+                return;
+            }
+            g_rs_master_dbg.bus_quiet_skips++;
+            rs_panel_master_dbg_sync_rx_decode(master);
+            RsPanelMasterDebug_Timer10ms();
+            g_rs_master_dbg.panel_count = 0u;
+            return;
         }
+        if (rs_panel_master_addr_scan_tick(master, now_ms) != 0u) {
+            rs_panel_master_dbg_sync_rx_decode(master);
+            RsPanelMasterDebug_Timer10ms();
+            return;
+        }
+        if (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE ||
+            master->collision_pending != 0u) {
+            if (rs_panel_master_addr_fsm_tick(master, now_ms) != 0u) {
+                rs_panel_master_arm_bus_quiet(now_ms);
+                rs_panel_master_dbg_sync_rx_decode(master);
+                RsPanelMasterDebug_Timer10ms();
+                return;
+            }
+        }
+        rs_panel_master_dbg_sync_rx_decode(master);
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.panel_count = 0u;
         return;
     }
 
-    if (s_inject_pause_poll != 0u) {
-        /* Пока кадр ещё в очереди — держим длинную паузу POLL (см. extend). */
-        rs_panel_master_inject_extend_poll_pause(now_ms, RS_PANEL_CMD_BOOT_SET_UPD_WORD);
-        s_inject_pause_poll = 0u;
-    }
-
-    /* Host→RS inject (в т.ч. 0xF3) — вне UART2 IRQ, максимум 1 кадр/тик. */
+    /* Host→RS inject (в т.ч. 0xF3) — вне UART2 IRQ, максимум 1 кадр/тик.
+     * Длинная пауза POLL — только после реальной boot-команды (см. extend). */
     if (s_inject_q_count != 0u) {
         rs_panel_master_inject_process_pending(master, now_ms);
+        rs_panel_master_arm_bus_quiet(now_ms);
         /* Не делаем POLL в том же тике (half-duplex). */
         RsPanelMasterDebug_Timer10ms();
         g_rs_master_dbg.menu_selected = g_menu_selected;
         g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        g_rs_master_dbg.inject_pause_active =
+            (s_inject_pause_until_ms != 0u &&
+             (int32_t)(now_ms - s_inject_pause_until_ms) < 0) ? 1u : 0u;
         return;
     }
 
     if (s_inject_pause_until_ms != 0u) {
         if ((int32_t)(now_ms - s_inject_pause_until_ms) < 0) {
             /* Тишина на RS: ждём ACK бутлоадера, без POLL/UI TX. */
+            g_rs_master_dbg.inject_pause_active = 1u;
+            g_rs_master_dbg.inject_pause_until_ms = s_inject_pause_until_ms;
             RsPanelMasterDebug_Timer10ms();
             return;
         }
         s_inject_pause_until_ms = 0u;
+        g_rs_master_dbg.inject_pause_active = 0u;
+        g_rs_master_dbg.inject_pause_until_ms = 0u;
+    }
+
+    /* Ждём RSP ожидаемого addr: иначе POLL соседа наезжает на ответ. */
+    if (rs_panel_master_bus_is_quiet(master, now_ms) != 0u) {
+        RsBus_RxHarvest(&master->bus);
+        g_rs_master_dbg.bus_quiet_skips++;
+        (void)rs_panel_master_poll_starving(master, now_ms); /* обновить gap dbg */
+        RsPanelMasterDebug_Timer10ms();
+        g_rs_master_dbg.menu_selected = g_menu_selected;
+        g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+        return;
     }
 
     /* Пока удержание/нажаты пусковые — POLL обязателен, но LED/SOUND нельзя
@@ -3534,33 +4118,58 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         }
     }
 
-    /* Автораздача адресов / коллизии.
-     * v3: НЕ блокировать POLL — «ПРОВЕРКА» снимается только SYS_READY в POLL.
-     * Раньше при пустом discover FSM крутился (WAIT↔DISCOVER) и POLL не шёл минутами. */
-    if (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE || master->collision_pending != 0u ||
-        master->first_boot_discover_done == 0u) {
-        uint8_t prev_fsm = (uint8_t)master->addr_fsm;
-        rs_panel_master_addr_fsm_tick(master, now_ms);
-        if (RsPanelV3Master_IsV3PollActive() == 0u &&
-            (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE ||
-             prev_fsm != (uint8_t)master->addr_fsm)) {
+    /* Hot-plug: сканить неизвестные addr 1..MAX даже если POLL due.
+     * Раньше any_poll_due блокировал scan → при 1 панели (poll_ms=1) addr 7
+     * никогда не находился. ACTIVITY/FSM — только если POLL не голодает. */
+    if (rs_panel_master_poll_starving(master, now_ms) == 0u) {
+        if (rs_panel_master_addr_scan_tick(master, now_ms) != 0u) {
             RsPanelMasterDebug_Timer10ms();
             g_rs_master_dbg.menu_selected = g_menu_selected;
             g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
             return;
         }
+        if (rs_panel_master_any_poll_due(master, now_ms) == 0u) {
+            if (master->addr_fsm != RS_PANEL_ADDR_FSM_IDLE ||
+                master->collision_pending != 0u) {
+                if (rs_panel_master_addr_fsm_tick(master, now_ms) != 0u) {
+                    rs_panel_master_arm_bus_quiet(now_ms);
+                    RsPanelMasterDebug_Timer10ms();
+                    g_rs_master_dbg.menu_selected = g_menu_selected;
+                    g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+                    return;
+                }
+            }
+            if (rs_panel_master_activity_req_tick(master, now_ms) != 0u) {
+                RsPanelMasterDebug_Timer10ms();
+                g_rs_master_dbg.menu_selected = g_menu_selected;
+                g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+                return;
+            }
+        }
+    } else {
+        g_rs_master_dbg.poll_dominate_defer++;
     }
 
     /* UI-очередь при force_poll обслуживается на следующем свободном тике. */
 
+    rs_panel_master_prune_dead_slots(master);
+    rs_panel_master_dbg_sync_rx_decode(master);
     RsPanelMasterDebug_Timer10ms();
     g_rs_master_dbg.panel_caps_valid = master->panels[0].caps_valid;
     g_rs_master_dbg.panel_link_state = (uint8_t)master->panels[0].link_state;
     g_rs_master_dbg.menu_selected = g_menu_selected;
     g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
+    {
+        uint8_t di;
+        g_rs_master_dbg.panel_count = master->panel_count;
+        for (di = 0u; di < 8u; di++) {
+            g_rs_master_dbg.panel_addr[di] =
+                (di < master->panel_count) ? master->panels[di].cfg.addr : 0u;
+        }
+    }
 
     if (s_logo_main_nav_deadline_ms != 0u &&
-        PanelState_IsReady(&master->panels[0]) != 0u &&
+        rs_panel_master_any_panel_ready(master) != 0u &&
         (int32_t)(now_ms - s_logo_main_nav_deadline_ms) >= 0) {
         s_logo_main_nav_deadline_ms = 0u;
         /* Панель сама уходит с logo (400 тиков). Повторный UI_NAV сдвигает виджеты.
@@ -3570,8 +4179,12 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         }
     }
 
+    /* Любая READY-панель (не только panels[0]): иначе hot-plug второй панели
+     * при «мертвом» слоте 0 никогда не доезжал до WARN/FIRE resync.
+     * Не красть тик, если POLL уже голодает (2 панели + каталог). */
     if (s_panel_ui_resync_pending != 0u &&
-        PanelState_IsReady(&master->panels[0]) != 0u &&
+        rs_panel_master_poll_starving(master, now_ms) == 0u &&
+        rs_panel_master_any_panel_ready(master) != 0u &&
         s_logo_main_nav_deadline_ms == 0u &&
         rs_panel_master_is_menu_ui_screen(g_ui_current_screen_id) == 0u &&
         Warning_IsProcessDelayActive() == 0u) {
@@ -3584,6 +4197,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         Fire_ForceUiResync();
         RsPanelMaster_PushSound();
         rs_panel_master_send_leds_to_ready_panels(master);
+        rs_panel_master_arm_bus_quiet(now_ms);
         RsPanelMasterDebug_Timer10ms();
         g_rs_master_dbg.menu_selected = g_menu_selected;
         g_rs_master_dbg.ui_screen_id = g_ui_current_screen_id;
@@ -3594,43 +4208,79 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
      * секунду, забивал RS и вместе с коротким watchdog ронял CAPS → duty 1 Гц.
      * Повторная доставка — через became_ready / deliver_fail (PushUiIfChanged). */
 
-    /* CAN→RS mirror: только в свободные тики (POLL не просрочен), 1 кадр/тик.
-     * Панели не принимают addr=0xFF — логика панели не затрагивается. */
+    /* CAN→RS mirror: только в свободные тики (POLL не due и не starving). */
     if (s_can_mirror_enable != 0u && s_can_mirror_q_count != 0u &&
+        rs_panel_master_poll_starving(master, now_ms) == 0u &&
         rs_panel_master_any_poll_due(master, now_ms) == 0u) {
         if (rs_panel_master_drain_can_mirror(master) != 0u) {
+            rs_panel_master_arm_bus_quiet(now_ms);
             return;
         }
     }
 
+    /*
+     * Fair RR: не return на панели «не due», пока не просмотрели остальных.
+     * Иначе при 2+ панелях один слот голодает POLL → watchdog «авария связи»,
+     * второй получает каталог/faults криво.
+     */
     {
-        uint8_t panel_rr = (uint8_t)(master->round_robin_idx % master->panel_count);
-        panel = &master->panels[panel_rr];
-        master->round_robin_idx = (uint8_t)((master->round_robin_idx + 1u) % master->panel_count);
+        uint8_t attempt;
+        uint8_t chosen = 0xFFu;
+        uint8_t chosen_need_caps = 0u;
 
-        if (!panel->cfg.enabled) {
-            return;
-        }
+        for (attempt = 0u; attempt < master->panel_count; attempt++) {
+            uint8_t panel_rr =
+                (uint8_t)((master->round_robin_idx + attempt) % master->panel_count);
+            PanelState *cand = &master->panels[panel_rr];
+            uint8_t poll_due;
+            uint8_t need_caps;
 
-        if ((now_ms - panel->last_rx_ms) > panel->watchdog_ms && panel->last_rx_ms != 0u) {
-            panel->link_state = PANEL_LINK_CAPS_PENDING;
-            /* v3: не сбрасывать caps_valid — иначе POLL останавливается на время CAPS
-             * и панель минутами не получает SYS (питание/неисправность/READY). */
-            if (RsPanelV3Master_IsV3PollActive() == 0u || s_v3_poll_seen[panel_rr] == 0u) {
-                panel->caps_valid = 0u;
+            if (cand->cfg.enabled == 0u) {
+                continue;
+            }
+
+            if ((now_ms - cand->last_rx_ms) > cand->watchdog_ms &&
+                cand->last_rx_ms != 0u) {
+                cand->link_state = PANEL_LINK_CAPS_PENDING;
+                /* v3: не сбрасывать caps_valid — иначе POLL останавливается на CAPS
+                 * и панель минутами не получает SYS (питание/неисправность/READY). */
+                if (RsPanelV3Master_IsV3PollActive() == 0u ||
+                    s_v3_poll_seen[panel_rr] == 0u) {
+                    cand->caps_valid = 0u;
+                }
+            }
+
+            poll_due = ((now_ms - cand->last_poll_ms) >= cand->cfg.poll_ms) ? 1u : 0u;
+            need_caps = (cand->link_state == PANEL_LINK_CAPS_PENDING ||
+                         cand->caps_valid == 0u) ? 1u : 0u;
+
+            /* v3 + poll_due: POLL даже при CAPS_PENDING. */
+            if (poll_due != 0u &&
+                (need_caps == 0u || RsPanelV3Master_IsV3PollActive() != 0u)) {
+                chosen = panel_rr;
+                chosen_need_caps = 0u;
+                break;
+            }
+            if (need_caps != 0u && chosen == 0xFFu) {
+                chosen = panel_rr;
+                chosen_need_caps = 1u;
             }
         }
-    }
 
-    if (panel->link_state == PANEL_LINK_CAPS_PENDING || panel->caps_valid == 0u) {
-        const uint8_t poll_due =
-            ((now_ms - panel->last_poll_ms) >= panel->cfg.poll_ms) ? 1u : 0u;
-        /* v3 + POLL due — приоритет POLL (SYS/READY). CAPS в свободный тик. */
-        if (RsPanelV3Master_IsV3PollActive() != 0u && poll_due != 0u) {
-            /* fallthrough to POLL */
-        } else {
-            if (s_last_caps_req_ms == 0u ||
-                (now_ms - s_last_caps_req_ms) >= RS_PANEL_CAPS_RETRY_MS) {
+        if (chosen == 0xFFu) {
+            return;
+        }
+
+        master->round_robin_idx =
+            (uint8_t)((chosen + 1u) % master->panel_count);
+        panel = &master->panels[chosen];
+
+        if (chosen_need_caps != 0u) {
+            /* Per-panel CAPS rate (не глобальный s_last_caps_req_ms). */
+            if (chosen < RS_PANEL_MAX_PANELS &&
+                (s_caps_req_ms[chosen] == 0u ||
+                 (now_ms - s_caps_req_ms[chosen]) >= RS_PANEL_CAPS_RETRY_MS)) {
+                s_caps_req_ms[chosen] = now_ms;
                 s_last_caps_req_ms = now_ms;
                 g_rs_master_dbg.caps_req_tx++;
                 (void)RsBus_SendFrame(&master->bus,
@@ -3640,13 +4290,10 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
                                       RS_PANEL_CMD_CAPS_REQ,
                                       0,
                                       0u);
+                rs_panel_master_arm_bus_quiet(now_ms);
             }
             return;
         }
-    }
-
-    if ((now_ms - panel->last_poll_ms) < panel->cfg.poll_ms) {
-        return;
     }
 
     if (panel->ack_wait_active != 0u) {
@@ -3682,16 +4329,22 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         MenuUi_IsConfigSessionActive()) {
         rs_panel_master_send_config_status_to_ready_panels(master);
     }
-    {
+    /* v3: значок и «Вкл» — SYS flags того же POLL. UI_DATA в этом тике —
+     * второй TX на half-duplex, панель его теряет и значок не появляется. */
+    if (RsPanelV3Master_IsV3PollActive() == 0u) {
         /* После окончания сессии шлём ещё раз, чтобы панель скрыла значок. */
         static uint8_t s_last_wifi_session_sent = 0u;
         uint8_t session = EspManager_IsWifiSessionActive();
-        if (g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_CONNECTION ||
+        if (s_connection_push_pending != 0u ||
+            g_ui_current_screen_id == RS_PANEL_SCREEN_MENU_CONNECTION ||
             session != 0u ||
             s_last_wifi_session_sent != 0u) {
             rs_panel_master_send_connection_status_to_ready_panels(master);
+            s_connection_push_pending = 0u;
             s_last_wifi_session_sent = session;
         }
+    } else {
+        s_connection_push_pending = 0u;
     }
 
     if (RsPanelV3Master_IsV3PollActive() != 0u) {
@@ -3712,6 +4365,10 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
         panel->last_poll_ms = now_ms;
         panel->last_tx_seq = master->next_seq;
         g_rs_master_dbg.poll_req_tx++;
+        if (panel_idx < 8u) {
+            g_rs_master_dbg.poll_tx_by_panel[panel_idx]++;
+            g_rs_master_dbg.poll_gap_ms_by_panel[panel_idx] = 0u;
+        }
         s_nonpoll_streak = 0u;
         (void)RsBus_SendFrame(&master->bus,
                               panel->cfg.addr,
@@ -3720,6 +4377,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
                               RS_PANEL_CMD_POLL,
                               v3_payload,
                               payload_len);
+        rs_panel_master_arm_bus_quiet(now_ms);
         return;
     }
 
@@ -3742,6 +4400,7 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
                           RS_PANEL_CMD_POLL,
                           payload,
                           payload_len);
+    rs_panel_master_arm_bus_quiet(now_ms);
 }
 
 /* Сколько записей журнала в одном event_reply (лимит 200 байт → текст режется). */
@@ -3880,10 +4539,15 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
                                          const RsPanelV3Event *ev,
                                          RsPanelV3EventReply *reply)
 {
-    (void)panel_idx;
+    /* Cursor журнала — per-panel (общий g_journal_selected ломал 2-ю панель). */
+    uint32_t *jsel;
     if (ev == 0 || reply == 0) {
         return 0u;
     }
+    if (panel_idx >= RS_PANEL_MAX_PANELS) {
+        panel_idx = 0u;
+    }
+    jsel = &s_v3_journal_selected[panel_idx];
     memset(reply, 0, sizeof(*reply));
 
     switch (ev->type) {
@@ -3910,22 +4574,23 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
             g_journal_total = jinfo.count;
         }
         if (g_journal_total > 0u) {
-            if (ev->u8_a == 0u && (g_journal_selected + 1u) < g_journal_total) {
-                g_journal_selected++;
-            } else if (ev->u8_a == 1u && g_journal_selected > 0u) {
-                g_journal_selected--;
+            if (ev->u8_a == 0u && (*jsel + 1u) < g_journal_total) {
+                (*jsel)++;
+            } else if (ev->u8_a == 1u && *jsel > 0u) {
+                (*jsel)--;
             } else if (ev->u8_a == 2u) {
-                g_journal_selected = g_journal_total - 1u;
+                *jsel = g_journal_total - 1u;
             } else if (ev->u8_a == 3u) {
                 /* refresh текущей */
             } else if ((uint32_t)ev->u16_a < g_journal_total) {
-                g_journal_selected = (uint32_t)ev->u16_a;
+                *jsel = (uint32_t)ev->u16_a;
             }
         } else {
-            g_journal_selected = 0u;
+            *jsel = 0u;
         }
+        g_journal_selected = *jsel; /* legacy UI_DATA path */
         reply->payload_len = rs_panel_v3_put_journal_list_payload(
-            reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, g_journal_selected, 1u);
+            reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, *jsel, 1u);
         return (reply->payload_len > 0u) ? 1u : 0u;
     }
     case RS_PANEL_V3_EVT_JOURNAL_GET_N: {
@@ -3938,7 +4603,7 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
             g_journal_total = jinfo.count;
         }
         if (g_journal_total == 0u) {
-            g_journal_selected = 0u;
+            *jsel = 0u;
             reply->payload_len = rs_panel_v3_put_journal_list_payload(
                 reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, 0u, 0u);
             return (reply->payload_len > 0u) ? 1u : 0u;
@@ -3951,7 +4616,7 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
         if (n == 0u) {
             n = 1u;
         }
-        /* selected на мастере не трогаем — GET_N только догрузка окна. */
+        /* selected панели не трогаем — GET_N только догрузка окна. */
         reply->payload_len = rs_panel_v3_put_journal_list_payload(
             reply->payload, RS_PANEL_V3_EVENT_REPLY_MAX, idx, n);
         return (reply->payload_len > 0u) ? 1u : 0u;
@@ -4065,7 +4730,7 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
     s_inject_q[s_inject_q_tail].len = frame_len;
     s_inject_q_tail = (uint8_t)((s_inject_q_tail + 1u) % RS_PANEL_INJECT_Q_DEPTH);
     s_inject_q_count++;
-    s_inject_pause_poll = 1u;
+    /* Не ставить 45 с паузу здесь: реальная cmd → extend только в process_pending. */
     __set_PRIMASK(primask);
     return 1u;
 }
@@ -4088,14 +4753,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
         n = (uint16_t)sizeof(s_rx_shadow);
     }
     memcpy(s_rx_shadow, g_active_master->bus.rx_dma_buf, n);
-    (void)HAL_UARTEx_ReceiveToIdle_DMA(huart,
-                                       g_active_master->bus.rx_dma_buf,
-                                       sizeof(g_active_master->bus.rx_dma_buf));
-    if (huart->hdmarx != 0) {
-        __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
-    }
+    RsBus_RxRearmFromIsr(&g_active_master->bus);
 
     RsPanelMasterDebug_OnRxDma(n);
+    RsPanelMasterDebug_OnRxHead(s_rx_shadow, n);
     RsPanelMaster_OnRxBytes(g_active_master, s_rx_shadow, n);
 }
 

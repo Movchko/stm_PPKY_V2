@@ -28,7 +28,7 @@
 #define CAN_DUP_WINDOW_MS     50
 /* Эхо собственного TX на другой шине: не позже 1 с → кольцо целое. */
 #define CAN_RING_ECHO_TIMEOUT_MS 1000u
-#define UART_BRIDGE_QUEUE_SIZE 128
+#define UART_BRIDGE_QUEUE_SIZE 64
 #define LOG_UART_BODY_MAX     246u
 #define UART_TX_PKT_MAX       256u
 
