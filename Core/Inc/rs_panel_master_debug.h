@@ -86,6 +86,15 @@ typedef struct {
     volatile uint32_t rx_last_err_code;
     /* RX был не BUSY_RX и перезапущен сторожем из Process10ms. */
     volatile uint32_t rx_rearm_wd;
+    /* Последний orphan short_hold: avail / need / dma_n / dma_read / сколько добрали из RDR. */
+    volatile uint16_t rx_short_avail;
+    volatile uint16_t rx_short_need;
+    volatile uint16_t rx_short_dma_n;
+    volatile uint16_t rx_short_dma_read;
+    volatile uint16_t rx_rdr_drain_n;
+    /* Сырой хвост short_hold (от 5A), до 40 байт — сверить с wire панели. */
+    volatile uint8_t  rx_short_frame[40];
+    volatile uint16_t rx_short_frame_len;
 } RsPanelMasterDbg;
 
 extern volatile RsPanelMasterDbg g_rs_master_dbg;

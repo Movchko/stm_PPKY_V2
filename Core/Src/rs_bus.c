@@ -1,4 +1,5 @@
 #include "rs_bus.h"
+#include "rs_panel_master_debug.h"
 
 #include <string.h>
 
@@ -71,8 +72,12 @@ static void rs_bus_rx_flush_errors(UART_HandleTypeDef *uart)
  * внутри байта и 0xA5 не видит (Live: rx_resync==rx_raw). 20 мкс = 4 символа марки:
  * успевает закончиться ложный байт от фронта DE и пройти IDLE у приёмника. */
 /* 20 мкс мало: панель Live — кадры как «5A 09 addr…» без ведущего A5.
- * 100 мкс ≈ 25 симв. mark @2 Мбод + dummy 0xFF перед кадром. */
-#define RS_BUS_DE_LEAD_US 100u
+ * 100 мкс мало при 2+ панелях (ringing/нагрузка) — в DMA мусор до RSP,
+ * FrameDecode: src_size 28..32 < total_size. 300 мкс ≈ 75 симв. mark @2 Мбод. */
+#define RS_BUS_DE_LEAD_US 300u
+/* Жертвенные 0xFF перед A5: при 2 Мбод IDLE=~5 мкс, любой preempt TX даёт щель
+ * и мастер теряет первые байты → буфер «5A …» без A5, short_hold@orphan. */
+#define RS_BUS_TX_PAD_N   4u
 
 static void rs_bus_delay_us(uint32_t us)
 {
@@ -83,19 +88,25 @@ static void rs_bus_delay_us(uint32_t us)
     }
 }
 
-/* Первый байт после DE↑ часто теряется на приёмнике — жертвуем 0xFF, A5 сохраняем. */
-static HAL_StatusTypeDef rs_bus_tx_preamble_pad(UART_HandleTypeDef *uart)
-{
-    uint8_t pad = 0xFFu;
-    return HAL_UART_Transmit(uart, &pad, 1u, 5u);
-}
+/*
+ * Pad 0xFF + кадр одним Transmit: два вызова давали IDLE между FF и A5,
+ * мастер rearm mid-RSP → src_size 28..32 < total_size, frames_ok=0 при 2+ панелях.
+ */
 
 static void rs_bus_rx_start_dma(RsBusContext *ctx)
 {
-    (void)HAL_UARTEx_ReceiveToIdle_DMA(ctx->uart, ctx->rx_dma_buf, sizeof(ctx->rx_dma_buf));
+    ctx->rx_dma_read = 0u;
+    /*
+     * НЕ ReceiveToIdle: @2 Мбод IDLE≈5 мкс, щель mid-RSP → callback + rearm
+     * съедает хвост (Live: avail=28, нужно 32, eternal break@373).
+     * Обычный Receive_DMA: байты копятся, harvest снимает по NDTR без Abort.
+     */
+    (void)HAL_UART_Receive_DMA(ctx->uart, ctx->rx_dma_buf, sizeof(ctx->rx_dma_buf));
     if (ctx->uart->hdmarx != 0) {
         __HAL_DMA_DISABLE_IT(ctx->uart->hdmarx, DMA_IT_HT);
     }
+    /* IDLE не нужен — иначе снова mid-frame stop. */
+    ATOMIC_CLEAR_BIT(ctx->uart->Instance->CR1, USART_CR1_IDLEIE);
     /* HAL в DMA-режиме считает FE/NE/PE блокирующими: abort RX + ErrorCallback.
      * Помеха на фронте DE не должна останавливать приём — байт уходит в DMA, кадр отсеет CRC. */
     ATOMIC_CLEAR_BIT(ctx->uart->Instance->CR3, USART_CR3_EIE);
@@ -314,9 +325,10 @@ void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len)
     }
 
     {
-        /* Недособранный хвост старше 2 мс — не продолжение кадра (2 Мбод: кадр < 1.5 мс). */
+        /* Недособранный orphan (Live: avail=31 need=32): 30 мс мало —
+         * следующий probe/шум через >30 мс сбрасывал почти полный RSP. */
         uint32_t now = HAL_GetTick();
-        if (ctx->rx_len != 0u && (now - ctx->rx_last_ms) > 2u) {
+        if (ctx->rx_len != 0u && (now - ctx->rx_last_ms) > 120u) {
             ctx->rx_len = 0u;
         }
         ctx->rx_last_ms = now;
@@ -330,15 +342,136 @@ void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len)
 
     pos = 0u;
     while (pos < ctx->rx_len) {
-        /* Ответ панели без A5 (тот же DE↑) — принять «сироту» 5A. */
+        /* Ответ панели без A5 (DE↑ съел A5) — «сирота» 5A.
+         * Live 2 панели: 5A 01 81… — len=1 ложный sync (0x81=RSP_POLL не на месте). */
         if (ctx->rx_buf[pos] == RS_BUS_PREAMBLE_1) {
             uint16_t avail = (uint16_t)(ctx->rx_len - pos);
             uint8_t tmp[RS_BUS_MAX_FRAME_SIZE];
             uint16_t need;
+            uint16_t len_field;
+            uint16_t total_size;
+            uint8_t addr_b;
+            uint8_t flags_b;
+            uint8_t cmd_b;
 
             if (avail < 8u) {
                 ctx->rx_decode_short_hold++;
                 break;
+            }
+            len_field = ctx->rx_buf[(uint16_t)(pos + 1u)];
+            /* Панель BuildRsp ≤96 → len≤100. Больший len = ложный sync → вечный break@373. */
+            if (len_field < 4u || len_field > 100u) {
+                pos++;
+                ctx->rx_resync_bytes++;
+                continue;
+            }
+            /* 5A|len|addr|seq|flags|cmd — отсечь ложный 5A в середине потока. */
+            addr_b = ctx->rx_buf[(uint16_t)(pos + 2u)];
+            flags_b = ctx->rx_buf[(uint16_t)(pos + 4u)];
+            cmd_b = ctx->rx_buf[(uint16_t)(pos + 5u)];
+            if (addr_b < 1u || addr_b > 8u ||
+                (flags_b & (uint8_t)RS_BUS_FLAG_DIR) == 0u ||
+                (cmd_b & 0x80u) == 0u) {
+                pos++;
+                ctx->rx_resync_bytes++;
+                continue;
+            }
+            total_size = (uint16_t)(2u + 1u + len_field + 2u);
+            if (avail < (uint16_t)(total_size - 1u)) {
+                /* Live: avail=28 need=32 — хвост часто сидит в RDR, а DMA
+                 * уже не двигается (BP на старом NDTR-spin = ложная «петля»).
+                 * Снимаем DMAR → добираем RXNE → возвращаем DMAR. */
+                {
+                    uint16_t need_from_a5 =
+                        (uint16_t)(total_size - 1u);
+                    uint16_t missing =
+                        (uint16_t)(need_from_a5 - avail);
+                    UART_HandleTypeDef *u = ctx->uart;
+                    uint16_t dsize =
+                        (uint16_t)sizeof(ctx->rx_dma_buf);
+                    uint16_t ndtr = 0u;
+                    uint16_t n = 0u;
+                    uint16_t drained = 0u;
+
+                    if (u != 0 && u->hdmarx != 0) {
+                        ndtr = (uint16_t)__HAL_DMA_GET_COUNTER(u->hdmarx);
+                        if (ndtr <= dsize) {
+                            n = (uint16_t)(dsize - ndtr);
+                        }
+                    }
+                    g_rs_master_dbg.rx_short_avail = avail;
+                    g_rs_master_dbg.rx_short_need = need_from_a5;
+                    g_rs_master_dbg.rx_short_dma_n = n;
+                    g_rs_master_dbg.rx_short_dma_read = ctx->rx_dma_read;
+                    {
+                        uint16_t di;
+                        uint16_t ncopy = avail;
+                        if (ncopy > (uint16_t)sizeof(g_rs_master_dbg.rx_short_frame)) {
+                            ncopy = (uint16_t)sizeof(g_rs_master_dbg.rx_short_frame);
+                        }
+                        g_rs_master_dbg.rx_short_frame_len = ncopy;
+                        for (di = 0u; di < (uint16_t)sizeof(g_rs_master_dbg.rx_short_frame); di++) {
+                            g_rs_master_dbg.rx_short_frame[di] =
+                                (di < ncopy) ? ctx->rx_buf[(uint16_t)(pos + di)] : 0u;
+                        }
+                    }
+
+                    if (u != 0 && missing > 0u && missing <= 8u &&
+                        (uint32_t)ctx->rx_len + missing <=
+                            sizeof(ctx->rx_buf)) {
+                        uint32_t spins =
+                            (SystemCoreClock / 1000000u) * 400u / 4u;
+                        CLEAR_BIT(u->Instance->CR3, USART_CR3_DMAR);
+                        while (spins > 0u && drained < missing) {
+                            spins--;
+                            if (__HAL_UART_GET_FLAG(u, UART_FLAG_RXNE) !=
+                                RESET) {
+                                ctx->rx_buf[ctx->rx_len] =
+                                    (uint8_t)(u->Instance->RDR & 0xFFu);
+                                ctx->rx_len++;
+                                drained++;
+                            }
+                        }
+                        SET_BIT(u->Instance->CR3, USART_CR3_DMAR);
+                        /* Пока DMAR снова включён — добрать хвост из DMA. */
+                        spins = (SystemCoreClock / 1000000u) * 200u / 4u;
+                        while (spins > 0u && avail + drained < need_from_a5) {
+                            uint16_t n2;
+                            uint16_t chunk;
+                            spins--;
+                            ndtr = (uint16_t)__HAL_DMA_GET_COUNTER(u->hdmarx);
+                            if (ndtr > dsize) {
+                                continue;
+                            }
+                            n2 = (uint16_t)(dsize - ndtr);
+                            if (n2 <= ctx->rx_dma_read) {
+                                continue;
+                            }
+                            chunk = (uint16_t)(n2 - ctx->rx_dma_read);
+                            if ((uint32_t)ctx->rx_len + chunk >
+                                sizeof(ctx->rx_buf)) {
+                                break;
+                            }
+                            memcpy(&ctx->rx_buf[ctx->rx_len],
+                                   &ctx->rx_dma_buf[ctx->rx_dma_read],
+                                   chunk);
+                            ctx->rx_len =
+                                (uint16_t)(ctx->rx_len + chunk);
+                            ctx->rx_dma_read = n2;
+                            drained = (uint16_t)(drained + chunk);
+                        }
+                        if (drained > 0u) {
+                            avail = (uint16_t)(ctx->rx_len - pos);
+                            g_rs_master_dbg.rx_rdr_drain_n =
+                                (uint16_t)(g_rs_master_dbg.rx_rdr_drain_n +
+                                           drained);
+                        }
+                    }
+                }
+                if (avail < (uint16_t)(total_size - 1u)) {
+                    ctx->rx_decode_short_hold++;
+                    break;
+                }
             }
             need = (uint16_t)(1u + avail);
             if (need > (uint16_t)sizeof(tmp)) {
@@ -432,10 +565,16 @@ static void rs_bus_rx_drain_pending(RsBusContext *ctx)
         return;
     }
     n = (uint16_t)(size - ndtr);
-    if (n == 0u) {
+    if (n <= ctx->rx_dma_read) {
         return;
     }
-    RsBus_ProcessRxBytes(ctx, ctx->rx_dma_buf, n);
+    {
+        uint16_t start = ctx->rx_dma_read;
+        uint16_t chunk = (uint16_t)(n - start);
+        /* Сначала отметить диапазон: ProcessRxBytes может добрать хвост по NDTR. */
+        ctx->rx_dma_read = n;
+        RsBus_ProcessRxBytes(ctx, &ctx->rx_dma_buf[start], chunk);
+    }
 }
 
 void RsBus_RxHarvest(RsBusContext *ctx)
@@ -455,27 +594,66 @@ void RsBus_RxHarvest(RsBusContext *ctx)
         return;
     }
     n = (uint16_t)(size - ndtr);
-    /* Пустой DMA: НЕ Abort/rearm. Раньше harvest @2 кГц дёргал UART каждые
-     * 0.5 мс → на линии шум без 0xA5 (панель: rx_raw≫0, rx_frames_ok=0). */
-    if (n == 0u) {
+    /* Нет новых байт — не трогаем UART (раньше Abort @2 кГц убивал RSP). */
+    if (n <= ctx->rx_dma_read) {
         return;
     }
 
     rs_bus_rx_irq_lock(uart);
-    /* Повторно считать NDTR под lock — байты могли дойти. */
     ndtr = (uint16_t)__HAL_DMA_GET_COUNTER(uart->hdmarx);
     if (ndtr <= size) {
         n = (uint16_t)(size - ndtr);
-        if (n != 0u) {
-            RsBus_ProcessRxBytes(ctx, ctx->rx_dma_buf, n);
-            (void)HAL_UART_AbortReceive(uart);
-            rs_bus_rx_flush_errors(uart);
-            uart->RxState = HAL_UART_STATE_READY;
-            uart->ReceptionType = HAL_UART_RECEPTION_STANDARD;
-            rs_bus_rx_start_dma(ctx);
+        if (n > ctx->rx_dma_read) {
+            uint16_t start = ctx->rx_dma_read;
+            uint16_t chunk = (uint16_t)(n - start);
+            RsPanelMasterDebug_OnRxDma(chunk);
+            RsPanelMasterDebug_OnRxHead(&ctx->rx_dma_buf[start], chunk);
+            /* Сначала отметить диапазон: ProcessRxBytes может добрать хвост по NDTR. */
+            ctx->rx_dma_read = n;
+            RsBus_ProcessRxBytes(ctx, &ctx->rx_dma_buf[start], chunk);
+            /* DMA почти полный — иначе хвост кадра потеряется. */
+            if (ctx->rx_dma_read >= (uint16_t)(size - 16u)) {
+                (void)HAL_UART_AbortReceive(uart);
+                rs_bus_rx_flush_errors(uart);
+                uart->RxState = HAL_UART_STATE_READY;
+                uart->ReceptionType = HAL_UART_RECEPTION_STANDARD;
+                rs_bus_rx_start_dma(ctx);
+            }
         }
     }
     rs_bus_rx_irq_unlock(uart);
+}
+
+void RsBus_ProcessIdleRx(RsBusContext *ctx,
+                         const uint8_t *data,
+                         uint16_t size,
+                         uint16_t already_read)
+{
+    if (ctx == 0 || data == 0 || size == 0u) {
+        return;
+    }
+    if (already_read >= size) {
+        return;
+    }
+    RsBus_ProcessRxBytes(ctx, &data[already_read],
+                         (uint16_t)(size - already_read));
+}
+
+void RsBus_OnRxDmaComplete(RsBusContext *ctx)
+{
+    if (ctx == 0 || ctx->uart == 0) {
+        return;
+    }
+    /* Буфер DMA полный: снять остаток и снова arm (без IDLE). */
+    rs_bus_rx_irq_lock(ctx->uart);
+    if (ctx->rx_dma_read < (uint16_t)sizeof(ctx->rx_dma_buf)) {
+        RsBus_ProcessRxBytes(ctx, &ctx->rx_dma_buf[ctx->rx_dma_read],
+                             (uint16_t)(sizeof(ctx->rx_dma_buf) - ctx->rx_dma_read));
+    }
+    ctx->uart->RxState = HAL_UART_STATE_READY;
+    ctx->uart->ReceptionType = HAL_UART_RECEPTION_STANDARD;
+    rs_bus_rx_start_dma(ctx);
+    rs_bus_rx_irq_unlock(ctx->uart);
 }
 
 HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
@@ -486,71 +664,76 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
                                   const uint8_t *payload,
                                   uint16_t payload_len)
 {
-    uint8_t frame[RS_BUS_MAX_FRAME_SIZE];
+    uint8_t wire[RS_BUS_MAX_FRAME_SIZE + RS_BUS_TX_PAD_N];
     uint16_t frame_len;
+    uint16_t wire_len;
+    uint32_t primask;
+    HAL_StatusTypeDef st;
 
     if (ctx == 0 || ctx->uart == 0) {
         return HAL_ERROR;
     }
 
-    frame_len = RsBus_FrameEncode(frame, sizeof(frame), addr, seq, flags, cmd, payload, payload_len);
+    memset(wire, 0xFFu, RS_BUS_TX_PAD_N);
+    frame_len = RsBus_FrameEncode(&wire[RS_BUS_TX_PAD_N], RS_BUS_MAX_FRAME_SIZE,
+                                  addr, seq, flags, cmd, payload, payload_len);
     if (frame_len == 0u) {
         return HAL_ERROR;
     }
+    wire_len = (uint16_t)(frame_len + RS_BUS_TX_PAD_N);
 
     rs_bus_rx_irq_lock(ctx->uart);
     rs_bus_rx_drain_pending(ctx);
     (void)HAL_UART_AbortReceive(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_SET);
     rs_bus_delay_us(RS_BUS_DE_LEAD_US);
-    if (rs_bus_tx_preamble_pad(ctx->uart) != HAL_OK ||
-        HAL_UART_Transmit(ctx->uart, frame, frame_len, 20u) != HAL_OK) {
-        rs_bus_wait_tx_complete(ctx->uart);
-        rs_bus_de_set(ctx, GPIO_PIN_RESET);
-        rs_bus_post_tx_settle();
-        rs_bus_rx_arm(ctx);
-        rs_bus_rx_irq_unlock(ctx->uart);
-        return HAL_ERROR;
+    /* Полный запрет IRQ на время TX: иначе щель >1 симв @2 Мбод → IDLE mid-frame. */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    st = HAL_UART_Transmit(ctx->uart, wire, wire_len, 20u);
+    if (primask == 0u) {
+        __enable_irq();
     }
     rs_bus_wait_tx_complete(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_RESET);
     rs_bus_post_tx_settle();
-    /* IRQ locked до arm: иначе байты в RDR без DMA → ORE → Recover убивает RX. */
     rs_bus_rx_arm(ctx);
     rs_bus_rx_irq_unlock(ctx->uart);
-    return HAL_OK;
+    return st;
 }
 
 HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_t frame_len)
 {
+    uint8_t wire[RS_BUS_MAX_FRAME_SIZE + RS_BUS_TX_PAD_N];
+    uint16_t wire_len;
+    uint32_t primask;
+    HAL_StatusTypeDef st;
+
     if (ctx == 0 || ctx->uart == 0 || frame == 0 || frame_len == 0u) {
         return HAL_ERROR;
     }
+    if (frame_len > RS_BUS_MAX_FRAME_SIZE) {
+        return HAL_ERROR;
+    }
+    memset(wire, 0xFFu, RS_BUS_TX_PAD_N);
+    memcpy(&wire[RS_BUS_TX_PAD_N], frame, frame_len);
+    wire_len = (uint16_t)(frame_len + RS_BUS_TX_PAD_N);
+
     rs_bus_rx_irq_lock(ctx->uart);
     rs_bus_rx_drain_pending(ctx);
     (void)HAL_UART_AbortReceive(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_SET);
     rs_bus_delay_us(RS_BUS_DE_LEAD_US);
-    if (rs_bus_tx_preamble_pad(ctx->uart) != HAL_OK) {
-        rs_bus_wait_tx_complete(ctx->uart);
-        rs_bus_de_set(ctx, GPIO_PIN_RESET);
-        rs_bus_post_tx_settle();
-        rs_bus_rx_arm(ctx);
-        rs_bus_rx_irq_unlock(ctx->uart);
-        return HAL_ERROR;
-    }
-    if (HAL_UART_Transmit(ctx->uart, (uint8_t *)frame, frame_len, 50u) != HAL_OK) {
-        rs_bus_wait_tx_complete(ctx->uart);
-        rs_bus_de_set(ctx, GPIO_PIN_RESET);
-        rs_bus_post_tx_settle();
-        rs_bus_rx_arm(ctx);
-        rs_bus_rx_irq_unlock(ctx->uart);
-        return HAL_ERROR;
+    primask = __get_PRIMASK();
+    __disable_irq();
+    st = HAL_UART_Transmit(ctx->uart, wire, wire_len, 50u);
+    if (primask == 0u) {
+        __enable_irq();
     }
     rs_bus_wait_tx_complete(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_RESET);
     rs_bus_post_tx_settle();
     rs_bus_rx_arm(ctx);
     rs_bus_rx_irq_unlock(ctx->uart);
-    return HAL_OK;
+    return st;
 }

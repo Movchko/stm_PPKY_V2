@@ -19,7 +19,12 @@ typedef struct {
     uint8_t rx_dma_buf[RS_BUS_RX_DMA_SIZE];
     uint8_t rx_buf[RS_BUS_MAX_FRAME_SIZE];
     uint16_t rx_len;
+    /* Сколько байт DMA уже отдали в ProcessRxBytes (harvest без Abort). */
+    uint16_t rx_dma_read;
     uint32_t rx_last_ms;
+    /* Short-hold «ждём хвост»: если > RX_HOLD_ABORT_MS — бросить преамбулу (иначе
+     * шум с 2 панелей вечно освежает rx_last_ms и парсер сидит на сироте 5A). */
+    uint32_t rx_hold_ms;
     /* Счётчики разбора (мастер копирует в Live Watch). */
     uint32_t rx_decode_crc_fail;
     uint32_t rx_decode_bad_hdr;
@@ -38,18 +43,26 @@ void RsBus_Init(RsBusContext *ctx,
                 uint16_t de_pin,
                 RsBusFrameHandler handler,
                 void *handler_ctx);
-/** ORE/FE в HAL_UART_ErrorCallback — сброс + снова ReceiveToIdle_DMA. */
+/** ORE/FE в HAL_UART_ErrorCallback — сброс + снова Receive_DMA. */
 void RsBus_RecoverFromError(RsBusContext *ctx);
-/** Из HAL_UARTEx_RxEventCallback: перезапуск RX DMA без flush RDR (там может лежать 0xA5 следующего кадра). */
+/** Legacy IDLE path (больше не используется для USART1 RS). */
 void RsBus_RxRearmFromIsr(RsBusContext *ctx);
 /** Из основного цикла: если RX не BUSY_RX (умер после ошибки) — перезапустить. */
 void RsBus_RxWatchdog(RsBusContext *ctx);
 /**
- * Process10ms во время bus quiet: забрать байты из DMA без ожидания IDLE IRQ.
- * Иначе RSP панели (после addr_scan) лежит в буфере до следующего TX и
- * panel_count остаётся 0 → только SYS=0 probe → «ПРОВЕРКА» без TIME.
+ * Process10ms / quiet: снять НОВЫЕ байты из DMA по NDTR без Abort.
+ * Rearm — SendFrame / RxCplt (буфер полный) / почти полный буфер.
  */
 void RsBus_RxHarvest(RsBusContext *ctx);
+/** DMA RX complete (буфер полный) — добрать хвост и rearm. */
+void RsBus_OnRxDmaComplete(RsBusContext *ctx);
+/**
+ * Legacy IDLE IRQ helper (не вызывается при Receive_DMA).
+ */
+void RsBus_ProcessIdleRx(RsBusContext *ctx,
+                         const uint8_t *data,
+                         uint16_t size,
+                         uint16_t already_read);
 void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len);
 HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
                                   uint8_t addr,

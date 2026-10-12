@@ -43,9 +43,10 @@ static uint16_t g_menu_selected = 0u; /* dbg mirror */
 #define RS_PANEL_ADDR_SETTLE_MS 500u
 /* Не крутить DISCOVER по ACTIVITY-коллизии чаще: иначе POLL/WiFi ACTIVITY глушатся. */
 #define RS_PANEL_ADDR_COLLISION_COOLDOWN_MS 8000u
-/* Скан 1..MAX: один проход после boot (не кольцо).
- * 8 × 200 мс ≈ 1.6 с + quiet turnaround; дальше только RR POLL / ACTIVITY. */
-#define RS_PANEL_ADDR_SCAN_INTERVAL_MS 200u
+/* Скан 1..MAX: шаг между probe. После первого ADD — периодический rescan
+ * неизвестных (hot-plug); иначе done навсегда → новая панель «НЕТ СВЯЗИ». */
+#define RS_PANEL_ADDR_SCAN_INTERVAL_MS 500u
+#define RS_PANEL_ADDR_RESCAN_MS 5000u
 /* ПО (bus_monitor) держит панель только по ESP_UART ACTIVITY (~60 с таймаут).
  * Панель больше не шлёт ACTIVITY сама — мастер запрашивает ACTIVITY_REQ (unicast)
  * и синтезирует presence в WiFi из слотов с свежим last_rx. */
@@ -60,9 +61,11 @@ static uint16_t g_menu_selected = 0u; /* dbg mirror */
  */
 /* Ответ панели: короткий RSP сразу, apply после. 40 мс — запас на half-duplex.
  * FIRE: раньше 120 мс из‑за TouchGFX в OnPoll; UI теперь Queue→Deferred,
- * ZONES только if_changed. 60 мс — запас на RSP+event_crit без просадки опроса. */
+ * ZONES только if_changed. 60 мс — запас на RSP+event_crit без просадки опроса.
+ * SCAN (panel_count==0): 2+ панели на шине — дольше ringing/settle после probe. */
 #define RS_PANEL_BUS_TURNAROUND_MS 40u
 #define RS_PANEL_BUS_TURNAROUND_FIRE_MS 60u
+#define RS_PANEL_BUS_TURNAROUND_SCAN_MS 100u
 /*
  * Если у любого слота gap POLL ≥ этого — addr_scan/ACTIVITY/can_mirror откладываем.
  */
@@ -976,14 +979,18 @@ static uint8_t rs_panel_master_addr_scan_tick(RsPanelMaster *master, uint32_t no
     /* Проход закончен (next ушёл за MAX) — после quiet/RSP последнего probe. */
     if (s_addr_scan_next > RS_PANEL_MAX_PANELS) {
         s_addr_scan_probe_addr = 0u;
-        if (master->panel_count == 0u) {
-            /* Никого не нашли: новый проход, иначе panel_count==0 навсегда. */
-            s_addr_scan_next = 1u;
-            s_addr_scan_next_ms = now_ms + RS_PANEL_ADDR_SCAN_INTERVAL_MS;
-            g_rs_master_dbg.addr_scan_next = s_addr_scan_next;
+        if (master->panel_count >= RS_PANEL_MAX_PANELS) {
+            s_addr_scan_done = 1u;
             return 0u;
         }
-        s_addr_scan_done = 1u;
+        /* 0 панелей или есть свободные слоты: новый проход (hot-plug). */
+        s_addr_scan_done = 0u;
+        s_addr_scan_next = 1u;
+        s_addr_scan_next_ms = now_ms +
+            ((master->panel_count == 0u)
+                 ? RS_PANEL_ADDR_SCAN_INTERVAL_MS
+                 : RS_PANEL_ADDR_RESCAN_MS);
+        g_rs_master_dbg.addr_scan_next = s_addr_scan_next;
         return 0u;
     }
 
@@ -1032,11 +1039,16 @@ static uint8_t rs_panel_master_addr_scan_tick(RsPanelMaster *master, uint32_t no
 
     /* Все addr в этом проходе уже известны / next за пределами. */
     if (s_addr_scan_next > RS_PANEL_MAX_PANELS) {
-        if (master->panel_count == 0u) {
-            s_addr_scan_next = 1u;
-            s_addr_scan_next_ms = now_ms + RS_PANEL_ADDR_SCAN_INTERVAL_MS;
-        } else {
+        if (master->panel_count >= RS_PANEL_MAX_PANELS) {
             s_addr_scan_done = 1u;
+        } else {
+            s_addr_scan_done = 0u;
+            s_addr_scan_next = 1u;
+            s_addr_scan_next_ms = now_ms +
+                ((master->panel_count == 0u)
+                     ? RS_PANEL_ADDR_SCAN_INTERVAL_MS
+                     : RS_PANEL_ADDR_RESCAN_MS);
+            g_rs_master_dbg.addr_scan_next = s_addr_scan_next;
         }
     }
     return 0u;
@@ -1588,8 +1600,12 @@ void RsPanelMaster_PushCanMirrorBsu(const uint8_t *bsu_pkt, uint16_t len)
 
 static void rs_panel_master_arm_bus_quiet(uint32_t now_ms)
 {
-    const uint32_t win = (Fire_IsActive() != 0u) ? RS_PANEL_BUS_TURNAROUND_FIRE_MS
-                                                 : RS_PANEL_BUS_TURNAROUND_MS;
+    uint32_t win = RS_PANEL_BUS_TURNAROUND_MS;
+    if (Fire_IsActive() != 0u) {
+        win = RS_PANEL_BUS_TURNAROUND_FIRE_MS;
+    } else if (g_active_master != 0 && g_active_master->panel_count == 0u) {
+        win = RS_PANEL_BUS_TURNAROUND_SCAN_MS;
+    }
     s_bus_quiet_until_ms = now_ms + win;
 }
 
@@ -2430,27 +2446,10 @@ uint8_t RsPanelMaster_InjectRawRsFrame(const uint8_t *frame, uint16_t frame_len)
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
-    static uint8_t s_rx_shadow[RS_BUS_RX_DMA_SIZE];
-    uint16_t n;
-
-    if (g_active_master == 0 || huart == 0 || size == 0u) {
-        return;
-    }
-    if (huart != g_active_master->bus.uart) {
-        return;
-    }
-
-    /* Сначала копия + сразу re-arm DMA: разбор кадра в IRQ дольше байта @2 Мбод → ORE. */
-    n = size;
-    if (n > (uint16_t)sizeof(s_rx_shadow)) {
-        n = (uint16_t)sizeof(s_rx_shadow);
-    }
-    memcpy(s_rx_shadow, g_active_master->bus.rx_dma_buf, n);
-    RsBus_RxRearmFromIsr(&g_active_master->bus);
-
-    RsPanelMasterDebug_OnRxDma(n);
-    RsPanelMasterDebug_OnRxHead(s_rx_shadow, n);
-    RsPanelMaster_OnRxBytes(g_active_master, s_rx_shadow, n);
+    /* USART1 RS: Receive_DMA без IDLE — сюда не попадаем.
+     * Оставляем пустым на случай чужого UART / старого вызова. */
+    (void)huart;
+    (void)size;
 }
 
 void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart)
@@ -2462,4 +2461,12 @@ void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart)
         return;
     }
     RsBus_RecoverFromError(&g_active_master->bus);
+}
+
+void RsPanelMaster_OnRxDmaComplete(void)
+{
+    if (g_active_master == 0) {
+        return;
+    }
+    RsBus_OnRxDmaComplete(&g_active_master->bus);
 }

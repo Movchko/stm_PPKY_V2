@@ -52,6 +52,8 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms);
 void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_t len);
 /** Из HAL_UART_ErrorCallback (USART1): сброс ORE и перезапуск RX DMA. */
 void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart);
+/** Из HAL_UART_RxCpltCallback (USART1): DMA RX буфер полный. */
+void RsPanelMaster_OnRxDmaComplete(void);
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
 /* UI_DATA CONNECTION_STATUS (wifi_on / rs485_on) — отложить TX в Process10ms. */
 void RsPanelMaster_PushConnectionStatus(void);

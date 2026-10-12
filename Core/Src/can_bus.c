@@ -1222,6 +1222,11 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorSt
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+	if (huart == &huart1) {
+		/* RS master: DMA-буфер полный — добрать и rearm (без IDLE). */
+		RsPanelMaster_OnRxDmaComplete();
+		return;
+	}
 	if (huart != &huart2) {
 		return;
 	}
