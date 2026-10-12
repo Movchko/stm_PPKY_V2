@@ -232,6 +232,13 @@ int main(void)
 		   */
 	  }
 
+	 /* RsBus раньше 1ms/10ms: при пожаре Fire_Timer1ms раздувает цикл,
+	  * иначе isRsBusPoll теряется (флаг, не счётчик) → rx_frames_ok 1–2/с. */
+	 if(isRsBusPoll) {
+		 isRsBusPoll = 0u;
+		 AppTimerRsBus();
+	 }
+
 	 if(is1ms) {
 		 is1ms--;
 		 AppTimer1ms();
@@ -240,11 +247,6 @@ int main(void)
 	 if(is10ms) {
 		 is10ms--;
 		 AppTimer10ms();
-	 }
-
-	 if(isRsBusPoll) {
-		 isRsBusPoll = 0u;
-		 AppTimerRsBus();
 	 }
 
 	 CanProcess();

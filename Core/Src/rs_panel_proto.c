@@ -59,10 +59,10 @@ static uint16_t g_menu_selected = 0u; /* dbg mirror */
  * следующий SendFrame AbortReceive перед своим TX.
  */
 /* Ответ панели: короткий RSP сразу, apply после. 40 мс — запас на half-duplex.
- * При FIRE_ACTIVE POLL с ZONES + тяжёлый OnPoll на панели — шире окно,
- * иначе RSP с event_crit (START_SP) не доходит до Fire_OnPanelStartSp. */
+ * FIRE: раньше 120 мс из‑за TouchGFX в OnPoll; UI теперь Queue→Deferred,
+ * ZONES только if_changed. 60 мс — запас на RSP+event_crit без просадки опроса. */
 #define RS_PANEL_BUS_TURNAROUND_MS 40u
-#define RS_PANEL_BUS_TURNAROUND_FIRE_MS 120u
+#define RS_PANEL_BUS_TURNAROUND_FIRE_MS 60u
 /*
  * Если у любого слота gap POLL ≥ этого — addr_scan/ACTIVITY/can_mirror откладываем.
  */

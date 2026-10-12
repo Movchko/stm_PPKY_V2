@@ -1692,7 +1692,9 @@ static uint8_t Fire_CountPendingPhase2(void)
 	return c;
 }
 
-/* Зоны, по которым ещё можно вручную дать ПУСК СП (в т.ч. после зонального ОСТАНОВ). */
+/* Зоны, по которым ещё можно вручную дать ПУСК СП (в т.ч. после зонального ОСТАНОВ).
+ * ПОЖАР1 (fire1_waiting) тоже: панель ретраит START_SP пока status==FIRE1;
+ * операторский пуск снимает ожидание 2-го источника и даёт фазу 2. */
 static uint8_t Fire_CountManualStartable(void)
 {
 	uint8_t c = 0u;
@@ -1705,7 +1707,7 @@ static uint8_t Fire_CountManualStartable(void)
 			c++;
 			continue;
 		}
-		if (!s->phase2_sent && !s->fire1_waiting) {
+		if (!s->phase2_sent) {
 			c++;
 		}
 	}
@@ -1784,7 +1786,7 @@ static uint8_t Fire_Phase2AllPending(void)
 {
 	uint8_t started = 0u;
 	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		if (!g_fire.slots[i].active || g_fire.slots[i].fire1_waiting) {
+		if (!g_fire.slots[i].active) {
 			continue;
 		}
 		if (Fire_ZoneLaunchBlocked(g_fire.slots[i].zone)) {
@@ -1799,10 +1801,11 @@ static uint8_t Fire_Phase2AllPending(void)
 		if (g_fire.slots[i].phase2_sent) {
 			continue;
 		}
-		/* ПУСК СП/ОБЩИЙ снимает зональный ОСТАНОВ и запускает фазу 2. */
+		/* ПУСК СП/ОБЩИЙ: снять зональный ОСТАНОВ; ПОЖАР1 — только после успешной фазы 2. */
 		g_fire.slots[i].launch_stopped = 0u;
 		g_fire.slots[i].countdown_paused = 0u;
 		if (Fire_SendPhase2Zone(g_fire.slots[i].zone)) {
+			g_fire.slots[i].fire1_waiting = 0u;
 			Fire_MarkSlotPhase2Sent(&g_fire.slots[i], HAL_GetTick(), FIRE_LOG_START_MANUAL);
 			started = 1u;
 		}
@@ -1820,9 +1823,6 @@ static uint8_t Fire_Phase2SelectedPending(uint8_t zone)
 		if ((g_fire.slots[i].zone & 0x7Fu) != (zone & 0x7Fu)) {
 			continue;
 		}
-		if (g_fire.slots[i].fire1_waiting) {
-			continue;
-		}
 		if (g_fire.slots[i].extinguish_aborted != 0u) {
 			g_fire.slots[i].extinguish_aborted = 0u;
 			g_fire.slots[i].phase2_sent = 0u;
@@ -1835,6 +1835,7 @@ static uint8_t Fire_Phase2SelectedPending(uint8_t zone)
 		g_fire.slots[i].launch_stopped = 0u;
 		g_fire.slots[i].countdown_paused = 0u;
 		if (Fire_SendPhase2Zone(g_fire.slots[i].zone)) {
+			g_fire.slots[i].fire1_waiting = 0u;
 			Fire_MarkSlotPhase2Sent(&g_fire.slots[i], HAL_GetTick(), FIRE_LOG_START_MANUAL);
 			started = 1u;
 		}
