@@ -21,7 +21,7 @@ void Fire_Init(void);
 /* Обработка 1 мс тиков (вызывать из AppTimer1ms) */
 void Fire_Timer1ms(void);
 
-/* Обработка 10 мс тиков (кнопки/бипер/LED) – вызывать из AppTimer10ms */
+/* Обработка 10 мс тиков (кнопки) – вызывать из AppTimer10ms */
 void Fire_Timer10ms(void);
 
 /* События от протокола backend (вызывать из ListenerCommandCB) */
@@ -40,28 +40,21 @@ void Fire_OnReplyResumeExtinguishmentTimer(uint32_t msg_id);
 /* Текущий статус сценария пожара (для подавления вторичных индикаций). */
 uint8_t Fire_IsActive(void);
 
-/* Есть активный слот с неуспешным тушением (ТУШ.ОШ.) - для LED_ERR. */
+/* Есть активный слот с неуспешным тушением (ТУШ.ОШ.). */
 uint8_t Fire_HasExtinguishIncomplete(void);
 
 /* Идёт удержание ПУСК ОБЩИЙ (3с) - нужен главный экран со счётчиком. */
 uint8_t Fire_IsStartAllHoldActive(void);
 
-/* Активен звук/индикация тушения (ПУСК непрерывно на панели). */
+/* Есть зона в процессе тушения (фаза 2 без end_ack). */
 uint8_t Fire_IsExtinguishIndicationActive(void);
-
-/* Режим обобщённого LED_FIRE для панели:
- * 0 = OFF, 1 = ПОЖАР1 (непрерывно), 2 = ПОЖАР2 (мигание), 3 = ВНИМАНИЕ (мигание). */
-uint8_t Fire_GetPanelFireLedMode(void);
 
 /* Ручной выбор пожара на главном экране (индекс в текущем UI-списке). */
 void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index);
 uint8_t Fire_UiGetSelectedIndex(void);
 
-/* Смена zone_fire_mode[] (меню РЕЖИМ ЗОН) - обновить LED_AUTO_OFF. */
+/* Смена zone_fire_mode[] (меню РЕЖИМ ЗОН). */
 void Fire_NotifyZoneModeChanged(void);
-
-/* Сбросить кэш UI пожара; следующий Fire_Timer10ms переотправит на панели. */
-void Fire_ForceUiResync(void);
 
 /* События с панели (протокол v3): zone=0 — все зоны. */
 void Fire_OnPanelStartAllCommit(void);

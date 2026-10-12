@@ -23,7 +23,6 @@
 /* USER CODE BEGIN Includes */
 #include "stdlib.h"
 #include "app.hpp"
-#include "led.h"
 #include "can_bus.h"
 #include "menu_ui.h"
 #include "fw_update.h"
@@ -107,7 +106,8 @@ const char *GetAppVersion(void)
 {
     static char ver_buf[64];
     /* fw: версия прошивки (пока константа) */
-    (void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 4 версия программной части %u", (unsigned)APP_VERSION_U32);
+    //(void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 04 версия программной части %u", (unsigned)APP_VERSION_U32);
+    (void)snprintf(ver_buf, sizeof(ver_buf), "04");
     return ver_buf;
 }
 
@@ -201,8 +201,6 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  Led_Init();
-
   if(isFlash == true) {
 	  AppInit();
 	  /* Сразу после старта: SetApp(MAIN,UPDATE) стирает сектор с Program WD.

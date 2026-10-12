@@ -3,10 +3,8 @@
 #include "main.h"
 #include "button.h"
 #include "beeper.h"
-#include "led.h"
 #include "backend.h"
 #include "device_config.h"
-#include "sound_profiles.h"
 #include <string.h>
 #include <stdio.h>
 #include "app.hpp"
@@ -25,16 +23,9 @@ extern uint8_t g_active_devices_count;
 
 #define FIRE_MAX_SLOTS       16u
 #define FIRE_UI_MAX_ZONES    16u
-#define FIRE_UI_NAME_LEN     (ZONE_NAME_SIZE + 1u)
-#define FIRE_STOP_TEXT_BLINK_PERIOD_MS       1600u
-#define FIRE_START_SP_TEXT_BLINK_PERIOD_MS   1600u
-#define FIRE_START_ALL_TEXT_BLINK_PERIOD_MS  1600u
-#define FIRE_START_ALL_SOUND_PERIOD_MS       SOUND_START_ALL_HOLD_PERIOD_MS
-#define FIRE_START_ALL_SOUND_DUTY_MS         SOUND_START_ALL_HOLD_DUTY_MS
 /* Малая панель: порог «короткого» ПУСК СП vs переход к удержанию общего пуска. */
 #define FIRE_SP_TO_ALL_HOLD_MS               1000u
 #define FIRE_START_ALL_HOLD_MS               3000u
-#define FIRE_START_LED_HOLD_MS               3000u
 /* ack_flags у IGNITER: предполагаем бит 1 = end_ack */
 #define FIRE_IGNITER_END_ACK_MASK            0x02u
 #define FIRE_CMD_RETRY_TIMEOUT_MS            200u
@@ -54,17 +45,6 @@ extern uint8_t g_active_devices_count;
  * (МКУ ретраит, пока датчик в Fire / was_fire). Новый source_key снова поднимает пожар. */
 #define FIRE_RESET_SUPPRESS_MAX              (FIRE_MAX_SLOTS * FIRE_MAX_SOURCES_PER_ZONE)
 #endif
-/* ГОСТ 53325 п.7.6.1.4 прим.2 / Тр. 3.5: частоты мигания обобщённого LED_FIRE */
-#define FIRE_LED_ATTENTION_HALF_MS           1250u /* 0,4 Гц (диапазон 0,2–0,5 Гц) */
-#define FIRE_LED_FIRE1_HALF_MS                400u /* 1,25 Гц (диапазон 1,0–2,0 Гц) */
-
-typedef enum {
-	FIRE_LED_MODE_OFF = 0,
-	FIRE_LED_MODE_FIRE1,
-	FIRE_LED_MODE_FIRE2,
-	FIRE_LED_MODE_ATTENTION
-} FireLedMode;
-
 /* Коды payload catalog events 9–13 (doc/event_log_catalog.json). */
 #define FIRE_LOG_DET_DPT_R                   0u
 #define FIRE_LOG_DET_DPT_TC                  1u
@@ -136,12 +116,6 @@ typedef struct {
 	uint8_t  ext_seen_no_ack;
 	uint8_t  source_count;
 	uint8_t  log_incomplete_posted;
-#if GOST_MODE
-	uint8_t  ui_src_valid;   /* бегущая строка: МКУ + канал источника */
-	uint8_t  ui_mcu_h_adr;
-	uint8_t  ui_ch_d_type;
-	uint8_t  ui_ch_l_adr;
-#endif
 	uint32_t phase2_deadline_ms;
 	uint32_t ext_retry_next_ms;
 	uint32_t paused_remaining_ms;
@@ -183,19 +157,8 @@ typedef struct {
 	uint8_t   sp_hold_active;
 	uint16_t  sp_hold_ms;
 	uint32_t  state_start_ms;
-	uint32_t  led_toggle_ms;
-	uint8_t   beeper_alert_active;
-	uint8_t   beeper_duty_active;
-	uint8_t   beeper_start_pattern_active;
-	uint8_t   start_all_hold_sound_active;
-	uint32_t  start_pattern_started_ms;
-	uint32_t  start_led_hold_until_ms;
-	uint32_t  stop_text_blink_until_ms;
-	uint32_t  start_sp_text_blink_until_ms;
 	uint8_t   stop_launch_pressed_latched;
 	uint8_t   start_launch_pressed_latched;
-	uint8_t   led_fire_on;
-	uint8_t   led_fire_mode; /* FireLedMode */
 	uint8_t   btn_start_all_hold_latched;
 	uint8_t   btn_start_sp_latched;
 	uint8_t   btn_stop_latched;
@@ -207,16 +170,7 @@ typedef struct {
 	uint8_t   gost_stop_reset_latched;
 	uint16_t  gost_stop_hold_ms;
 #endif
-	uint8_t   start_all_is_bright;
-	uint8_t   last_ui_active;
-	uint8_t   last_ui_mode;
-	uint8_t   last_ui_remaining;
-	uint8_t   last_ui_nzones;
-	uint8_t   last_ui_zone_modes[FIRE_UI_MAX_ZONES];
-	uint8_t   last_ui_zone_remaining[FIRE_UI_MAX_ZONES];
 	uint8_t   last_fire_mode;
-	uint32_t  last_ui_force_names_ms;
-	char      last_ui_names[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
 	/* После «ОСТАНОВ ПУСКА»: авто-отсчёт зон и его отображение отключены, слоты пожара сохраняются */
 	uint8_t   zone_countdown_stopped;
 	/* После команды PauseExtinguishmentTimer: таймеры зон "заморожены". */
@@ -242,8 +196,6 @@ typedef struct {
 static FireResetSuppressEntry g_fire_reset_suppress[FIRE_RESET_SUPPRESS_MAX];
 #endif
 
-/* Управляет яркостью кнопки/подписи ПУСК ОБЩИЙ (обычная/активная). */
-static void Fire_SetStartAllBrightness(uint8_t bright);
 /* Отправляет широкую команду STOP всем МКУ пожарного контура. */
 static void Fire_SendStopAllMcus(void);
 /* Отправляет фазу 1 запуска по конкретной зоне. */
@@ -302,12 +254,7 @@ static uint8_t Fire_IsAndEffectiveForZone(uint8_t zone);
 static uint32_t Fire_SourceKeyFromMsgId(uint32_t msg_id);
 static uint8_t Fire_AddSourceToSlot(FireZoneSlot *slot, uint32_t source_key);
 static uint8_t Fire_HasFire1Waiting(void);
-static uint8_t Fire_ZoneIsFire1Waiting(uint8_t zone);
-static uint8_t Fire_ShouldUseFire1Sound(void);
-static uint8_t Fire_ShouldUseFire1Led(void);
 static uint8_t Fire_PromoteFire1WhenAndUnavailable(uint32_t now_ms);
-/* ГОСТ: управление LED_FIRE (ВНИМАНИЕ / ПОЖАР1 / ПОЖАР2). */
-static void Fire_UpdateLedFire(uint32_t now_ms);
 /* Возвращает 1, если по зоне тушение уже запускалось и повторный пуск запрещён. */
 static uint8_t Fire_ZoneIsExtinguishLocked(uint8_t zone);
 /* Отметить зону как тушащуюся по команде с шины (без повторной отправки CAN). */
@@ -317,7 +264,6 @@ static void Fire_UpdateExtinguishAckTracking(void);
 /* Считает зоны, где фаза 2 ещё не отправлена. */
 static uint8_t Fire_CountPendingPhase2(void);
 /* Минимальный оставшийся таймер (сек) среди pending-зон. */
-static uint8_t Fire_MinRemainingSec(uint32_t now_ms);
 /* Оставшийся таймер (сек) для конкретной зоны из UI-выбора. */
 static uint8_t Fire_RemainingSecForZone(uint8_t zone, uint32_t now_ms);
 /* Автообработка дедлайнов фазы 2 в автоматическом режиме. */
@@ -329,13 +275,10 @@ static uint8_t Fire_ZoneAllIgnitersEndAck(uint8_t zone);
 /* Возвращает 1, если все активные пожарные зоны завершили тушение (end_ack). */
 static uint8_t Fire_AllActiveZonesEndAck(void);
 /* Возвращает 1, если все активные пожарные зоны в терминальном состоянии (успех/ошибка). */
-static uint8_t Fire_AllActiveZonesTerminal(void);
 /* Возвращает 1, если есть хотя бы одна зона с исчерпанными попытками дотушивания. */
 static uint8_t Fire_HasExtinguishFailure(void);
 /* Периодический дотушивающий перезапуск только незавершённых спичек. */
 static void Fire_ProcessExtinguishRetries(uint32_t now_ms);
-/* Формирует список имён зон для UI (уникальные, отсортированные). */
-static void Fire_FillZoneNamesForUi(char (*out_names)[FIRE_UI_NAME_LEN], uint8_t *out_n);
 static uint8_t Fire_BuildUiZoneList(uint8_t *zones, uint8_t max_out);
 /* Собирает отсортированный список igniter-адресов в заданной зоне. */
 static uint8_t Fire_CollectSortedIgniterTargetsByZone(uint8_t zone, FireIgniterAddr *out, uint8_t max_out);
@@ -359,180 +302,16 @@ static void Fire_RetryCancelAll(void);
 static void Fire_RetryCancelKind(uint8_t kind);
 /* Заглушка отчёта о спичке, которая не подтвердила запуск. */
 static void SetErrIgnNotStart(const FireIgniterAddr *addr);
-/* Переводит пищалку в тревожный режим ПОЖАР1/ПОЖАР2. */
-static void Fire_BeeperEnterAlert(uint8_t fire1_sound);
-/* Переводит пищалку в дежурный режим ПОЖАР1/ПОЖАР2. */
-static void Fire_BeeperEnterDuty(uint8_t fire1_sound);
-/* Прерывистый звук для пуска (скважность 2, период 2.4с). */
-static void Fire_BeeperEnterStartPattern(uint32_t now_ms);
-/* Тик/переключение между паттернами. */
-static void Fire_BeeperTick(uint32_t now_ms);
-/* Звук подтверждения удержания ПУСК ОБЩИЙ (1.6с, скважность 2). */
-static void Fire_StartAllHoldSoundOn(void);
-static void Fire_StartAllHoldSoundOff(void);
 static uint8_t Fire_Phase2SelectedPending(uint8_t zone);
 static void Fire_SendStopZone(uint8_t zone);
 static void Fire_AbortExtinguishRetriesForZone(uint8_t zone);
 static uint8_t Fire_GetSelectedZoneFromUi(uint8_t *zone);
+#if !GOST_MODE
 static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8_t stop_reason);
+#endif
 static void Fire_ApplyFireModePolicy(uint32_t now_ms);
 static void Fire_PauseCountdownAndDispatch(uint32_t now_ms);
 static void Fire_ResumeCountdownAndDispatch(uint32_t now_ms);
-
-extern void Fire_UiUpdate(uint8_t active, uint8_t mode, uint8_t remaining_s, uint8_t n_zones,
-			  char (*zone_names)[FIRE_UI_NAME_LEN],
-			  const uint8_t *zone_modes, const uint8_t *zone_remaining);
-
-static void Fire_BeeperEnterAlert(uint8_t fire1_sound)
-{
-	Beeper_ResumeSoundOnNewEvent();
-	/* Сигнальный режим: для ПОЖАР1 отдельный паттерн, для ПОЖАР2 штатный сигнал. */
-	g_fire.beeper_alert_active = 1u;
-	g_fire.beeper_duty_active = 0u;
-	g_fire.beeper_start_pattern_active = 0u;
-	Beeper_StopPattern();
-	if (fire1_sound) {
-		Beeper_ContinuousOff();
-		Beeper_StartPulseTrain(SOUND_FIRE1_SIGNAL_ON_MS, SOUND_FIRE1_SIGNAL_OFF_MS,
-				       SOUND_FIRE1_SIGNAL_PULSES, SOUND_FIRE1_SIGNAL_REPEAT_MS);
-	} else {
-		Beeper_FireAlarmOn();
-	}
-	RsPanelMaster_PushSound();
-}
-
-static void Fire_BeeperEnterDuty(uint8_t fire1_sound)
-{
-	/* После обработки пожара: дежурный профиль зависит от ПОЖАР1/ПОЖАР2. */
-	g_fire.beeper_alert_active = 0u;
-	g_fire.beeper_duty_active = 1u;
-	g_fire.beeper_start_pattern_active = 0u;
-	Beeper_StopPattern();
-	if (fire1_sound) {
-		Beeper_StartPulseTrain(SOUND_FIRE1_DUTY_ON_MS, SOUND_FIRE1_DUTY_OFF_MS,
-				       SOUND_FIRE1_DUTY_PULSES, SOUND_FIRE1_DUTY_REPEAT_MS);
-	} else {
-		Beeper_StartPulseTrain(BEEPER_PATTERN_FIRE_ON_MS, BEEPER_PATTERN_FIRE_OFF_MS,
-				       BEEPER_PATTERN_FIRE_PULSES, BEEPER_PATTERN_FIRE_REPEAT_MS);
-	}
-	RsPanelMaster_PushSound();
-}
-
-static void Fire_BeeperEnterStartPattern(uint32_t now_ms)
-{
-	(void)now_ms;
-	Beeper_ResumeSoundOnNewEvent();
-	/* ПУСК: прерывистый звук  */
-	g_fire.beeper_alert_active = 0u;
-	g_fire.beeper_duty_active = 0u;
-	g_fire.beeper_start_pattern_active = 1u;
-	g_fire.start_pattern_started_ms = HAL_GetTick();
-	Beeper_ContinuousOff();
-	Beeper_StartPulseTrain(BEEPER_PATTERN_START_ON_MS, BEEPER_PATTERN_START_OFF_MS,
-			       BEEPER_PATTERN_START_PULSES, BEEPER_PATTERN_START_REPEAT_MS);
-	RsPanelMaster_PushSound();
-	/* На панель — непрерывное свечение LED_START + звук START. */
-	RsPanelMaster_PushLeds();
-}
-
-/* Есть зона, у которой тушение ещё в процессе (фаза 2 ушла, end_ack нет). */
-static uint8_t Fire_AnyZoneExtinguishingInProgress(void)
-{
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		const FireZoneSlot *s = &g_fire.slots[i];
-		if (!s->active || s->phase2_sent == 0u) {
-			continue;
-		}
-		if (s->extinguish_aborted != 0u || s->ext_retry_failed != 0u) {
-			continue;
-		}
-		if (!Fire_ZoneAllIgnitersEndAck(s->zone)) {
-			return 1u;
-		}
-	}
-	return 0u;
-}
-
-static void Fire_BeeperTick(uint32_t now_ms)
-{
-	if (g_fire.start_all_hold_sound_active) {
-		return;
-	}
-	if (g_fire.beeper_alert_active) {
-		return;
-	}
-	if (g_fire.beeper_start_pattern_active) {
-		if (Fire_AllActiveZonesEndAck()) {
-			/* Все активные зоны потушены — дежурный профиль. */
-			g_fire.beeper_start_pattern_active = 0u;
-			g_fire.start_led_hold_until_ms = now_ms + FIRE_START_LED_HOLD_MS;
-			Fire_BeeperEnterDuty(Fire_ShouldUseFire1Sound());
-			RsPanelMaster_PushLeds();
-		} else if (Fire_AnyZoneExtinguishingInProgress() == 0u) {
-			/* Тушение части зон закончилось, но пожар ещё есть (другие зоны
-			 * в останове/ожидании) — вернуть звук пожара, не держать ПУСК. */
-			Fire_BeeperEnterAlert(Fire_ShouldUseFire1Sound());
-			RsPanelMaster_PushLeds();
-		}
-	}
-}
-
-static void Fire_StartAllHoldSoundOn(void)
-{
-	if (g_fire.start_all_hold_sound_active) {
-		return;
-	}
-	g_fire.start_all_hold_sound_active = 1u;
-	Beeper_ContinuousOff();
-	/* Как на панели: 0.8/0.8 при period 1.6 с — иначе хост через ~1.6 с в IDLE,
-	 * а панель продолжает HOLD; стоп потом может отфильтроваться dedup'ом. */
-	Beeper_StartPulseTrain(FIRE_START_ALL_SOUND_DUTY_MS,
-			       (uint16_t)(FIRE_START_ALL_SOUND_PERIOD_MS - FIRE_START_ALL_SOUND_DUTY_MS),
-			       1u,
-			       FIRE_START_ALL_SOUND_PERIOD_MS);
-	RsPanelMaster_PushSound();
-}
-
-static uint8_t s_start_all_hold_led_blink = 0xFFu;
-/* До какого tick повторять MAIN_FIRE active=0 после ForceUiResync/GostReset. */
-static uint32_t s_ui_clear_retry_until_ms = 0u;
-
-static void Fire_PushStartAllHoldLeds(uint8_t blink_on)
-{
-	/* v3: мигание HOLD на панели локально, не через CMD_LED. */
-	if (RsPanelV3Master_IsV3PollActive() != 0u) {
-		return;
-	}
-	if (blink_on == s_start_all_hold_led_blink) {
-		return;
-	}
-	s_start_all_hold_led_blink = blink_on;
-	RsPanelMaster_PushLeds();
-}
-
-static void Fire_StartAllHoldSoundOff(void)
-{
-	if (g_fire.start_all_hold_sound_active) {
-		g_fire.start_all_hold_sound_active = 0u;
-		Beeper_StopPattern();
-		if (g_fire.beeper_alert_active) {
-			Beeper_StartPulseTrain(BEEPER_PATTERN_FIRE_ON_MS, BEEPER_PATTERN_FIRE_OFF_MS,
-					       BEEPER_PATTERN_FIRE_PULSES, BEEPER_PATTERN_FIRE_REPEAT_MS);
-		} else if (g_fire.beeper_start_pattern_active) {
-			Beeper_StartPulseTrain(BEEPER_PATTERN_START_ON_MS, BEEPER_PATTERN_START_OFF_MS,
-					       BEEPER_PATTERN_START_PULSES, BEEPER_PATTERN_START_REPEAT_MS);
-		} else if (g_fire.beeper_duty_active) {
-			Beeper_StartPulseTrain(BEEPER_PATTERN_FIRE_ON_MS, BEEPER_PATTERN_FIRE_OFF_MS,
-					       BEEPER_PATTERN_FIRE_PULSES, BEEPER_PATTERN_FIRE_REPEAT_MS);
-		}
-	} else {
-		Beeper_StopPattern();
-	}
-	/* Панель крутит START_ALL_HOLD локально (period); хост с repeat=0 мог уже
-	 * уйти в IDLE и закэшировать SOUND_OFF — без invalidate OFF не уйдёт. */
-	RsPanelMaster_InvalidateSoundDedup();
-	RsPanelMaster_PushSound();
-}
 
 static uint8_t Fire_ZoneCanToIdx(uint8_t zone_can)
 {
@@ -558,11 +337,6 @@ static uint8_t Fire_ZoneLaunchBlocked(uint8_t zone_can)
 static uint8_t Fire_ZoneIsManual(uint8_t zone_can)
 {
 	return PPKY_ZoneIsManualByCanZone(zone_can);
-}
-
-static void Fire_RefreshAutoOffLed(void)
-{
-	Led_Set(LED_AUTO_OFF, PPKY_AnyZoneManualOrBlocked() ? 1u : 0u);
 }
 
 static uint8_t Fire_ZoneDelaySec(uint8_t zone)
@@ -721,136 +495,6 @@ static uint8_t Fire_IsMcuDType(uint8_t d_type)
 		d_type == DEVICE_MCU_K3 ||
 		d_type == DEVICE_MCU_KR) ? 1u : 0u;
 }
-
-#if GOST_MODE
-static const char *Fire_ChannelTypeShort(uint8_t v_d_type)
-{
-	switch (v_d_type & 0x7Fu) {
-	case DEVICE_DPT_TYPE: return "ДПТ";
-	case DEVICE_IGNITER_TYPE: return "СП";
-	case DEVICE_BUTTON_TYPE: return "КН";
-	case DEVICE_LSWITCH_TYPE: return "КОН";
-	default: return 0;
-	}
-}
-
-static uint8_t Fire_ChannelTypeHasUiSuffix(uint8_t v_d_type)
-{
-	return (Fire_ChannelTypeShort(v_d_type) != 0) ? 1u : 0u;
-}
-
-/* Обрезать UTF-8 до max_bytes без разрыва многобайтового символа. */
-static size_t Fire_Utf8TruncLen(const char *s, size_t max_bytes)
-{
-	size_t i = 0u;
-
-	if (s == 0 || max_bytes == 0u) {
-		return 0u;
-	}
-	while (i < max_bytes && s[i] != '\0') {
-		unsigned char c = (unsigned char)s[i];
-		size_t clen = 1u;
-		if ((c & 0x80u) == 0u) {
-			clen = 1u;
-		} else if ((c & 0xE0u) == 0xC0u) {
-			clen = 2u;
-		} else if ((c & 0xF0u) == 0xE0u) {
-			clen = 3u;
-		} else if ((c & 0xF8u) == 0xF0u) {
-			clen = 4u;
-		} else {
-			break;
-		}
-		if ((i + clen) > max_bytes) {
-			break;
-		}
-		i += clen;
-	}
-	return i;
-}
-
-/* Имя зоны + суффикс источника; суффикс целиком, имя режется по границе UTF-8. */
-static void Fire_FormatZoneUiName(char *dst, size_t dst_sz, const char *name, const char *suffix)
-{
-	size_t suffix_len;
-	size_t name_max;
-	size_t name_len;
-
-	if (dst == 0 || dst_sz == 0u) {
-		return;
-	}
-	dst[0] = '\0';
-	if (name == 0) {
-		name = "";
-	}
-	if (suffix == 0 || suffix[0] == '\0') {
-		(void)snprintf(dst, dst_sz, "%s", name);
-		dst[dst_sz - 1u] = '\0';
-		return;
-	}
-	suffix_len = strlen(suffix);
-	if (suffix_len >= (dst_sz - 1u)) {
-		/* Суффикс не влезает целиком — отдаём его с безопасной обрезкой. */
-		name_len = Fire_Utf8TruncLen(suffix, dst_sz - 1u);
-		memcpy(dst, suffix, name_len);
-		dst[name_len] = '\0';
-		return;
-	}
-	name_max = (dst_sz - 1u) - suffix_len;
-	name_len = Fire_Utf8TruncLen(name, name_max);
-	memcpy(dst, name, name_len);
-	memcpy(dst + name_len, suffix, suffix_len);
-	dst[name_len + suffix_len] = '\0';
-}
-
-static uint8_t Fire_ResolveMcuHAdr(uint8_t zone, uint8_t ch_d_type, uint8_t ch_l_adr,
-				   uint8_t id_h_adr, uint8_t id_d_type)
-{
-	if (Fire_IsMcuDType(id_d_type) && id_h_adr != 0u) {
-		return id_h_adr;
-	}
-	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
-		const ActiveDeviceInfo *ad = &g_active_devices[i];
-		if (!ad->online || !Fire_IsMcuDType(ad->dev.d_type) ||
-		    (ad->dev.zone & 0x7Fu) != (zone & 0x7Fu)) {
-			continue;
-		}
-		if (ch_d_type == 0u && ch_l_adr == 0u) {
-			return ad->dev.h_adr;
-		}
-		for (uint8_t vi = 0u; vi < ad->vdev_count; vi++) {
-			if ((ad->vdevs[vi].v_d_type & 0x7Fu) == (ch_d_type & 0x7Fu) &&
-			    (ad->vdevs[vi].v_l_adr & 0x3Fu) == (ch_l_adr & 0x3Fu)) {
-				return ad->dev.h_adr;
-			}
-		}
-	}
-	return id_h_adr;
-}
-
-static void Fire_SlotRememberUiSource(FireZoneSlot *slot, uint32_t msg_id, const uint8_t *msg_data)
-{
-	can_ext_id_t id;
-	uint8_t ch_d_type = 0u;
-	uint8_t ch_l_adr = 0u;
-
-	if (slot == NULL) {
-		return;
-	}
-	id.ID = msg_id & 0x0FFFFFFFu;
-	if (msg_data != NULL) {
-		/* SetStatusFire: [0]=cmd [1]=origin_d_type [2]=origin_l_adr */
-		ch_d_type = msg_data[1];
-		ch_l_adr = msg_data[2] & 0x3Fu;
-	}
-	slot->ui_ch_d_type = ch_d_type;
-	slot->ui_ch_l_adr = ch_l_adr;
-	slot->ui_mcu_h_adr = Fire_ResolveMcuHAdr(slot->zone, ch_d_type, ch_l_adr,
-						 (uint8_t)id.field.h_adr,
-						 (uint8_t)(id.field.d_type & 0x7Fu));
-	slot->ui_src_valid = 1u;
-}
-#endif
 
 static uint8_t Fire_ClampU8FromU32(uint32_t v)
 {
@@ -1721,40 +1365,6 @@ static uint8_t Fire_HasFire1Waiting(void)
 	return 0u;
 }
 
-static uint8_t Fire_ZoneIsFire1Waiting(uint8_t zone)
-{
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		if (!g_fire.slots[i].active || !g_fire.slots[i].fire1_waiting) {
-			continue;
-		}
-		if ((g_fire.slots[i].zone & 0x7Fu) == (zone & 0x7Fu)) {
-			return 1u;
-		}
-	}
-	return 0u;
-}
-
-static uint8_t Fire_ShouldUseFire1Sound(void)
-{
-	return (Fire_HasFire1Waiting() && Fire_CountPendingPhase2() == 0u) ? 1u : 0u;
-}
-
-/* Для LED_FIRE: ПОЖАР1 только если все активные зоны ещё в ожидании второй сработки. */
-static uint8_t Fire_ShouldUseFire1Led(void)
-{
-	uint8_t has_fire1 = 0u;
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		if (!g_fire.slots[i].active) {
-			continue;
-		}
-		if (!g_fire.slots[i].fire1_waiting) {
-			return 0u; /* есть ПОЖАР2 / сценарий / тушение — выше приоритет */
-		}
-		has_fire1 = 1u;
-	}
-	return has_fire1;
-}
-
 static uint8_t Fire_PromoteFire1WhenAndUnavailable(uint32_t now_ms)
 {
 	/* Автопереход ПОЖАР1 -> ПОЖАР2:
@@ -1807,7 +1417,6 @@ static uint8_t Fire_TryAddNewFireZone(uint8_t zone, uint32_t source_key, uint8_t
 		}
 #if GOST_MODE
 		/* Новый источник / повторный цикл — обновить подпись бегущей строки. */
-		Fire_SlotRememberUiSource(existing, msg_id, msg_data);
 #endif
 		if (existing->extinguish_locked) {
 			existing->fire_redisplay = 1u;
@@ -1842,7 +1451,6 @@ static uint8_t Fire_TryAddNewFireZone(uint8_t zone, uint32_t source_key, uint8_t
 	s->appeared_ms = now_ms;
 	(void)Fire_AddSourceToSlot(s, source_key);
 #if GOST_MODE
-	Fire_SlotRememberUiSource(s, msg_id, msg_data);
 #endif
 	if (Fire_ZoneLaunchBlocked(zone)) {
 		s->fire1_waiting = 0u;
@@ -2084,19 +1692,6 @@ static uint8_t Fire_CountPendingPhase2(void)
 	return c;
 }
 
-static uint8_t Fire_CountBlockedFireSlots(void)
-{
-	uint8_t c = 0u;
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		if (g_fire.slots[i].active && !g_fire.slots[i].phase2_sent &&
-		    !g_fire.slots[i].fire1_waiting &&
-		    Fire_ZoneLaunchBlocked(g_fire.slots[i].zone)) {
-			c++;
-		}
-	}
-	return c;
-}
-
 /* Зоны, по которым ещё можно вручную дать ПУСК СП (в т.ч. после зонального ОСТАНОВ). */
 static uint8_t Fire_CountManualStartable(void)
 {
@@ -2115,48 +1710,6 @@ static uint8_t Fire_CountManualStartable(void)
 		}
 	}
 	return c;
-}
-
-static uint8_t Fire_AnyLaunchStopped(void)
-{
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		if (g_fire.slots[i].active && g_fire.slots[i].launch_stopped) {
-			return 1u;
-		}
-	}
-	return 0u;
-}
-
-static uint8_t Fire_MinRemainingSec(uint32_t now_ms)
-{
-	if (g_fire.zone_countdown_stopped) {
-		return 0u;
-	}
-	uint32_t best_ms = 0xFFFFFFFFu;
-	uint8_t found = 0u;
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		FireZoneSlot *s = &g_fire.slots[i];
-		if (!s->active || s->phase2_sent || s->fire1_waiting || s->launch_stopped ||
-		    Fire_ZoneLaunchBlocked(s->zone)) {
-			continue;
-		}
-		found = 1u;
-		uint32_t rem;
-		if (g_fire.zone_countdown_paused || s->countdown_paused != 0u) {
-			rem = s->paused_remaining_ms;
-		} else if (now_ms >= s->phase2_deadline_ms) {
-			return 0u;
-		} else {
-			rem = s->phase2_deadline_ms - now_ms;
-		}
-		if (rem < best_ms) {
-			best_ms = rem;
-		}
-	}
-	if (!found) {
-		return 0u;
-	}
-	return (uint8_t)((best_ms + 999u) / 1000u);
 }
 
 static uint8_t Fire_RemainingSecForZone(uint8_t zone, uint32_t now_ms)
@@ -2448,30 +2001,6 @@ static uint8_t Fire_AllActiveZonesEndAck(void)
 	return any_zone;
 }
 
-static uint8_t Fire_AllActiveZonesTerminal(void)
-{
-	uint8_t any_zone = 0u;
-	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-		const FireZoneSlot *s = &g_fire.slots[i];
-		if (!s->active) {
-			continue;
-		}
-		any_zone = 1u;
-		/* Операторский стоп: зона остаётся в ПОЖАР — не считаем «все терминальны»
-		 * (иначе Sync уйдёт в IDLE и баннер ПОЖАР пропадёт). */
-		if (s->extinguish_aborted != 0u) {
-			return 0u;
-		}
-		if (!s->phase2_sent) {
-			return 0u;
-		}
-		if (!Fire_ZoneAllIgnitersEndAck(s->zone) && s->ext_retry_failed == 0u) {
-			return 0u;
-		}
-	}
-	return any_zone;
-}
-
 static uint8_t Fire_HasExtinguishFailure(void)
 {
 	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
@@ -2685,254 +2214,8 @@ static void Fire_UiStatusForZone(uint8_t zone, uint32_t now_ms, uint8_t *mode_ou
 	*rem_out = found ? best_rem : 0u;
 }
 
-static void Fire_FillZoneNamesForUi(char (*out_names)[FIRE_UI_NAME_LEN], uint8_t *out_n)
-{
-	/* Готовит уникальный отсортированный список имён зон для UI панели. */
-	uint8_t zones[FIRE_UI_MAX_ZONES];
-	uint8_t nz = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
-	*out_n = nz;
-	for (uint8_t i = 0u; i < nz; i++) {
-		uint8_t z_can = zones[i];
-		uint8_t zi = Fire_ZoneCanToIdx(z_can);
-		char *dst = out_names[i];
-		if (zi >= ZONE_NUMBER) {
-			dst[0] = '\0';
-			continue;
-		}
-		char name[ZONE_NAME_SIZE + 1u];
-		memcpy(name, PPKYConfig.zone_name[zi], ZONE_NAME_SIZE);
-		name[ZONE_NAME_SIZE] = '\0';
-		for (int s = (int)ZONE_NAME_SIZE - 1; s >= 0; s--) {
-			if (name[s] == ' ' || name[s] == '\0') {
-				name[s] = '\0';
-			} else {
-				break;
-			}
-		}
-		if (name[0] == '\0') {
-			(void)snprintf(name, sizeof(name), "Зона %u", (unsigned)z_can);
-		}
-#if GOST_MODE
-		{
-			int8_t si = Fire_FindSlotZone(z_can);
-			uint8_t have_src = 0u;
-			const FireZoneSlot *slot = 0;
-			if (si >= 0) {
-				uint8_t key = Fire_UiZoneKey(z_can);
-				for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-					const FireZoneSlot *s = &g_fire.slots[i];
-					if (!s->active || Fire_UiZoneKey(s->zone) != key ||
-					    s->ui_src_valid == 0u) {
-						continue;
-					}
-					/* Суффикс только для известного канала (ДПТ/СП/КН/КОН).
-					 * Иначе default «К» + l_adr=0 даёт «К0» даже если в имени зоны этого нет. */
-					if (Fire_ChannelTypeHasUiSuffix(s->ui_ch_d_type) == 0u) {
-						continue;
-					}
-					slot = s;
-					have_src = 1u;
-					break;
-				}
-			}
-			if (have_src != 0u && slot != 0) {
-				char suffix[28];
-				const char *type_s = Fire_ChannelTypeShort(slot->ui_ch_d_type);
-				if (type_s == 0) {
-					(void)snprintf(dst, (size_t)FIRE_UI_NAME_LEN, "%s", name);
-				} else {
-					if (slot->ui_mcu_h_adr != 0u) {
-						(void)snprintf(suffix, sizeof(suffix), " МКУ %u %s%u",
-							       (unsigned)slot->ui_mcu_h_adr,
-							       type_s,
-							       (unsigned)slot->ui_ch_l_adr);
-					} else {
-						(void)snprintf(suffix, sizeof(suffix), " %s%u",
-							       type_s,
-							       (unsigned)slot->ui_ch_l_adr);
-					}
-					Fire_FormatZoneUiName(dst, (size_t)FIRE_UI_NAME_LEN, name, suffix);
-				}
-			} else {
-				(void)snprintf(dst, (size_t)FIRE_UI_NAME_LEN, "%s", name);
-			}
-		}
-#else
-		(void)snprintf(dst, (size_t)FIRE_UI_NAME_LEN, "%s", name);
-#endif
-		dst[FIRE_UI_NAME_LEN - 1u] = '\0';
-	}
-}
-
-static void Fire_UpdateUiText(uint8_t active, uint8_t mode, uint8_t remaining_s, uint8_t n_zones,
-			      char (*zone_names)[FIRE_UI_NAME_LEN],
-			      const uint8_t *zone_modes, const uint8_t *zone_remaining)
-{
-	/* Пуш в UI только при изменениях; есть защита от редкой рассинхронизации n_zones==0. */
-	uint8_t same = (g_fire.last_ui_active == active && g_fire.last_ui_mode == mode &&
-			g_fire.last_ui_remaining == remaining_s &&
-			g_fire.last_ui_nzones == n_zones);
-	if (same && n_zones > 0u) {
-		same = (memcmp(g_fire.last_ui_names, zone_names,
-			       (size_t)n_zones * (size_t)FIRE_UI_NAME_LEN) == 0);
-	}
-	if (same && n_zones > 0u && zone_modes != 0) {
-		same = (memcmp(g_fire.last_ui_zone_modes, zone_modes, (size_t)n_zones) == 0);
-	}
-	if (same && n_zones > 0u && zone_remaining != 0) {
-		same = (memcmp(g_fire.last_ui_zone_remaining, zone_remaining, (size_t)n_zones) == 0);
-	}
-	/*
-	 * Раньше при n_zones==0 кэш считал одинаковым (active, remaining, 0) и годами не вызывал
-	 * Fire_UiUpdate, пока не сменится секунда таймера — имя зоны не доходило до UI панели.
-	 * При активных слотах список имён должен быть непуст: периодически пробиваем кэш.
-	 */
-	if (same && active && n_zones == 0u && Fire_AnyActiveSlot()) {
-		uint32_t t = HAL_GetTick();
-		if ((t - g_fire.last_ui_force_names_ms) >= 50u) {
-			g_fire.last_ui_force_names_ms = t;
-			same = 0u;
-		}
-	}
-	/* Удержание ПУСК ОБЩИЙ (n_zones==0): периодически пробиваем dedup — RS/ACK
-	 * могли проглотить единственный кадр, а секунда remaining ещё та же. */
-	if (same && active && mode == 1u && n_zones == 0u && g_fire.all_hold_active) {
-		uint32_t t = HAL_GetTick();
-		if ((t - g_fire.last_ui_force_names_ms) >= 200u) {
-			g_fire.last_ui_force_names_ms = t;
-			same = 0u;
-		}
-	}
-	/* ДО ПУСКА: кадр с новой секундой легко теряется на half-duplex (SOUND/LED/POLL).
-	 * Dedup уже запомнил remaining — без retry экран залипает на первом значении. */
-	if (same && active != 0u && mode == 1u && n_zones > 0u) {
-		uint32_t t = HAL_GetTick();
-		if ((t - g_fire.last_ui_force_names_ms) >= 250u) {
-			g_fire.last_ui_force_names_ms = t;
-			same = 0u;
-		}
-	}
-	/* После GostReset/ForceUiResync: повторять active=0 ~2 с, пока панель
-	 * может не принять единственный clear (fire_active залипает, меню закрыто). */
-	if (same && active == 0u &&
-	    (int32_t)(HAL_GetTick() - s_ui_clear_retry_until_ms) < 0) {
-		uint32_t t = HAL_GetTick();
-		if ((t - g_fire.last_ui_force_names_ms) >= 250u) {
-			g_fire.last_ui_force_names_ms = t;
-			same = 0u;
-		}
-	}
-	if (same) {
-		return;
-	}
-	g_fire.last_ui_active = active;
-	g_fire.last_ui_mode = mode;
-	g_fire.last_ui_remaining = remaining_s;
-	g_fire.last_ui_nzones = n_zones;
-	if (n_zones > 0u) {
-		memcpy(g_fire.last_ui_names, zone_names,
-		       (size_t)n_zones * (size_t)FIRE_UI_NAME_LEN);
-		if (zone_modes != 0) {
-			memcpy(g_fire.last_ui_zone_modes, zone_modes, (size_t)n_zones);
-		}
-		if (zone_remaining != 0) {
-			memcpy(g_fire.last_ui_zone_remaining, zone_remaining, (size_t)n_zones);
-		}
-	}
-	Fire_UiUpdate(active, mode, remaining_s, n_zones, zone_names, zone_modes, zone_remaining);
-}
-
 /* Обобщённый индикатор ПОЖАР: ПОЖАР1 непрерывно, ПОЖАР2 и ВНИМАНИЕ мигают.
  * Приоритет: ПОЖАР2 > ПОЖАР1 > ВНИМАНИЕ. */
-static void Fire_UpdateLedFire(uint32_t now_ms)
-{
-	uint8_t mode = FIRE_LED_MODE_OFF;
-	uint8_t mode_changed = 0u;
-
-	if (g_fire.state != FIRE_STATE_IDLE || Fire_AnyActiveSlot()) {
-		mode = Fire_ShouldUseFire1Led() ? FIRE_LED_MODE_FIRE1 : FIRE_LED_MODE_FIRE2;
-	} else if (Warning_HasActiveAttention()) {
-		mode = FIRE_LED_MODE_ATTENTION;
-	}
-
-	if (mode != g_fire.led_fire_mode) {
-		g_fire.led_fire_mode = mode;
-		g_fire.led_toggle_ms = now_ms;
-		g_fire.led_fire_on = (mode != FIRE_LED_MODE_OFF) ? 1u : 0u;
-		mode_changed = 1u;
-	}
-
-	if (mode == FIRE_LED_MODE_OFF) {
-		if (Led_GetState(LED_FIRE) != 0u || mode_changed != 0u) {
-			Led_Set(LED_FIRE, 0);
-			RsPanelMaster_PushLeds();
-		}
-		g_fire.led_fire_on = 0u;
-		return;
-	}
-
-	if (mode == FIRE_LED_MODE_FIRE1) {
-		if (Led_GetState(LED_FIRE) != 1u || mode_changed != 0u) {
-			Led_Set(LED_FIRE, 1u);
-			RsPanelMaster_PushLeds();
-		}
-		g_fire.led_fire_on = 1u;
-		if (g_fire.beeper_alert_active) {
-			Led_ForceStatusBright(LED_FIRE);
-		}
-		return;
-	}
-
-	{
-		uint8_t prev_on = g_fire.led_fire_on;
-		uint32_t half_ms = (mode == FIRE_LED_MODE_FIRE2) ?
-				   FIRE_LED_FIRE1_HALF_MS : FIRE_LED_ATTENTION_HALF_MS;
-		if (TickAgeExpiredMs(now_ms, g_fire.led_toggle_ms, half_ms) != 0u) {
-			g_fire.led_toggle_ms = now_ms;
-			g_fire.led_fire_on = (uint8_t)!g_fire.led_fire_on;
-		}
-		Led_Set(LED_FIRE, g_fire.led_fire_on);
-		/* ППКУ2: LED на панели только по CMD_LED — пуш на каждом фронте мигания. */
-		if (g_fire.led_fire_on != prev_on || mode_changed != 0u) {
-			RsPanelMaster_PushLeds();
-		}
-		if (g_fire.led_fire_on) {
-			if (g_fire.beeper_alert_active || mode == FIRE_LED_MODE_ATTENTION) {
-				Led_ForceStatusBright(LED_FIRE);
-			}
-		}
-	}
-}
-
-static void Fire_SetIdleIndication(void)
-{
-	/* Полный дежурный профиль индикаторов/звука в состоянии IDLE. */
-	Led_Set(LED_BUT_START_SP, 0);
-	Led_Set(LED_STR_START_SP, 0);
-	Led_Set(LED_BUT_START_ALL, 0);
-	Fire_SetStartAllBrightness(0u);
-	Led_Set(LED_STR_START_ALL, 1u);
-	Led_Set(LED_BUT_STOP, 0);
-	Led_Set(LED_STR_STOP, 0);
-	Led_Set(LED_START, 0);
-	Led_Set(LED_STOP, 0);
-	Led_Set(LED_FIRE, 0);
-	g_fire.led_fire_mode = FIRE_LED_MODE_OFF;
-	g_fire.led_fire_on = 0u;
-	Fire_RefreshAutoOffLed();
-	/* LED_FIRE при ВНИМАНИЕ — Fire_UpdateLedFire после Idle. */
-	g_fire.stop_launch_pressed_latched = 0u;
-	g_fire.beeper_alert_active = 0u;
-	g_fire.beeper_duty_active = 0u;
-	g_fire.beeper_start_pattern_active = 0u;
-	Beeper_ContinuousOff();
-	if (!g_fire.start_all_hold_sound_active) {
-		Beeper_StopPattern();
-	}
-	RsPanelMaster_PushSound();
-	RsPanelMaster_PushLeds();
-}
-
 #if GOST_MODE
 static void Fire_GostResetFire(uint32_t now_ms)
 {
@@ -2988,15 +2271,11 @@ static void Fire_GostResetFire(uint32_t now_ms)
 
 	g_fire.start_launch_pressed_latched = 0u;
 	g_fire.stop_launch_pressed_latched = 0u;
-	g_fire.start_led_hold_until_ms = 0u;
-	g_fire.stop_text_blink_until_ms = 0u;
-	g_fire.start_sp_text_blink_until_ms = 0u;
 	g_fire.all_hold_active = 0u;
 	g_fire.all_hold_ms = 0u;
 	g_fire.sp_hold_active = 0u;
 	g_fire.sp_hold_ms = 0u;
 	g_fire.btn_start_all_hold_latched = 0u;
-	Fire_StartAllHoldSoundOff();
 
 	Fire_SyncStateFromSlots();
 	g_fire.state_start_ms = now_ms;
@@ -3006,36 +2285,13 @@ static void Fire_GostResetFire(uint32_t now_ms)
 		g_fire.state = FIRE_STATE_IDLE;
 		g_fire.zone_countdown_stopped = 0u;
 		g_fire.zone_countdown_paused = 0u;
-		Fire_SetIdleIndication();
-		Fire_UpdateLedFire(now_ms);
-		{
-			char z0[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
-			/* ForceUiResync: иначе cached active=0 после неудачного TX
-			 * не повторяется, а на панели залипают ТУШ.ВЫП и fire_active. */
-			Fire_ForceUiResync();
-			Fire_UpdateUiText(0u, 0u, 0u, 0u, z0, 0, 0);
-		}
-		RsPanelMaster_PushLeds();
 	} else {
-		/* Остались другие зоны — обновить UI/звук через обычный тик FSM. */
-		Fire_ForceUiResync();
 		Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
-		RsPanelMaster_PushLeds();
 	}
 }
 #endif
 
-static void Fire_SetStartAllBrightness(uint8_t bright)
-{
-	if (g_fire.start_all_is_bright == bright) {
-		return;
-	}
-	g_fire.start_all_is_bright = bright;
-	uint8_t pwr = bright ? LED_BUT_MAX_BRIGHTNESS : LED_BUT_DIM_BRIGHTNESS;
-	Led_SetBrightness(LED_BUT_START_ALL, pwr);
-	Led_SetBrightness(LED_STR_START_ALL, pwr);
-}
-
+#if !GOST_MODE
 static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8_t stop_reason)
 {
 	/* Общее поведение "ОСТАНОВ ПУСКА": таймеры остановлены, arm на МКУ снят,
@@ -3045,7 +2301,8 @@ static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8
 	g_fire.zone_countdown_paused = 0u;
 	g_fire.start_launch_pressed_latched = 0u;
 	g_fire.stop_launch_pressed_latched = 1u;
-	g_fire.stop_text_blink_until_ms = blink_stop_text ? (now_ms + (FIRE_STOP_TEXT_BLINK_PERIOD_MS * 3u)) : 0u;
+	(void)blink_stop_text;
+	(void)now_ms;
 	Fire_SendStopAllMcus();
 	Fire_AbortExtinguishRetriesAll();
 	g_fire.all_hold_active = 0u;
@@ -3053,11 +2310,11 @@ static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8
 	g_fire.sp_hold_active = 0u;
 	g_fire.sp_hold_ms = 0u;
 	g_fire.btn_start_all_hold_latched = 0u;
-	Fire_StartAllHoldSoundOff();
 	if (Fire_CountPendingPhase2() > 0u) {
 		g_fire.state = FIRE_STATE_WAIT_MANUAL;
 	}
 }
+#endif
 
 static void Fire_ApplyFireModePolicy(uint32_t now_ms)
 {
@@ -3066,7 +2323,6 @@ static void Fire_ApplyFireModePolicy(uint32_t now_ms)
 		return;
 	}
 	g_fire.last_fire_mode = mode;
-	Fire_RefreshAutoOffLed();
 
 	/* Внешний перевод в manual во время активного пожара должен вести себя как кнопка STOP. */
 #if !GOST_MODE
@@ -3099,92 +2355,10 @@ static uint8_t Fire_ButtonPressedEvent(uint8_t button_id, uint8_t *latched_flag)
 	return 0u;
 }
 
-static void Fire_ApplyStateLeds(uint32_t now_ms)
-{
-	/* Профиль индикации для не-IDLE состояний; отдельные override применяются в Fire_Transition(). */
-	Fire_RefreshAutoOffLed();
-
-	uint8_t manual_startable = Fire_CountManualStartable();
-
-	if (manual_startable > 0u) {
-		Led_Set(LED_BUT_START_SP, 1);
-		if ((int32_t)(now_ms - g_fire.start_sp_text_blink_until_ms) < 0) {
-			uint8_t blink_on = (((now_ms / (FIRE_START_SP_TEXT_BLINK_PERIOD_MS / 2u)) & 1u) != 0u) ? 1u : 0u;
-			Led_Set(LED_STR_START_SP, blink_on);
-		} else {
-			Led_Set(LED_STR_START_SP, 1);
-		}
-		Led_Set(LED_BUT_STOP, 1);
-		if ((int32_t)(now_ms - g_fire.stop_text_blink_until_ms) < 0) {
-			uint8_t blink_on = (((now_ms / (FIRE_STOP_TEXT_BLINK_PERIOD_MS / 2u)) & 1u) != 0u) ? 1u : 0u;
-			Led_Set(LED_STR_STOP, blink_on);
-		} else {
-			Led_Set(LED_STR_STOP, 1);
-		}
-		if (g_fire.all_hold_active) {
-			/* Мигание кнопки/подписи задаётся ниже после ApplyStateLeds. */
-			Fire_SetStartAllBrightness(1u);
-		} else {
-			Fire_SetStartAllBrightness(0u);
-			Led_Set(LED_BUT_START_ALL, 0u);
-			Led_Set(LED_STR_START_ALL, 1u);
-		}
-		if (g_fire.beeper_start_pattern_active != 0u ||
-		    Fire_AnyZoneExtinguishingInProgress() != 0u) {
-#if GOST_MODE
-			/* Тр. 3.6 / ГОСТ 7.6.3.2а: ПУСК — непрерывное свечение (звук остаётся прерывистым). */
-			Led_Set(LED_START, 1u);
-#else
-			uint32_t phase = (now_ms - g_fire.start_pattern_started_ms) %
-					 (BEEPER_PATTERN_START_ON_MS + BEEPER_PATTERN_START_OFF_MS);
-			Led_Set(LED_START, (phase < BEEPER_PATTERN_START_ON_MS) ? 1u : 0u);
-#endif
-			Led_ForceStatusBright(LED_START);
-		} else {
-			Led_Set(LED_START, ((int32_t)(now_ms - g_fire.start_led_hold_until_ms) < 0) ? 1u : 0u);
-		}
-	} else {
-		Led_Set(LED_BUT_START_SP, 0);
-		Led_Set(LED_STR_START_SP, 0);
-		if (g_fire.stop_launch_pressed_latched || Fire_AnyLaunchStopped()) {
-			Led_Set(LED_BUT_STOP, 1);
-			if ((int32_t)(now_ms - g_fire.stop_text_blink_until_ms) < 0) {
-				uint8_t blink_on = (((now_ms / (FIRE_STOP_TEXT_BLINK_PERIOD_MS / 2u)) & 1u) != 0u) ? 1u : 0u;
-				Led_Set(LED_STR_STOP, blink_on);
-			} else {
-				Led_Set(LED_STR_STOP, 1);
-			}
-		} else {
-			Led_Set(LED_BUT_STOP, 0);
-			Led_Set(LED_STR_STOP, 0);
-		}
-		Fire_SetStartAllBrightness(0u);
-		Led_Set(LED_BUT_START_ALL, 0);
-		Led_Set(LED_STR_START_ALL, 1);
-		if (g_fire.beeper_start_pattern_active != 0u ||
-		    Fire_AnyZoneExtinguishingInProgress() != 0u) {
-#if GOST_MODE
-			Led_Set(LED_START, 1u);
-#else
-			uint32_t phase = (now_ms - g_fire.start_pattern_started_ms) %
-					 (BEEPER_PATTERN_START_ON_MS + BEEPER_PATTERN_START_OFF_MS);
-			Led_Set(LED_START, (phase < BEEPER_PATTERN_START_ON_MS) ? 1u : 0u);
-#endif
-			Led_ForceStatusBright(LED_START);
-		} else {
-			Led_Set(LED_START, ((int32_t)(now_ms - g_fire.start_led_hold_until_ms) < 0) ? 1u : 0u);
-		}
-	}
-	Led_Set(LED_STOP, (g_fire.stop_launch_pressed_latched || Fire_AnyLaunchStopped()) ? 1u : 0u);
-}
-
 static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 {
 	/* Единая точка обработки событий сценария пожара:
-	 * FSM, автодедлайны, звук, LED и публикация состояния на UI. */
-	uint8_t ui_active = 0u;
-	uint8_t ui_mode = 0u;
-	uint8_t ui_remaining = 0u;
+	 * FSM, автодедлайны, звук, LED. Состояние зон — Fire_FillV3Zones (POLL). */
 	uint8_t fire_processed = 0u;
 	uint8_t start_processed = 0u;
 
@@ -3199,9 +2373,7 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 #endif
 			g_fire.reply_received = 0u;
 		}
-		Led_ForceStatusBright(LED_FIRE);
-		/* Новый пожар: профиль звука зависит от ПОЖАР1/ПОЖАР2. */
-		Fire_BeeperEnterAlert(Fire_ShouldUseFire1Sound());
+		Beeper_ResumeSoundOnNewEvent();
 #if !GOST_MODE
 		if (PPKYConfig.fire_mode == 2u) {
 			/* В ручном режиме пожар сразу обрабатывается как "ОСТАНОВ ПУСКА". */
@@ -3209,7 +2381,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 			fire_processed = 1u;
 		}
 #else
-		Fire_RefreshAutoOffLed();
 		fire_processed = 1u;
 #endif
 		break;
@@ -3218,8 +2389,7 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		if (g_fire.state == FIRE_STATE_IDLE) {
 			g_fire.state = (PPKYConfig.fire_mode == 2u) ? FIRE_STATE_WAIT_MANUAL : FIRE_STATE_WAIT_AUTO;
 		}
-		Led_ForceStatusBright(LED_FIRE);
-		Fire_BeeperEnterAlert(Fire_ShouldUseFire1Sound());
+		Beeper_ResumeSoundOnNewEvent();
 		fire_processed = 1u;
 		break;
 	case FIRE_EVENT_REPLY_FIRE:
@@ -3238,7 +2408,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		g_fire.sp_hold_active = 0u;
 		g_fire.sp_hold_ms = 0u;
 		g_fire.btn_start_all_hold_latched = 0u;
-		Fire_StartAllHoldSoundOff();
 		if (Fire_CountPendingPhase2() > 0u) {
 			g_fire.state = (PPKYConfig.fire_mode == 2u) ? FIRE_STATE_WAIT_MANUAL : FIRE_STATE_WAIT_AUTO;
 		}
@@ -3285,7 +2454,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 			}
 			g_fire.start_launch_pressed_latched = 1u;
 			g_fire.stop_launch_pressed_latched = 0u;
-			g_fire.start_sp_text_blink_until_ms = now_ms + (FIRE_START_SP_TEXT_BLINK_PERIOD_MS * 3u);
 			Fire_SyncStateFromSlots();
 			fire_processed = 1u;
 			start_processed = 1u;
@@ -3310,7 +2478,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 			if (any_started) {
 			g_fire.start_launch_pressed_latched = 1u;
 			g_fire.stop_launch_pressed_latched = 0u;
-			g_fire.start_sp_text_blink_until_ms = now_ms + (FIRE_START_SP_TEXT_BLINK_PERIOD_MS * 3u);
 			Fire_SyncStateFromSlots();
 			fire_processed = 1u;
 			start_processed = 1u;
@@ -3331,7 +2498,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 			if (any_started) {
 				g_fire.start_launch_pressed_latched = 1u;
 				g_fire.stop_launch_pressed_latched = 0u;
-				g_fire.start_sp_text_blink_until_ms = now_ms + (FIRE_START_SP_TEXT_BLINK_PERIOD_MS * 3u);
 				Fire_SyncStateFromSlots();
 				fire_processed = 1u;
 				start_processed = 1u;
@@ -3384,8 +2550,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 						(void)Fire_AbortZoneExtinguishOperator(sel_zone, now_ms);
 						g_fire.start_launch_pressed_latched = 0u;
 						g_fire.stop_launch_pressed_latched = 1u;
-						g_fire.stop_text_blink_until_ms =
-							now_ms + (FIRE_STOP_TEXT_BLINK_PERIOD_MS * 3u);
 						Fire_SyncStateFromSlots();
 						fire_processed = 1u;
 						break;
@@ -3398,8 +2562,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 						} else {
 							Fire_PauseZoneCountdown(sel_zone, now_ms);
 							g_fire.stop_launch_pressed_latched = 1u;
-							g_fire.stop_text_blink_until_ms =
-								now_ms + (FIRE_STOP_TEXT_BLINK_PERIOD_MS * 3u);
 						}
 						g_fire.start_launch_pressed_latched = 0u;
 						Fire_SyncStateFromSlots();
@@ -3447,245 +2609,14 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 	Fire_ProcessExtinguishRetries(now_ms);
 	Fire_UpdateExtinguishAckTracking();
 	Fire_SyncStateFromSlots();
-	/* Пока решение не принято (до ПУСК/СТОП/автопуска), удерживаем тревожный звук активным.
-	 * Это защищает от внешних пересечений индикации, которые могут сбросить звук. */
-	if ((g_fire.state == FIRE_STATE_WAIT_AUTO || g_fire.state == FIRE_STATE_WAIT_MANUAL) &&
-	    (g_fire.start_launch_pressed_latched == 0u) &&
-	    ((g_fire.stop_launch_pressed_latched == 0u) ||
-	     (Fire_CountPendingPhase2() > 0u) || Fire_HasFire1Waiting()) &&
-	    !g_fire.all_hold_active &&
-	    !g_fire.beeper_alert_active &&
-	    !g_fire.beeper_start_pattern_active &&
-	    !g_fire.beeper_duty_active) {
-		Fire_BeeperEnterAlert(Fire_ShouldUseFire1Sound());
+	if (fire_processed != 0u && g_fire.state != FIRE_STATE_IDLE) {
+		Beeper_ResumeSoundOnNewEvent();
 	}
-	if (fire_processed && g_fire.state != FIRE_STATE_IDLE) {
-		if (start_processed) {
-			Fire_BeeperEnterStartPattern(now_ms);
-		} else {
-			/* Останов: если есть ещё pending/ПОЖАР1 по другим зонам — тревога, иначе дежурный. */
-			if (Fire_CountPendingPhase2() > 0u || Fire_HasFire1Waiting()) {
-				Fire_BeeperEnterAlert(Fire_ShouldUseFire1Sound());
-			} else {
-				Fire_BeeperEnterDuty(Fire_ShouldUseFire1Sound());
-			}
-		}
-		Led_SetBrightness(LED_FIRE, LED_STATUS_DIM_BRIGHTNESS);
-	}
-	Fire_BeeperTick(now_ms);
+	(void)start_processed;
 
-	if (g_fire.all_hold_active && g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS) {
-		ui_mode = 1u;
-		{
-			uint32_t rem_ms = FIRE_START_ALL_HOLD_MS - g_fire.all_hold_ms;
-			ui_remaining = (uint8_t)((rem_ms + 999u) / 1000u);
-		}
-	} else if (g_fire.state == FIRE_STATE_WAIT_AUTO || g_fire.state == FIRE_STATE_WAIT_MANUAL) {
-		if (!g_fire.zone_countdown_stopped) {
-#if GOST_MODE
-			if (g_fire_ui_manual_select_enabled) {
-				uint8_t sel_zone = 0u;
-				if (Fire_GetSelectedZoneFromUi(&sel_zone)) {
-					int8_t si = Fire_FindSlotZone(sel_zone);
-					if (Fire_ZoneLaunchBlocked(sel_zone)) {
-						ui_mode = 8u; /* ПУСК ЗАБЛ. */
-						ui_remaining = 0u;
-					} else if (si >= 0 && g_fire.slots[(uint8_t)si].extinguish_aborted != 0u) {
-						ui_mode = 9u; /* ТУШЕНИЕ ОСТ. */
-						ui_remaining = 0u;
-					} else if (si >= 0 && g_fire.slots[(uint8_t)si].phase2_sent != 0u &&
-						   Fire_ZoneAllIgnitersEndAck(sel_zone)) {
-						ui_mode = 3u; /* ТУШ.ВЫП. по выбранной зоне */
-						ui_remaining = 0u;
-					} else if (si >= 0 && g_fire.slots[(uint8_t)si].countdown_paused != 0u) {
-						ui_mode = 5u; /* ПАУЗА */
-						ui_remaining = (uint8_t)((g_fire.slots[(uint8_t)si].paused_remaining_ms + 999u) / 1000u);
-					} else if (si >= 0 && g_fire.slots[(uint8_t)si].launch_stopped) {
-						ui_mode = 4u; /* ПОЖАР/ОСТ. ПУСКА по выбранной зоне */
-						ui_remaining = 0u;
-					} else if (Fire_ZoneIsFire1Waiting(sel_zone)) {
-						ui_mode = 6u; /* ПОЖАР1 */
-						ui_remaining = 0u;
-					} else {
-						ui_remaining = Fire_RemainingSecForZone(sel_zone, now_ms);
-					}
-				} else {
-					ui_remaining = Fire_MinRemainingSec(now_ms);
-				}
-			} else {
-				ui_remaining = Fire_MinRemainingSec(now_ms);
-			}
-#else
-			ui_remaining = Fire_MinRemainingSec(now_ms);
-#endif
-			if (ui_mode == 0u) {
-				if (Fire_CountPendingPhase2() == 0u && Fire_HasFire1Waiting()) {
-					ui_mode = 6u; /* ПОЖАР1 */
-					ui_remaining = 0u;
-				} else if (Fire_CountPendingPhase2() == 0u && Fire_CountBlockedFireSlots() > 0u) {
-					ui_mode = 8u; /* ПУСК ЗАБЛ. */
-					ui_remaining = 0u;
-				} else {
-					uint8_t any_pending = 0u;
-					uint8_t all_paused = 1u;
-					for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-						const FireZoneSlot *s = &g_fire.slots[i];
-						if (!s->active || s->phase2_sent || s->fire1_waiting ||
-						    s->launch_stopped || Fire_ZoneLaunchBlocked(s->zone)) {
-							continue;
-						}
-						any_pending = 1u;
-						if (s->countdown_paused == 0u && g_fire.zone_countdown_paused == 0u) {
-							all_paused = 0u;
-						}
-					}
-					ui_mode = (any_pending && all_paused) || g_fire.zone_countdown_paused
-						  ? 5u : 1u; /* ПАУЗА или ДО ПУСКА */
-				}
-			}
-		} else {
-			ui_remaining = 0u;
-			ui_mode = 4u; /* ПОЖАР/ОСТ. ПУСКА */
-		}
-	} else if (g_fire.state == FIRE_STATE_EXTINGUISHING) {
-		ui_remaining = 0u;
-		ui_mode = 2u; /* ТУШЕНИЕ */
-#if GOST_MODE
-		if (g_fire_ui_manual_select_enabled) {
-			uint8_t sel_zone = 0u;
-			if (Fire_GetSelectedZoneFromUi(&sel_zone)) {
-				int8_t si = Fire_FindSlotZone(sel_zone);
-				if (si >= 0 && g_fire.slots[(uint8_t)si].extinguish_aborted != 0u) {
-					ui_mode = 9u; /* ТУШЕНИЕ ОСТ. */
-				} else if (si >= 0 && g_fire.slots[(uint8_t)si].ext_retry_failed != 0u) {
-					ui_mode = 7u;
-				} else if (si >= 0 && g_fire.slots[(uint8_t)si].phase2_sent != 0u &&
-					   Fire_ZoneAllIgnitersEndAck(sel_zone)) {
-					ui_mode = 3u; /* ТУШ.ВЫП. по выбранной зоне */
-				} else if (si >= 0 && g_fire.slots[(uint8_t)si].launch_stopped != 0u &&
-					   g_fire.slots[(uint8_t)si].phase2_sent == 0u) {
-					ui_mode = 4u; /* ещё в останове пуска */
-				} else if (si >= 0 && g_fire.slots[(uint8_t)si].countdown_paused != 0u) {
-					ui_mode = 5u;
-					ui_remaining = (uint8_t)((g_fire.slots[(uint8_t)si].paused_remaining_ms + 999u) / 1000u);
-				} else if (Fire_ZoneIsFire1Waiting(sel_zone)) {
-					ui_mode = 6u;
-				} else if (si >= 0 && g_fire.slots[(uint8_t)si].phase2_sent == 0u &&
-					   !Fire_ZoneLaunchBlocked(sel_zone)) {
-					ui_remaining = Fire_RemainingSecForZone(sel_zone, now_ms);
-					ui_mode = 1u;
-				}
-			}
-		}
-#endif
-		if (ui_mode == 2u) {
-			if (Fire_AllActiveZonesEndAck()) {
-				ui_mode = 3u; /* ТУШЕНИЕ ПРОИЗВЕДЕНО */
-				Fire_LogExtinguishComplete();
-			} else if (Fire_AllActiveZonesTerminal() && Fire_HasExtinguishFailure()) {
-				ui_mode = 7u; /* ТУШЕНИЕ НЕ ВЫПОЛНЕНО */
-#if GOST_MODE
-			} else if (!g_fire_ui_manual_select_enabled) {
-				/* Все фазы 2 остановлены оператором — «ТУШ.ОСТ.» без UI-выбора. */
-				uint8_t any_p2 = 0u;
-				uint8_t all_aborted = 1u;
-				for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-					const FireZoneSlot *s = &g_fire.slots[i];
-					if (!s->active || !s->phase2_sent) {
-						continue;
-					}
-					any_p2 = 1u;
-					if (s->extinguish_aborted == 0u) {
-						all_aborted = 0u;
-						break;
-					}
-				}
-				if (any_p2 && all_aborted) {
-					ui_mode = 9u;
-				}
-#endif
-			}
-		}
-	}
-
-	if (g_fire.state == FIRE_STATE_IDLE) {
-		if (g_fire.all_hold_active && g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS) {
-			/* Удержание ПУСК ОБЩИЙ из НОРМЫ.
-			 * Не вызывать Fire_SetIdleIndication(): он каждый тик гасит BUT/STR,
-			 * ставит DIM и шлёт PushLeds — мигание на панели не видно. */
-			Led_Set(LED_BUT_START_SP, 0);
-			Led_Set(LED_STR_START_SP, 0);
-			Led_Set(LED_BUT_STOP, 0);
-			Led_Set(LED_STR_STOP, 0);
-			Led_Set(LED_START, 0);
-			Led_Set(LED_STOP, 0);
-			Fire_UpdateLedFire(now_ms);
-			{
-				uint8_t blink_on = (((now_ms / (FIRE_START_ALL_TEXT_BLINK_PERIOD_MS / 2u)) & 1u) != 0u) ? 1u : 0u;
-				Fire_SetStartAllBrightness(1u);
-				Led_Set(LED_BUT_START_ALL, blink_on);
-				Led_Set(LED_STR_START_ALL, blink_on);
-				Fire_PushStartAllHoldLeds(blink_on);
-			}
-			{
-				char z0[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
-				Fire_UpdateUiText(1u, 1u, ui_remaining, 0u, z0, 0, 0);
-			}
-			return;
-		}
-		Fire_SetIdleIndication();
-		Fire_UpdateLedFire(now_ms);
-		if (g_fire.start_launch_pressed_latched) {
-			Led_Set(LED_START, 1u);
-		}
-		{
-			char z0[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
-			Fire_UpdateUiText(0u, 0u, 0u, 0u, z0, 0, 0);
-		}
-		return;
-	}
-
-	Fire_UpdateLedFire(now_ms);
-	Fire_ApplyStateLeds(now_ms);
-	if ((g_fire.state == FIRE_STATE_WAIT_AUTO || g_fire.state == FIRE_STATE_WAIT_MANUAL) &&
-	    g_fire.all_hold_active) {
-		uint8_t blink_on = (((now_ms / (FIRE_START_ALL_TEXT_BLINK_PERIOD_MS / 2u)) & 1u) != 0u) ? 1u : 0u;
-		Fire_SetStartAllBrightness(1u);
-		Led_Set(LED_BUT_START_ALL, blink_on);
-		Led_Set(LED_STR_START_ALL, blink_on);
-		Fire_PushStartAllHoldLeds(blink_on);
-	}
-
-	ui_active = 1u;
-	{
-		char zn[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
-		uint8_t zm[FIRE_UI_MAX_ZONES];
-		uint8_t zr[FIRE_UI_MAX_ZONES];
-		uint8_t nzn = 0u;
-		uint8_t zones[FIRE_UI_MAX_ZONES];
-		uint8_t nz_can;
-		uint8_t disp = 0u;
-		memset(zm, 0, sizeof(zm));
-		memset(zr, 0, sizeof(zr));
-		Fire_FillZoneNamesForUi(zn, &nzn);
-		nz_can = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
-		if (nz_can > nzn) {
-			nz_can = nzn;
-		}
-		for (uint8_t i = 0u; i < nz_can; i++) {
-			Fire_UiStatusForZone(zones[i], now_ms, &zm[i], &zr[i]);
-		}
-		if (g_fire.all_hold_active == 0u || g_fire.all_hold_ms >= FIRE_START_ALL_HOLD_MS) {
-			if (g_fire_ui_manual_select_enabled != 0u &&
-			    g_fire_ui_selected_index < nz_can) {
-				disp = g_fire_ui_selected_index;
-			}
-			if (nz_can > 0u) {
-				ui_mode = zm[disp];
-				ui_remaining = zr[disp];
-			}
-		}
-		Fire_UpdateUiText(ui_active, ui_mode, ui_remaining, nzn, zn, zm, zr);
+	/* Журнал «тушение произведено» — раньше срабатывал в ветке MAIN_FIRE ui_mode. */
+	if (g_fire.state == FIRE_STATE_EXTINGUISHING && Fire_AllActiveZonesEndAck()) {
+		Fire_LogExtinguishComplete();
 	}
 }
 
@@ -3701,19 +2632,12 @@ void Fire_Init(void)
 	Fire_ResetSuppressClear();
 #endif
 	g_fire.state = FIRE_STATE_IDLE;
-	g_fire.start_all_is_bright = 0xFFu;
-	Fire_SetStartAllBrightness(0u);
-	Led_Set(LED_BUT_START_ALL, 0u);
-	Led_Set(LED_STR_START_ALL, 1u);
-	g_fire.start_all_is_bright = 0u;
-	g_fire.last_ui_nzones = 0u;
 	g_fire.last_fire_mode = PPKYConfig.fire_mode;
-	Fire_RefreshAutoOffLed();
 	g_fire_ui_manual_select_enabled = 0u;
 	g_fire_ui_selected_index = 0u;
 }
 
-/* Периодический тик 1 мс: FSM, таймеры автопуска и UI-обновления. */
+/* Периодический тик 1 мс: FSM, таймеры автопуска, LED/звук. */
 void Fire_Timer1ms(void)
 {
 	if (MenuUi_IsConfigSessionActive()) {
@@ -3728,9 +2652,6 @@ void Fire_Timer1ms(void)
 	}
 	Fire_RetryProcess(now);
 	if (g_fire.state == FIRE_STATE_IDLE && !Fire_AnyActiveSlot() && !g_fire.all_hold_active) {
-		/* IDLE: LED_FIRE (ВНИМАНИЕ) + актуальный LED_AUTO_OFF по режимам зон. */
-		Fire_UpdateLedFire(now);
-		Fire_RefreshAutoOffLed();
 		return;
 	}
 	Fire_Transition(FIRE_EVENT_TICK_1MS, now);
@@ -3753,15 +2674,7 @@ void Fire_Timer10ms(void)
 				g_fire.all_hold_active = 1u;
 				g_fire.all_hold_ms = 0u;
 				g_fire.state_start_ms = now_ms;
-				s_start_all_hold_led_blink = 0xFFu;
-				Fire_StartAllHoldSoundOn();
-				Fire_ForceUiResync();
 				/* Сразу включить мигание кнопки/подписи — до первого Fire_Transition. */
-				Fire_SetStartAllBrightness(1u);
-				Led_Set(LED_BUT_START_ALL, 1u);
-				Led_Set(LED_STR_START_ALL, 1u);
-				Fire_PushStartAllHoldLeds(1u);
-				RsPanelMaster_OnStartAllHoldBegin();
 				/* Сырое касание ПУСК ОБЩИЙ — до удержания 3 с (код 14 после hold). */
 				Fire_LogPanelBtnPress(FIRE_LOG_BTN_START_ALL, 0u);
 			} else {
@@ -3771,7 +2684,6 @@ void Fire_Timer10ms(void)
 				if (g_fire.all_hold_ms >= FIRE_START_ALL_HOLD_MS &&
 				    g_fire.btn_start_all_hold_latched == 0u) {
 					g_fire.btn_start_all_hold_latched = 1u;
-					Fire_StartAllHoldSoundOff();
 					if (g_fire.last_btn_start_all_action_ms == 0u ||
 					    (now_ms - g_fire.last_btn_start_all_action_ms) >= 500u) {
 						g_fire.last_btn_start_all_action_ms = now_ms;
@@ -3788,21 +2700,10 @@ void Fire_Timer10ms(void)
 			g_fire.all_hold_active = 0u;
 			g_fire.all_hold_ms = 0u;
 			g_fire.btn_start_all_hold_latched = 0u;
-			s_start_all_hold_led_blink = 0xFFu;
-			Fire_StartAllHoldSoundOff();
 			/* Явно вернуть дежурный вид: при отпускании в фазе blink_off
 			 * на панели могли остаться BUT/STR=OFF и full brightness. */
-			g_fire.start_all_is_bright = 0xFFu;
-			Fire_SetStartAllBrightness(0u);
-			Led_Set(LED_BUT_START_ALL, 0u);
-			Led_Set(LED_STR_START_ALL, 1u);
 			/* Повторный push: один кадр LED легко теряется на half-duplex. */
-			RsPanelMaster_PushLeds();
-			RsPanelMaster_InvalidateSoundDedup();
-			RsPanelMaster_PushSound();
-			Fire_ForceUiResync();
 			Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
-			RsPanelMaster_PushLeds();
 		}
 	}
 
@@ -3857,21 +2758,12 @@ void Fire_Timer10ms(void)
 				if (g_fire.all_hold_active == 0u) {
 					g_fire.all_hold_active = 1u;
 					g_fire.state_start_ms = now_ms;
-					s_start_all_hold_led_blink = 0xFFu;
-					Fire_StartAllHoldSoundOn();
-					Fire_ForceUiResync();
-					Fire_SetStartAllBrightness(1u);
-					Led_Set(LED_BUT_START_ALL, 1u);
-					Led_Set(LED_STR_START_ALL, 1u);
-					Fire_PushStartAllHoldLeds(1u);
-					RsPanelMaster_OnStartAllHoldBegin();
 					Fire_LogPanelBtnPress(FIRE_LOG_BTN_START_ALL, 0u);
 				}
 				g_fire.all_hold_ms = g_fire.sp_hold_ms;
 				if (g_fire.sp_hold_ms >= FIRE_START_ALL_HOLD_MS &&
 				    g_fire.btn_start_all_hold_latched == 0u) {
 					g_fire.btn_start_all_hold_latched = 1u;
-					Fire_StartAllHoldSoundOff();
 					if (g_fire.last_btn_start_all_action_ms == 0u ||
 					    (now_ms - g_fire.last_btn_start_all_action_ms) >= 500u) {
 						g_fire.last_btn_start_all_action_ms = now_ms;
@@ -3889,14 +2781,6 @@ void Fire_Timer10ms(void)
 				g_fire.all_hold_active = 0u;
 				g_fire.all_hold_ms = 0u;
 				g_fire.btn_start_all_hold_latched = 0u;
-				s_start_all_hold_led_blink = 0xFFu;
-				Fire_StartAllHoldSoundOff();
-				g_fire.start_all_is_bright = 0xFFu;
-				Fire_SetStartAllBrightness(0u);
-				Led_Set(LED_BUT_START_ALL, 0u);
-				Led_Set(LED_STR_START_ALL, 1u);
-				RsPanelMaster_PushLeds();
-				Fire_ForceUiResync();
 				Fire_Transition(FIRE_EVENT_TICK_1MS, now_ms);
 			}
 			/* <1с: обычный ПУСК СП. ≥1с и отпустили до 3с: ничего. */
@@ -4102,17 +2986,19 @@ uint8_t Fire_IsStartAllHoldActive(void)
 
 uint8_t Fire_IsExtinguishIndicationActive(void)
 {
-	/* Пока идёт тушение (фаза 2 без EndAck) или активен start-pattern —
-	 * непрерывное свечение LED_START (ГОСТ) + звук START. */
-	if (g_fire.beeper_start_pattern_active != 0u) {
-		return 1u;
+	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
+		const FireZoneSlot *s = &g_fire.slots[i];
+		if (!s->active || s->phase2_sent == 0u) {
+			continue;
+		}
+		if (s->extinguish_aborted != 0u || s->ext_retry_failed != 0u) {
+			continue;
+		}
+		if (!Fire_ZoneAllIgnitersEndAck(s->zone)) {
+			return 1u;
+		}
 	}
-	return Fire_AnyZoneExtinguishingInProgress();
-}
-
-uint8_t Fire_GetPanelFireLedMode(void)
-{
-	return (uint8_t)g_fire.led_fire_mode;
+	return 0u;
 }
 
 void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index)
@@ -4124,7 +3010,6 @@ void Fire_UiSetManualSelection(uint8_t enabled, uint8_t selected_ui_index)
 	}
 	g_fire_ui_manual_select_enabled = en;
 	g_fire_ui_selected_index = selected_ui_index;
-	Fire_ForceUiResync();
 }
 
 uint8_t Fire_UiGetSelectedIndex(void)
@@ -4134,20 +3019,7 @@ uint8_t Fire_UiGetSelectedIndex(void)
 
 void Fire_NotifyZoneModeChanged(void)
 {
-	const uint8_t on = PPKY_AnyZoneManualOrBlocked() ? 1u : 0u;
-	Led_Set(LED_AUTO_OFF, on);
-	if (on != 0u) {
-		Led_ForceStatusBright(LED_AUTO_OFF);
-	}
-}
-
-void Fire_ForceUiResync(void)
-{
-	g_fire.last_ui_active = 0xFFu;
-	g_fire.last_ui_mode = 0xFFu;
-	g_fire.last_ui_remaining = 0xFFu;
-	g_fire.last_ui_nzones = 0xFFu;
-	s_ui_clear_retry_until_ms = HAL_GetTick() + 2000u;
+	/* v3: AUTO_OFF на панели локально; на ППКУ LED нет. */
 }
 
 static void Fire_ApplyPanelZoneSelect(uint8_t zone)
@@ -4179,9 +3051,10 @@ void Fire_OnPanelStartAllCommit(void)
 	Fire_Transition(FIRE_EVENT_BTN_START_ALL, now);
 	g_fire_panel_btn_source = 0u;
 }
-
+static volatile uint32_t sp_cnt = 0;
 void Fire_OnPanelStartSp(uint8_t zone)
 {
+	sp_cnt++;
 	uint32_t now = HAL_GetTick();
 	Fire_ApplyPanelZoneSelect(zone);
 	g_fire_panel_btn_source = 1u;
@@ -4214,12 +3087,11 @@ void Fire_OnPanelFireReset(uint8_t zone)
 
 void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms)
 {
-	char zn[FIRE_UI_MAX_ZONES][FIRE_UI_NAME_LEN];
+	/* ZONES TLV: zone/status/remaining. Имена — отдельный ZONE_NAMES каталог. */
 	uint8_t zm[FIRE_UI_MAX_ZONES];
 	uint8_t zr[FIRE_UI_MAX_ZONES];
 	uint8_t zones[FIRE_UI_MAX_ZONES];
-	uint8_t nzn = 0u;
-	uint8_t nz_can;
+	uint8_t nz;
 	uint8_t i;
 
 	if (out == 0) {
@@ -4230,29 +3102,18 @@ void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms)
 	    !(g_fire.all_hold_active && g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS)) {
 		return;
 	}
-	Fire_FillZoneNamesForUi(zn, &nzn);
-	nz_can = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
-	if (nz_can > nzn) {
-		nz_can = nzn;
-	}
-	for (i = 0u; i < nz_can; i++) {
-		Fire_UiStatusForZone(zones[i], now_ms, &zm[i], &zr[i]);
-	}
 	if (g_fire.all_hold_active != 0u && g_fire.all_hold_ms < FIRE_START_ALL_HOLD_MS) {
-		out->count = 0u;
 		return;
 	}
-	out->count = nzn;
-	if (out->count > RS_PANEL_V3_MAX_ZONES) {
-		out->count = RS_PANEL_V3_MAX_ZONES;
+	nz = Fire_BuildUiZoneList(zones, FIRE_UI_MAX_ZONES);
+	if (nz > RS_PANEL_V3_MAX_ZONES) {
+		nz = RS_PANEL_V3_MAX_ZONES;
 	}
-	for (i = 0u; i < out->count; i++) {
-		out->items[i].zone = (i < nz_can) ? zones[i] : (uint8_t)(i + 1u);
-		out->items[i].status = (i < nz_can) ? zm[i] : 0u;
-		out->items[i].remaining_s = (i < nz_can) ? zr[i] : 0u;
-		if (i < nzn) {
-			strncpy(out->items[i].name, zn[i], RS_PANEL_V3_ZONE_NAME_LEN - 1u);
-			out->items[i].name[RS_PANEL_V3_ZONE_NAME_LEN - 1u] = '\0';
-		}
+	for (i = 0u; i < nz; i++) {
+		Fire_UiStatusForZone(zones[i], now_ms, &zm[i], &zr[i]);
+		out->items[i].zone = zones[i];
+		out->items[i].status = zm[i];
+		out->items[i].remaining_s = zr[i];
 	}
+	out->count = nz;
 }

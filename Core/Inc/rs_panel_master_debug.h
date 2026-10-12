@@ -29,7 +29,7 @@ typedef struct {
     volatile uint8_t  panel_addr[8];
     volatile uint32_t poll_tx_by_panel[8];
     volatile uint32_t time_tlv_tx_by_panel[8];
-    /* Bring-up: SYS_READY и возраст boot (мс) — снятие «ПРОВЕРКА». */
+    /* Bring-up: SYS_READY (~20 с + primed) и возраст boot (мс) — снятие «ПРОВЕРКА». */
     volatile uint8_t  sys_ready;
     volatile uint32_t boot_age_ms;
     /* Inject/bootloader pause: POLL silent while now < inject_pause_until_ms. */

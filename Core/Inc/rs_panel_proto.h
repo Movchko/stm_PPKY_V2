@@ -53,18 +53,8 @@ void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_
 /** Из HAL_UART_ErrorCallback (USART1): сброс ORE и перезапуск RX DMA. */
 void RsPanelMaster_OnUartError(UART_HandleTypeDef *huart);
 void RsPanelMaster_LoadDefaultConfig(RsPanelMaster *master);
-/* Синхронизировать текущее состояние Beeper на все готовые панели. */
-void RsPanelMaster_PushSound(void);
-/* MENU_TOGGLE: beep + beep_block на готовые панели (legacy UI_DATA). */
-void RsPanelMaster_PushMenuSoundState(void);
-/* Сбросить dedup SOUND — следующий PushSound уйдёт даже при том же профиле (стоп hold). */
-void RsPanelMaster_InvalidateSoundDedup(void);
-/* Синхронизировать LED (в т.ч. NORM/ERR) на готовые панели. */
-void RsPanelMaster_PushLeds(void);
 /* UI_DATA CONNECTION_STATUS (wifi_on / rs485_on) — отложить TX в Process10ms. */
 void RsPanelMaster_PushConnectionStatus(void);
-/* Удержание ПУСК ОБЩИЙ: MAIN на панели + сброс dedup UI (вызывать при старте hold). */
-void RsPanelMaster_OnStartAllHoldBegin(void);
 /* 1 = подключена малая панель (нет ПУСК ОБЩИЙ). */
 uint8_t RsPanelMaster_IsSmallPanel(void);
 /* Прокидка сырого RS-кадра с WiFi/ПО (BSU_PKT_TYPE_ESP_UART) на шину панелей. */

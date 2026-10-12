@@ -8,12 +8,10 @@
 #include "event_log.h"
 #include "fire.h"
 #include "gost_mode.h"
-#include "led.h"
 #include "beeper.h"
 #include "can_bus.h"
 #include "device_config.h"
 #include "device_dpt.hpp"
-#include "sound_profiles.h"
 #include "menu_ui.h"
 #include "rs_panel_master_debug.h"
 #include "rs_panel_proto.h"
@@ -29,16 +27,6 @@ extern "C" uint8_t Warning_UiUpdate(uint8_t active, uint8_t n_items,
 				    char (*big_titles)[WARN_TITLE_LEN],
 				    char (*details)[ZONE_NAME_SIZE + 1]);
 
-enum FaultSoundPhase : uint8_t {
-	FAULT_SOUND_IDLE = 0u,
-	FAULT_SOUND_WAIT_PERIODIC,
-	FAULT_SOUND_PERIODIC
-};
-enum AttentionSoundPhase : uint8_t {
-	ATTN_SOUND_IDLE = 0u,
-	ATTN_SOUND_WAIT_PERIODIC,
-	ATTN_SOUND_PERIODIC
-};
 static uint8_t g_power_fault_mask = 0u;
 static uint8_t g_ppku_input_fault_mask = 0u;
 static uint8_t g_raw_power_fault_mask = 0u;
@@ -47,10 +35,6 @@ static uint32_t g_power_confirm_since[4];
 static uint8_t g_power_confirm_pending[4];
 static uint8_t g_prev_power_fault_mask = 0u;
 static uint8_t g_prev_ppku_input_fault_mask = 0u;
-static FaultSoundPhase g_fault_sound_phase = FAULT_SOUND_IDLE;
-static uint32_t g_fault_sound_deadline_ms = 0u;
-static AttentionSoundPhase g_attention_sound_phase = ATTN_SOUND_IDLE;
-static uint32_t g_attention_sound_deadline_ms = 0u;
 
 extern "C" uint8_t Warning_HasActiveFault(void);
 
@@ -96,8 +80,6 @@ static uint8_t g_last_count = 0xFFu;
 static char g_last_big[WARN_MAX_ITEMS][WARN_TITLE_LEN];
 static char g_last_details[WARN_MAX_ITEMS][ZONE_NAME_SIZE + 1];
 static uint8_t g_last_build_count = 0u;
-static uint8_t g_led_err_on = 0u;
-static uint8_t g_prev_active_fault_count = 0u;
 static uint8_t g_prev_sound_fault_count = 0u;
 static uint8_t g_prev_sound_attention_count = 0u;
 static uint32_t g_position_fault_mask = 0u;
@@ -1208,127 +1190,21 @@ static uint8_t CountActiveAttentionNow(void)
 
 static void UpdateFaultSound(uint32_t now_ms)
 {
+	/* Панель сама играет fault/attention; здесь только unmute → SYS. */
+	(void)now_ms;
 	uint8_t attention_count = CountActiveAttentionNow();
 	uint8_t fault_count = CountActiveFaultNow();
 	if (Fire_IsActive()) {
-		g_fault_sound_phase = FAULT_SOUND_IDLE;
-		g_fault_sound_deadline_ms = 0u;
-		g_attention_sound_phase = ATTN_SOUND_IDLE;
-		g_attention_sound_deadline_ms = 0u;
 		g_prev_sound_fault_count = fault_count;
 		g_prev_sound_attention_count = attention_count;
 		return;
 	}
-
-	if (attention_count > 0u) {
-		/* ВНИМАНИЕ имеет приоритет над НЕИСПРАВНОСТЬЮ. */
-		if (g_fault_sound_phase == FAULT_SOUND_PERIODIC || g_fault_sound_phase == FAULT_SOUND_WAIT_PERIODIC) {
-			Beeper_StopPattern();
-			g_fault_sound_phase = FAULT_SOUND_IDLE;
-			g_fault_sound_deadline_ms = 0u;
-		}
-
-		if (attention_count > g_prev_sound_attention_count) {
-			Beeper_ResumeSoundOnNewEvent();
-		}
-		if (attention_count > g_prev_sound_attention_count || g_attention_sound_phase == ATTN_SOUND_IDLE) {
-			Beeper_StopPattern();
-			Beeper_StartPulseTrain(SOUND_ATTN_SIGNAL_ON_MS, SOUND_ATTN_SIGNAL_OFF_MS,
-					       SOUND_ATTN_SIGNAL_PULSES, 0u);
-			g_attention_sound_phase = ATTN_SOUND_WAIT_PERIODIC;
-			g_attention_sound_deadline_ms =
-				now_ms + ((SOUND_ATTN_SIGNAL_ON_MS + SOUND_ATTN_SIGNAL_OFF_MS) * (uint32_t)SOUND_ATTN_SIGNAL_PULSES);
-			RsPanelMaster_PushSound();
-		} else if (g_attention_sound_phase == ATTN_SOUND_WAIT_PERIODIC &&
-			   TimeReached(now_ms, g_attention_sound_deadline_ms)) {
-			Beeper_StartPulseTrain(SOUND_ATTN_DUTY_ON_MS, SOUND_ATTN_DUTY_OFF_MS,
-					       SOUND_ATTN_DUTY_PULSES, SOUND_ATTN_DUTY_REPEAT_MS);
-			g_attention_sound_phase = ATTN_SOUND_PERIODIC;
-			RsPanelMaster_PushSound();
-		}
-
-		g_prev_sound_attention_count = attention_count;
-		g_prev_sound_fault_count = fault_count;
-		return;
-	}
-
-	if (fault_count == 0u) {
-		uint8_t stopped = 0u;
-		if (g_fault_sound_phase == FAULT_SOUND_PERIODIC ||
-		    g_fault_sound_phase == FAULT_SOUND_WAIT_PERIODIC) {
-			Beeper_StopPattern();
-			stopped = 1u;
-		}
-		if (g_attention_sound_phase == ATTN_SOUND_PERIODIC ||
-		    g_attention_sound_phase == ATTN_SOUND_WAIT_PERIODIC) {
-			Beeper_StopPattern();
-			stopped = 1u;
-		}
-		g_fault_sound_phase = FAULT_SOUND_IDLE;
-		g_fault_sound_deadline_ms = 0u;
-		g_attention_sound_phase = ATTN_SOUND_IDLE;
-		g_attention_sound_deadline_ms = 0u;
-		g_prev_sound_fault_count = fault_count;
-		g_prev_sound_attention_count = attention_count;
-		if (stopped != 0u) {
-			RsPanelMaster_PushSound();
-		}
-		return;
-	}
-
-	/* Любая новая неисправность должна заново выдать 1.3с сигнальный звук. */
-	if (fault_count > g_prev_sound_fault_count) {
+	if (attention_count > g_prev_sound_attention_count ||
+	    fault_count > g_prev_sound_fault_count) {
 		Beeper_ResumeSoundOnNewEvent();
-	}
-	if (fault_count > g_prev_sound_fault_count || g_fault_sound_phase == FAULT_SOUND_IDLE) {
-		Beeper_StopPattern();
-		Beeper_StartPulseTrain(SOUND_FAULT_SIGNAL_ON_MS, SOUND_FAULT_SIGNAL_OFF_MS,
-				       SOUND_FAULT_SIGNAL_PULSES, 0u);
-		g_fault_sound_phase = FAULT_SOUND_WAIT_PERIODIC;
-		g_fault_sound_deadline_ms =
-			now_ms + ((SOUND_FAULT_SIGNAL_ON_MS + SOUND_FAULT_SIGNAL_OFF_MS) * (uint32_t)SOUND_FAULT_SIGNAL_PULSES);
-		g_prev_sound_fault_count = fault_count;
-		g_prev_sound_attention_count = attention_count;
-		RsPanelMaster_PushSound();
-		return;
 	}
 	g_prev_sound_fault_count = fault_count;
 	g_prev_sound_attention_count = attention_count;
-	if (g_fault_sound_phase == FAULT_SOUND_WAIT_PERIODIC &&
-	    TimeReached(now_ms, g_fault_sound_deadline_ms)) {
-		Beeper_StartPulseTrain(SOUND_FAULT_DUTY_ON_MS, SOUND_FAULT_DUTY_OFF_MS,
-				       SOUND_FAULT_DUTY_PULSES, SOUND_FAULT_DUTY_REPEAT_MS);
-		g_fault_sound_phase = FAULT_SOUND_PERIODIC;
-		RsPanelMaster_PushSound();
-	}
-}
-
-/* Управляет LED_ERR: только неисправность (непрерывно). ВНИМАНИЕ — на LED_FIRE.
- * NORM гасим здесь же до PushUi/CMD_LED (App_Update в том же тике ещё со старым has_fault). */
-static void UpdateErrorLed(uint32_t now_ms)
-{
-	uint8_t fault_count = CountActiveFaultNow();
-	uint8_t attention_count = CountActiveAttentionNow();
-	uint8_t active_count = (uint8_t)(fault_count + attention_count);
-
-	if (active_count > g_prev_active_fault_count && fault_count > 0u) {
-		Led_ForceStatusBright(LED_ERR);
-	}
-	g_prev_active_fault_count = active_count;
-	(void)now_ms;
-
-	if (fault_count > 0u || Fire_HasExtinguishIncomplete()) {
-		Led_Set(LED_ERR, 1u);
-		g_led_err_on = 1u;
-	} else if (g_led_err_on) {
-		Led_Set(LED_ERR, 0u);
-		g_led_err_on = 0u;
-	}
-
-	if (fault_count > 0u || attention_count > 0u ||
-	    Fire_HasExtinguishIncomplete() || Fire_IsActive()) {
-		Led_Set(LED_NORM, 0u);
-	}
 }
 
 /* Пушит UI-данные на панель только при реальном изменении (анти-спам). */
@@ -1631,7 +1507,6 @@ extern "C" void WarningProcess1ms(void)
 	ProcessPendingConfirmations(now_ms);
 	SyncPowerFaultEventLog();
 	PruneInactiveItems(now_ms);
-	UpdateErrorLed(now_ms);
 	UpdateFaultSound(now_ms);
 
 	/* Список поддерживаем всегда (в т.ч. во время пожара) — приоритет показа на UI. */
@@ -1699,10 +1574,14 @@ extern "C" uint8_t Warning_GetLastUiBuildCount(void)
 	return g_last_build_count;
 }
 
-/* Live Watch: оставшиеся мс паузы (обновляется в Warning_IsProcessDelayActive). */
+/* Live Watch: остаток пауз (обновляется в Is*DelayActive). */
 uint32_t warning_process_delay = 10000u;
+uint32_t warning_sys_ready_delay = 20000u;
 
-#define WARNING_PROCESS_DELAY_MS 10000u
+/* Process: совпадает с CM_GRACE — сбор неисправностей / Commit / FAULT_EVT на шину.
+ * SYS_READY позже: панель держит «ПРОВЕРКА», пока снимок faults уже уходит. */
+#define WARNING_PROCESS_DELAY_MS   10000u
+#define WARNING_SYS_READY_DELAY_MS 20000u
 static uint32_t s_warning_delay_start_ms = 0u;
 static uint8_t s_warning_delay_armed = 0u;
 
@@ -1712,6 +1591,7 @@ extern "C" void Warning_ArmProcessDelay(uint32_t now_ms)
 	s_warning_delay_armed = 1u;
 	s_fault_pipeline_primed = 0u;
 	warning_process_delay = WARNING_PROCESS_DELAY_MS;
+	warning_sys_ready_delay = WARNING_SYS_READY_DELAY_MS;
 }
 
 extern "C" uint8_t Warning_IsProcessDelayActive(void)
@@ -1727,6 +1607,22 @@ extern "C" uint8_t Warning_IsProcessDelayActive(void)
 		return 0u;
 	}
 	warning_process_delay = WARNING_PROCESS_DELAY_MS - elapsed;
+	return 1u;
+}
+
+extern "C" uint8_t Warning_IsSysReadyDelayActive(void)
+{
+	uint32_t elapsed;
+
+	if (s_warning_delay_armed == 0u) {
+		return 1u;
+	}
+	elapsed = (uint32_t)(HAL_GetTick() - s_warning_delay_start_ms);
+	if (elapsed >= WARNING_SYS_READY_DELAY_MS) {
+		warning_sys_ready_delay = 0u;
+		return 0u;
+	}
+	warning_sys_ready_delay = WARNING_SYS_READY_DELAY_MS - elapsed;
 	return 1u;
 }
 

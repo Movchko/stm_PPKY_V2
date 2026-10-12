@@ -3,7 +3,6 @@
 #include "button.h"
 #include "beeper.h"
 #include "device_config.h"
-#include "led.h"
 #include "backend.h"
 #include "service.h"
 #include "config_sync.hpp"
@@ -87,21 +86,6 @@ uint8_t status_sec_cnt = 0;
 
 extern UART_HandleTypeDef huart1;
 static RsPanelMaster g_rs_panel_master;
-
-extern "C" __attribute__((weak)) void App_OnFireUiUpdate(uint8_t active, uint8_t mode,
-							      uint8_t remaining_s, uint8_t n_zones,
-							      char (*zone_names)[ZONE_NAME_SIZE + 1],
-							      const uint8_t *zone_modes,
-							      const uint8_t *zone_remaining)
-{
-	(void)active;
-	(void)mode;
-	(void)remaining_s;
-	(void)n_zones;
-	(void)zone_names;
-	(void)zone_modes;
-	(void)zone_remaining;
-}
 
 extern "C" __attribute__((weak)) uint8_t App_OnWarningUiUpdate(uint8_t active, uint8_t n_items,
 								      char (*big_titles)[WARNING_TITLE_LEN],
@@ -1036,7 +1020,7 @@ void AppInit() {
 
 	/* Инициализация FSM пожара */
 	Fire_Init();
-	/* Fault pipeline / SYS_READY: ровно ~10 с wall-time с этого момента. */
+	/* Process ~10 с, SYS_READY ~20 с (сначала faults/каталог, потом снятие ПРОВЕРКА). */
 	Warning_ArmProcessDelay(HAL_GetTick());
 	RsPanelMaster_Init(&g_rs_panel_master, &huart1, BRP_485_EN_GPIO_Port, BRP_485_EN_Pin);
 }
@@ -1066,8 +1050,6 @@ void AppProcess(uint32_t now_ms) {
 
 uint32_t counter1s = 0;
 
-uint32_t led_power_toogle_cnt = 0;
-uint8_t led_power_is_toogle = 0;
 
 /* Гистерезис порогов входа питания: ширина зоны возврата (~2% номинала, не меньше 300 мВ).
  * Без него на границе enter-порога ADC даёт частые set/clear → спам EventLog. */
@@ -1137,34 +1119,8 @@ static void App_UpdatePowerFaultIndication(uint32_t now_ms)
 	Warning_SetPowerFaultMask(power_fault_mask);
 	Warning_SetPpkuInputFaultMask(ppku_input_fault_mask);
 
-	if (ppku_input_fault_mask != 0u) {
-		led_power_is_toogle = 1;
-	} else {
-		Led_Set(LED_POWER, 1);
-		led_power_toogle_cnt = LED_POWER_TOOGLE_PERIOD_MS;
-		led_power_is_toogle = 0;
-	}
-
-	if (led_power_is_toogle) {
-		if (led_power_toogle_cnt) {
-			if (led_power_toogle_cnt == (LED_POWER_TOOGLE_PERIOD_MS / 2)) {
-				Led_Set(LED_POWER, 1);
-			}
-			led_power_toogle_cnt--;
-		} else {
-			Led_Set(LED_POWER, 0);
-			led_power_toogle_cnt = LED_POWER_TOOGLE_PERIOD_MS;
-		}
-	}
-
-	/* LED_ERR — только неисправность (WarningProcess1ms). ВНИМАНИЕ — на LED_FIRE. */
-	uint8_t has_fault = (power_fault_mask != 0u || ppku_input_fault_mask != 0u) ? 1u :
-			    (Warning_HasActiveFault() || Warning_HasActiveAttention()) ? 1u : 0u;
-	if (!has_fault && !Fire_IsActive()) {
-		Led_Set(LED_NORM, 1u);
-	} else {
-		Led_Set(LED_NORM, 0u);
-	}
+	/* Индикация POWER/NORM/ERR — на панели из SYS; локальных LED на ППКУ нет. */
+	(void)power_fault_mask;
 }
 
 void AppTimer1ms() {
@@ -1235,8 +1191,6 @@ void AppTimer10ms() {
 	}
 
 	Fire_Timer10ms();
-	Beeper_Process();
-	Led_Process();
 	/* RS-опрос панели — AppTimerRsBus() (TIM3 @ 2 кГц), не здесь. */
 
 	/* 300 * 10 мс = 3 с после старта приложения — app WD для бутлоадера ППКУ. */
@@ -1333,12 +1287,6 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData) {
 			Fire_OnReplyResumeExtinguishmentTimer(MsgID);
 		}
 	}
-}
-
-extern "C" void Fire_UiUpdate(uint8_t active, uint8_t mode, uint8_t remaining_s, uint8_t n_zones,
-			      char (*zone_names)[ZONE_NAME_SIZE + 1],
-			      const uint8_t *zone_modes, const uint8_t *zone_remaining) {
-	App_OnFireUiUpdate(active, mode, remaining_s, n_zones, zone_names, zone_modes, zone_remaining);
 }
 
 extern "C" uint8_t Warning_UiUpdate(uint8_t active, uint8_t n_items,

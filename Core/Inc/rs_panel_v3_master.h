@@ -15,6 +15,8 @@ void RsPanelV3Master_OnBoot(uint32_t boot_ms);
 void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t now_ms);
 
 void RsPanelV3Master_OnRsp(uint8_t panel_idx, const RsPanelV3Rsp *rsp, uint32_t now_ms);
+/* Fire/journal из RSP — только main (не UART IRQ). Звать в начале Process10ms. */
+void RsPanelV3Master_ProcessDeferred(uint32_t now_ms);
 
 uint8_t RsPanelV3Master_IsSysReady(void);
 uint32_t RsPanelV3Master_GetBootAgeMs(void);

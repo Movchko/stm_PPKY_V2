@@ -6,7 +6,6 @@
  */
 
 #include "button.h"
-#include "beeper.h"
 #include "fire.h"
 
 struct Button Buttons[NUM_BUTTON];
@@ -89,9 +88,6 @@ void Button_Process() {
 				Buttons[i].state = ButtonStateLongPress;
 			if((Buttons[i].press_counter >= SHORT_PRESS_COUNT) && (Buttons[i].state == ButtonStateReset)) {
 				Buttons[i].state = ButtonStatePress;
-				/* Подтверждаем нажатие, не прерывая дежурные фоновые паттерны. */
-				Beeper_ButtonAcknowledge();
-
 			}
 
 			Buttons[i].press_counter++;

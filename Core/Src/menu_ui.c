@@ -5,7 +5,6 @@
 #include "can_bus.h"
 #include "event_log.h"
 #include "esp_manager.h"
-#include "beeper.h"
 
 #define MENU_CFG_SUCCESS_HOLD_MS 5000u
 
@@ -162,7 +161,6 @@ void MenuConfig_Process1ms(uint32_t now_ms)
 		return;
 	}
 	if (g_cfg_success_beep_done == 0u) {
-		Beeper_PlayConfigSuccess();
 		g_cfg_success_beep_done = 1u;
 	}
 	if (g_cfg_success_from_ms != 0u &&
