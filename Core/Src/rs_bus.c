@@ -317,10 +317,9 @@ void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len)
     }
 
     {
-        /* Недособранный orphan (Live: avail=31 need=32): 30 мс мало —
-         * следующий probe/шум через >30 мс сбрасывал почти полный RSP. */
+        /* Недособранный кадр: сброс по тишине (хвост придёт следующим harvest). */
         uint32_t now = HAL_GetTick();
-        if (ctx->rx_len != 0u && (now - ctx->rx_last_ms) > 120u) {
+        if (ctx->rx_len != 0u && (now - ctx->rx_last_ms) > 50u) {
             ctx->rx_len = 0u;
         }
         ctx->rx_last_ms = now;
@@ -370,100 +369,12 @@ void RsBus_ProcessRxBytes(RsBusContext *ctx, const uint8_t *data, uint16_t len)
             }
             total_size = (uint16_t)(2u + 1u + len_field + 2u);
             if (avail < (uint16_t)(total_size - 1u)) {
-                /* Live: avail=28 need=32 — хвост часто сидит в RDR, а DMA
-                 * уже не двигается (BP на старом NDTR-spin = ложная «петля»).
-                 * Снимаем DMAR → добираем RXNE → возвращаем DMAR. */
-                {
-                    uint16_t need_from_a5 =
-                        (uint16_t)(total_size - 1u);
-                    uint16_t missing =
-                        (uint16_t)(need_from_a5 - avail);
-                    UART_HandleTypeDef *u = ctx->uart;
-                    uint16_t dsize =
-                        (uint16_t)sizeof(ctx->rx_dma_buf);
-                    uint16_t ndtr = 0u;
-                    uint16_t n = 0u;
-                    uint16_t drained = 0u;
-
-                    if (u != 0 && u->hdmarx != 0) {
-                        ndtr = (uint16_t)__HAL_DMA_GET_COUNTER(u->hdmarx);
-                        if (ndtr <= dsize) {
-                            n = (uint16_t)(dsize - ndtr);
-                        }
-                    }
-                    g_rs_master_dbg.rx_short_avail = avail;
-                    g_rs_master_dbg.rx_short_need = need_from_a5;
-                    g_rs_master_dbg.rx_short_dma_n = n;
-                    g_rs_master_dbg.rx_short_dma_read = ctx->rx_dma_read;
-                    {
-                        uint16_t di;
-                        uint16_t ncopy = avail;
-                        if (ncopy > (uint16_t)sizeof(g_rs_master_dbg.rx_short_frame)) {
-                            ncopy = (uint16_t)sizeof(g_rs_master_dbg.rx_short_frame);
-                        }
-                        g_rs_master_dbg.rx_short_frame_len = ncopy;
-                        for (di = 0u; di < (uint16_t)sizeof(g_rs_master_dbg.rx_short_frame); di++) {
-                            g_rs_master_dbg.rx_short_frame[di] =
-                                (di < ncopy) ? ctx->rx_buf[(uint16_t)(pos + di)] : 0u;
-                        }
-                    }
-
-                    if (u != 0 && missing > 0u && missing <= 8u &&
-                        (uint32_t)ctx->rx_len + missing <=
-                            sizeof(ctx->rx_buf)) {
-                        uint32_t spins =
-                            (SystemCoreClock / 1000000u) * 400u / 4u;
-                        CLEAR_BIT(u->Instance->CR3, USART_CR3_DMAR);
-                        while (spins > 0u && drained < missing) {
-                            spins--;
-                            if (__HAL_UART_GET_FLAG(u, UART_FLAG_RXNE) !=
-                                RESET) {
-                                ctx->rx_buf[ctx->rx_len] =
-                                    (uint8_t)(u->Instance->RDR & 0xFFu);
-                                ctx->rx_len++;
-                                drained++;
-                            }
-                        }
-                        SET_BIT(u->Instance->CR3, USART_CR3_DMAR);
-                        /* Пока DMAR снова включён — добрать хвост из DMA. */
-                        spins = (SystemCoreClock / 1000000u) * 200u / 4u;
-                        while (spins > 0u && avail + drained < need_from_a5) {
-                            uint16_t n2;
-                            uint16_t chunk;
-                            spins--;
-                            ndtr = (uint16_t)__HAL_DMA_GET_COUNTER(u->hdmarx);
-                            if (ndtr > dsize) {
-                                continue;
-                            }
-                            n2 = (uint16_t)(dsize - ndtr);
-                            if (n2 <= ctx->rx_dma_read) {
-                                continue;
-                            }
-                            chunk = (uint16_t)(n2 - ctx->rx_dma_read);
-                            if ((uint32_t)ctx->rx_len + chunk >
-                                sizeof(ctx->rx_buf)) {
-                                break;
-                            }
-                            memcpy(&ctx->rx_buf[ctx->rx_len],
-                                   &ctx->rx_dma_buf[ctx->rx_dma_read],
-                                   chunk);
-                            ctx->rx_len =
-                                (uint16_t)(ctx->rx_len + chunk);
-                            ctx->rx_dma_read = n2;
-                            drained = (uint16_t)(drained + chunk);
-                        }
-                        if (drained > 0u) {
-                            avail = (uint16_t)(ctx->rx_len - pos);
-                            g_rs_master_dbg.rx_rdr_drain_n =
-                                (uint16_t)(g_rs_master_dbg.rx_rdr_drain_n +
-                                           drained);
-                        }
-                    }
-                }
-                if (avail < (uint16_t)(total_size - 1u)) {
-                    ctx->rx_decode_short_hold++;
-                    break;
-                }
+                /* Хвост доберёт следующий DMA harvest — без RDR/NDTR drain. */
+                g_rs_master_dbg.rx_short_avail = avail;
+                g_rs_master_dbg.rx_short_need =
+                    (uint16_t)(total_size - 1u);
+                ctx->rx_decode_short_hold++;
+                break;
             }
             need = (uint16_t)(1u + avail);
             if (need > (uint16_t)sizeof(tmp)) {

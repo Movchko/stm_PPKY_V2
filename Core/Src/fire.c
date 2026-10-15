@@ -1816,11 +1816,13 @@ static uint8_t Fire_Phase2AllPending(void)
 static uint8_t Fire_Phase2SelectedPending(uint8_t zone)
 {
 	uint8_t started = 0u;
+	uint8_t key = Fire_UiZoneKey(zone);
 	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
 		if (!g_fire.slots[i].active) {
 			continue;
 		}
-		if ((g_fire.slots[i].zone & 0x7Fu) != (zone & 0x7Fu)) {
+		/* UI/панель шлют Fire_UiZoneKey (0→1); слот может хранить raw 0. */
+		if (Fire_UiZoneKey(g_fire.slots[i].zone) != key) {
 			continue;
 		}
 		if (g_fire.slots[i].extinguish_aborted != 0u) {
@@ -2425,18 +2427,16 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 #if GOST_MODE
 			if (g_fire_ui_manual_select_enabled) {
 				uint8_t sel_zone = 0u;
-				/* Сначала — выбранная зона (листание 1/N). */
+				/* Выбранная зона (стрелки панели → ApplyPanelZoneSelect). */
 				if (Fire_GetSelectedZoneFromUi(&sel_zone)) {
 					started = Fire_Phase2SelectedPending(sel_zone);
 					if (started != 0u) {
 						log_zone = sel_zone;
 					}
-				}
-				/* ГОСТ UI после вспышки нового пожара возвращает выбор на зону 0
-				 * (уже в тушении при delay=0). ПУСК СП тогда молча no-op,
-				 * а зона с задержкой так и остаётся в «ДО ПУСКА». Fallback —
-				 * пуск всех ещё ожидающих фазы 2. */
-				if (started == 0u && Fire_CountManualStartable() > 0u) {
+					/* Явный выбор: без fallback на All — иначе чужой COUNTDOWN
+					 * стартует вместо выбранной (или маскирует no-op по ТУШ.ВЫП). */
+				} else if (Fire_CountManualStartable() > 0u) {
+					/* Выбор сброшен (зона исчезла из UI) — все awaiting. */
 					started = Fire_Phase2AllPending();
 				}
 			} else
@@ -2470,19 +2470,22 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 			BroadcastSetStatusFire(0u, FIRE_STATUS_SRC_PPKU_START_ALL,
 			                       DEVICE_PPKY_TYPE, 0u);
 			uint8_t any_started = Fire_StartAllExistingZonesAndMarkSlots();
-			/* Если есть активные пожарные слоты — ручной общий пуск должен
-			 * завершить их ожидание фазы 2 (таймер далее не идёт). */
-			if (Fire_CountPendingPhase2() > 0u) {
-				Fire_Phase2AllPending();
-				any_started = 1u;
+			/* Pending countdown + FIRE1/abort/launch_stopped — Phase2All.
+			 * CountPendingPhase2 не видит fire1/launch_stopped → без этого
+			 * ПУСК ОБЩИЙ при уже потушенных зонах молча no-op. */
+			if (Fire_CountPendingPhase2() > 0u ||
+			    Fire_CountManualStartable() > 0u) {
+				if (Fire_Phase2AllPending() != 0u) {
+					any_started = 1u;
+				}
 			}
 			if (any_started) {
-			g_fire.start_launch_pressed_latched = 1u;
-			g_fire.stop_launch_pressed_latched = 0u;
-			Fire_SyncStateFromSlots();
-			fire_processed = 1u;
-			start_processed = 1u;
-		}
+				g_fire.start_launch_pressed_latched = 1u;
+				g_fire.stop_launch_pressed_latched = 0u;
+				Fire_SyncStateFromSlots();
+				fire_processed = 1u;
+				start_processed = 1u;
+			}
 		}
 		break;
 	case FIRE_EVENT_BUS_START_EXT: {
@@ -2527,16 +2530,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 			if (g_fire_ui_manual_select_enabled) {
 				have_zone = Fire_GetSelectedZoneFromUi(&sel_zone);
 			}
-			if (!have_zone) {
-				/* Без выбора — первая активная зона. */
-				for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-					if (g_fire.slots[i].active) {
-						sel_zone = g_fire.slots[i].zone;
-						have_zone = 1u;
-						break;
-					}
-				}
-			}
 			if (have_zone) {
 				int8_t si = Fire_FindSlotZone(sel_zone);
 				if (g_fire_panel_btn_source != 0u) {
@@ -2571,16 +2564,49 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 					}
 					/* ТУШ.ВЫП / ТУШ.ОСТ / ТУШ.ОШ / ПОЖАР1: короткий ОСТАНОВ
 					 * не переводит в «ПОЖАР/ОСТ.ПУСКА» (сброс — удержанием ≥5 с). */
-					if ((s->phase2_sent != 0u &&
-					     (Fire_ZoneAllIgnitersEndAck(sel_zone) ||
-					      s->extinguish_aborted != 0u ||
-					      s->ext_retry_failed != 0u)) ||
-					    s->fire1_waiting != 0u ||
-					    s->launch_stopped != 0u) {
-						break;
-					}
-					/* Иной терминальный статус зоны — только лог, без смены UI. */
 					break;
+				}
+			} else {
+				/* zone=0 / без выбора: пауза/resume ВСЕХ countdown-слотов.
+				 * Раньше брали первый active — часто EXT_DONE → silent no-op. */
+				uint8_t any_cd = 0u;
+				uint8_t any_done = 0u;
+				uint8_t i;
+				if (g_fire_panel_btn_source != 0u) {
+					Fire_LogPanelButton(FIRE_LOG_BTN_STOP, 0u, 0u);
+				}
+				for (i = 0u; i < FIRE_MAX_SLOTS; i++) {
+					FireZoneSlot *s = &g_fire.slots[i];
+					if (!s->active || s->phase2_sent || s->fire1_waiting ||
+					    s->launch_stopped || s->extinguish_aborted) {
+						continue;
+					}
+					if (s->countdown_paused != 0u) {
+						any_done = 1u;
+					} else {
+						any_cd = 1u;
+					}
+				}
+				if (any_cd != 0u || any_done != 0u) {
+					uint8_t do_pause = (any_cd != 0u) ? 1u : 0u;
+					for (i = 0u; i < FIRE_MAX_SLOTS; i++) {
+						FireZoneSlot *s = &g_fire.slots[i];
+						if (!s->active || s->phase2_sent || s->fire1_waiting ||
+						    s->launch_stopped || s->extinguish_aborted) {
+							continue;
+						}
+						if (do_pause != 0u) {
+							if (s->countdown_paused == 0u) {
+								Fire_PauseZoneCountdown(s->zone, now_ms);
+							}
+						} else if (s->countdown_paused != 0u) {
+							Fire_ResumeZoneCountdown(s->zone, now_ms);
+						}
+					}
+					g_fire.start_launch_pressed_latched = 0u;
+					g_fire.stop_launch_pressed_latched = do_pause;
+					Fire_SyncStateFromSlots();
+					fire_processed = 1u;
 				}
 			}
 			break;
