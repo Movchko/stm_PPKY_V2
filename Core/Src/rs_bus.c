@@ -67,16 +67,10 @@ static void rs_bus_rx_flush_errors(UART_HandleTypeDef *uart)
     uart->ErrorCode = HAL_UART_ERROR_NONE;
 }
 
-/* 2 Мбод: бит 0.5 мкс. Без паузы после DE↑ старт-бит 0xA5 попадает на включение
- * драйвера / выход линии из неопределённого состояния → приёмник синхронизируется
- * внутри байта и 0xA5 не видит (Live: rx_resync==rx_raw). 20 мкс = 4 символа марки:
- * успевает закончиться ложный байт от фронта DE и пройти IDLE у приёмника. */
-/* 20 мкс мало: панель Live — кадры как «5A 09 addr…» без ведущего A5.
- * 100 мкс мало при 2+ панелях (ringing/нагрузка) — в DMA мусор до RSP,
- * FrameDecode: src_size 28..32 < total_size. 300 мкс ≈ 75 симв. mark @2 Мбод. */
+/* @250 кбод: символ ≈40 мкс. DE lead — несколько символов mark после DE↑,
+ * чтобы A5 не сел на ringing драйвера (история с 2 Мбод: без паузы теряли A5). */
 #define RS_BUS_DE_LEAD_US 300u
-/* Жертвенные 0xFF перед A5: при 2 Мбод IDLE=~5 мкс, любой preempt TX даёт щель
- * и мастер теряет первые байты → буфер «5A …» без A5, short_hold@orphan. */
+/* Жертвенные 0xFF перед A5: щель >1 симв в TX → orphan 5A на мастере. */
 #define RS_BUS_TX_PAD_N   4u
 
 static void rs_bus_delay_us(uint32_t us)
@@ -97,9 +91,8 @@ static void rs_bus_rx_start_dma(RsBusContext *ctx)
 {
     ctx->rx_dma_read = 0u;
     /*
-     * НЕ ReceiveToIdle: @2 Мбод IDLE≈5 мкс, щель mid-RSP → callback + rearm
-     * съедает хвост (Live: avail=28, нужно 32, eternal break@373).
-     * Обычный Receive_DMA: байты копятся, harvest снимает по NDTR без Abort.
+     * НЕ ReceiveToIdle: щель mid-RSP → IDLE callback + rearm съедает хвост.
+     * Receive_DMA: байты копятся, harvest снимает по NDTR без Abort.
      */
     (void)HAL_UART_Receive_DMA(ctx->uart, ctx->rx_dma_buf, sizeof(ctx->rx_dma_buf));
     if (ctx->uart->hdmarx != 0) {
@@ -155,8 +148,7 @@ void RsBus_RxWatchdog(RsBusContext *ctx)
     rs_bus_rx_irq_unlock(ctx->uart);
 }
 
-/* После TC/DE→RX: дать шине устаканиться (~десятки бит @2 Мбод), иначе
- * в DMA попадает ringing без 0xA5. */
+/* После TC/DE→RX: дать шине устаканиться, иначе в DMA ringing без 0xA5. */
 static void rs_bus_post_tx_settle(void)
 {
     rs_bus_delay_us(RS_BUS_DE_LEAD_US);
@@ -667,7 +659,6 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
     uint8_t wire[RS_BUS_MAX_FRAME_SIZE + RS_BUS_TX_PAD_N];
     uint16_t frame_len;
     uint16_t wire_len;
-    uint32_t primask;
     HAL_StatusTypeDef st;
 
     if (ctx == 0 || ctx->uart == 0) {
@@ -687,13 +678,10 @@ HAL_StatusTypeDef RsBus_SendFrame(RsBusContext *ctx,
     (void)HAL_UART_AbortReceive(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_SET);
     rs_bus_delay_us(RS_BUS_DE_LEAD_US);
-    /* Полный запрет IRQ на время TX: иначе щель >1 симв @2 Мбод → IDLE mid-frame. */
-    primask = __get_PRIMASK();
-    __disable_irq();
-    st = HAL_UART_Transmit(ctx->uart, wire, wire_len, 20u);
-    if (primask == 0u) {
-        __enable_irq();
-    }
+    /* Не __disable_irq на весь TX: @250 кбод кадр до ~11 мс — SysTick/UI
+     * отстают. RX — Receive_DMA без IDLE, щель между байтами допустима.
+     * UART RX IRQ всё равно заблокирован (half-duplex). */
+    st = HAL_UART_Transmit(ctx->uart, wire, wire_len, 50u);
     rs_bus_wait_tx_complete(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_RESET);
     rs_bus_post_tx_settle();
@@ -706,7 +694,6 @@ HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_
 {
     uint8_t wire[RS_BUS_MAX_FRAME_SIZE + RS_BUS_TX_PAD_N];
     uint16_t wire_len;
-    uint32_t primask;
     HAL_StatusTypeDef st;
 
     if (ctx == 0 || ctx->uart == 0 || frame == 0 || frame_len == 0u) {
@@ -724,12 +711,7 @@ HAL_StatusTypeDef RsBus_SendRaw(RsBusContext *ctx, const uint8_t *frame, uint16_
     (void)HAL_UART_AbortReceive(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_SET);
     rs_bus_delay_us(RS_BUS_DE_LEAD_US);
-    primask = __get_PRIMASK();
-    __disable_irq();
     st = HAL_UART_Transmit(ctx->uart, wire, wire_len, 50u);
-    if (primask == 0u) {
-        __enable_irq();
-    }
     rs_bus_wait_tx_complete(ctx->uart);
     rs_bus_de_set(ctx, GPIO_PIN_RESET);
     rs_bus_post_tx_settle();

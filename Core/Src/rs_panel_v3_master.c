@@ -1104,10 +1104,10 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         }
     }
 
-    /* 2) TIME важнее каталога: откат фазы стрима, кадр SYS+TIME (+ACK, +ZONES fire).
-     * Иначе TIME срезался на весь ZONE/MCU stream → часы 00:00 при NORMA.
-     * Следующий POLL продолжит каталог с той же позиции. */
-    if (want_time != 0u && has_stream_tlv != 0u) {
+    /* 2) TIME vs stream: FAULT_CLEAR/SET не откатываем ради TIME — иначе
+     * @250 кбод + mismatch CRC мастер залипает на CLEAR, WARN/журнал голодают.
+     * ZONE/DEV по-прежнему уступают TIME (часы на NORMA). */
+    if (want_time != 0u && has_stream_tlv != 0u && poll.has_fault_evt == 0u) {
         ctx->stream_active = saved_ctx.stream_active;
         ctx->stream_phase = saved_ctx.stream_phase;
         ctx->stream_idx = saved_ctx.stream_idx;
@@ -1157,7 +1157,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
     }
 
-    /* 3) Без TIME или без стрима: срезать TIME, оставить стрим (resync). */
+    /* 3) Срезать TIME, оставить стрим (FAULT/каталог resync). */
     if (want_time != 0u) {
         ctx->last_time_ms = saved_ctx.last_time_ms;
         poll.has_time = 0u;

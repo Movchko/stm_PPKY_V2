@@ -59,19 +59,17 @@ static uint16_t g_menu_selected = 0u; /* dbg mirror */
  * или не истечёт окно. Без RecoverFromError/Abort в таймауте — только
  * следующий SendFrame AbortReceive перед своим TX.
  */
-/* Ответ панели: короткий RSP сразу, apply после. 40 мс — запас на half-duplex.
- * FIRE: раньше 120 мс из‑за TouchGFX в OnPoll; UI теперь Queue→Deferred,
- * ZONES только if_changed. 60 мс — запас на RSP+event_crit без просадки опроса.
- * SCAN (panel_count==0): 2+ панели на шине — дольше ringing/settle после probe. */
-#define RS_PANEL_BUS_TURNAROUND_MS 40u
-#define RS_PANEL_BUS_TURNAROUND_FIRE_MS 60u
-#define RS_PANEL_BUS_TURNAROUND_SCAN_MS 100u
+/* @250 кбод: символ ≈40 мкс, max wire ~260 B ≈11 мс; stagger addr×2 мс до 16 мс.
+ * Quiet должен покрыть stagger+RSP (+запас). */
+#define RS_PANEL_BUS_TURNAROUND_MS 50u
+#define RS_PANEL_BUS_TURNAROUND_FIRE_MS 80u
+#define RS_PANEL_BUS_TURNAROUND_SCAN_MS 120u
 /*
  * Если у любого слота gap POLL ≥ этого — addr_scan/ACTIVITY/can_mirror откладываем.
  */
-#define RS_PANEL_POLL_MAX_GAP_MS 120u
-/* При 2+ панелях мин. период POLL на слот (wall) — не долбить шину каждые 1 мс. */
-#define RS_PANEL_MULTI_POLL_MS 40u
+#define RS_PANEL_POLL_MAX_GAP_MS 150u
+/* При 2+ панелях мин. период POLL на слот (wall). */
+#define RS_PANEL_MULTI_POLL_MS 50u
 
 static uint32_t s_last_caps_req_ms = 0u;
 /* До этого tick не слать новый master TX (ждём RSP / turnaround). */

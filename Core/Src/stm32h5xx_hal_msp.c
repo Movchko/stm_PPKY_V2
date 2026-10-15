@@ -757,8 +757,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     PB14     ------> USART1_TX
     PB15     ------> USART1_RX
     */
-    /* 2 Мбод RS-485: LOW давал битые края → на RX нет preamble 0xA5
-     * (Live: rx_resync==rx_raw, frames_ok=0). Панель UART4 уже VERY_HIGH. */
+    /* RS-485: VERY_HIGH — на LOW битые края, RX без 0xA5 (как на панели UART4). */
     GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
