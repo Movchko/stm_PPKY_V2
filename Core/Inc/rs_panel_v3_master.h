@@ -33,6 +33,8 @@ void RsPanelV3Master_RequestCatalogResync(void);
 void RsPanelV3Master_RequestCatalogResyncPanel(uint8_t panel_idx);
 /* Сброс last_time_ms → TIME в ближайшем POLL (после CAPS/reboot панели). */
 void RsPanelV3Master_ForceTimeSyncPanel(uint8_t panel_idx);
+/* Сброс last_tx ZONES → следующий POLL обязан отдать снимок (пуски с CAN/панели). */
+void RsPanelV3Master_InvalidateFireZonesTx(void);
 /* Сдвиг s_ctx[] при prune слота (иначе индекс панелей и ctx разъезжаются). */
 void RsPanelV3Master_RemovePanelSlot(uint8_t panel_idx);
 

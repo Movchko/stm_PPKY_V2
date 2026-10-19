@@ -240,8 +240,10 @@ static const MKUCfg* Fire_FindConfiguredMcuByZoneHAdr(uint8_t zone, uint8_t h_ad
 static uint8_t Fire_IsMcuDType(uint8_t d_type);
 /* Ограничение uint32 в диапазон uint8. */
 static uint8_t Fire_ClampU8FromU32(uint32_t v);
-/* Ищет слот по номеру зоны, возвращает индекс или -1. */
+/* Ищет слот по UI-ключу зоны (0≡1), для панели/паузы/STOP. */
 static int8_t Fire_FindSlotZone(uint8_t zone);
+/* Ищет слот по точной CAN-зоне — для FSM пожара / extinguish_locked. */
+static int8_t Fire_FindSlotZoneExact(uint8_t zone);
 /* Выделяет свободный слот пожара, возвращает индекс или -1. */
 static int8_t Fire_AllocSlot(void);
 /** @return 1 если зона добавлена впервые в цикле, 0 если по этой зоне пожар уже учтён */
@@ -306,6 +308,7 @@ static uint8_t Fire_Phase2SelectedPending(uint8_t zone);
 static void Fire_SendStopZone(uint8_t zone);
 static void Fire_AbortExtinguishRetriesForZone(uint8_t zone);
 static uint8_t Fire_GetSelectedZoneFromUi(uint8_t *zone);
+static void Fire_ApplyPanelZoneSelect(uint8_t zone);
 #if !GOST_MODE
 static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8_t stop_reason);
 #endif
@@ -523,9 +526,10 @@ static const MKUCfg* Fire_FindConfiguredMcuByZoneHAdr(uint8_t zone, uint8_t h_ad
 static uint8_t Fire_CollectSortedIgniterTargetsByZone(uint8_t zone, FireIgniterAddr *out, uint8_t max_out)
 {
 	uint8_t n = 0u;
+	uint8_t z = zone & 0x7Fu;
 	for (uint8_t i = 0u; i < g_active_devices_count && n < max_out; i++) {
 		const ActiveDeviceInfo *ad = &g_active_devices[i];
-		if (!ad->online || ad->dev.zone != zone) {
+		if (!ad->online || ((ad->dev.zone & 0x7Fu) != z)) {
 			continue;
 		}
 		for (uint8_t vi = 0u; vi < ad->vdev_count && n < max_out; vi++) {
@@ -1138,6 +1142,8 @@ static void Fire_MarkSlotPhase2Sent(FireZoneSlot *slot, uint32_t now_ms, uint8_t
 	slot->log_incomplete_posted = 0u;
 	slot->ext_retry_next_ms = now_ms + Fire_ExtinguishGraceMs(slot->zone);
 	Fire_LogExtinguishStart(slot->zone, start_type);
+	/* Панель кэширует ZONES; форс следующего POLL со статусом ТУШЕНИЕ. */
+	RsPanelV3Master_InvalidateFireZonesTx();
 }
 
 static void Fire_SendStopAllMcus(void)
@@ -1204,9 +1210,21 @@ static void Fire_ResumeCountdownAndDispatch(uint32_t now_ms)
 
 static int8_t Fire_FindSlotZone(uint8_t zone)
 {
+	/* UI/панель: zone 0 и 1 — один ключ (СТЕНД). */
 	uint8_t key = Fire_UiZoneKey(zone);
 	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
 		if (g_fire.slots[i].active && Fire_UiZoneKey(g_fire.slots[i].zone) == key) {
+			return (int8_t)i;
+		}
+	}
+	return -1;
+}
+
+static int8_t Fire_FindSlotZoneExact(uint8_t zone)
+{
+	uint8_t z = zone & 0x7Fu;
+	for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
+		if (g_fire.slots[i].active && ((g_fire.slots[i].zone & 0x7Fu) == z)) {
 			return (int8_t)i;
 		}
 	}
@@ -1409,7 +1427,9 @@ static uint8_t Fire_TryAddNewFireZone(uint8_t zone, uint32_t source_key, uint8_t
 		return 0u;
 	}
 #endif
-	int8_t si = Fire_FindSlotZone(zone);
+	/* Точная зона: иначе 0≡1 через UiZoneKey склеивает два пожара в один
+	 * extinguish_locked слот → второй ПУСК СП no-op. */
+	int8_t si = Fire_FindSlotZoneExact(zone);
 	if (si >= 0) {
 		FireZoneSlot *existing = &g_fire.slots[(uint8_t)si];
 		if (!Fire_AddSourceToSlot(existing, source_key)) {
@@ -1447,7 +1467,7 @@ static uint8_t Fire_TryAddNewFireZone(uint8_t zone, uint32_t source_key, uint8_t
 	FireZoneSlot *s = &g_fire.slots[(uint8_t)alloc_si];
 	memset(s, 0, sizeof(*s));
 	s->active = 1u;
-	s->zone = zone;
+	s->zone = zone & 0x7Fu;
 	s->appeared_ms = now_ms;
 	(void)Fire_AddSourceToSlot(s, source_key);
 #if GOST_MODE
@@ -1574,7 +1594,7 @@ static uint8_t Fire_AnyActiveSlot(void)
 
 static uint8_t Fire_ZoneIsExtinguishLocked(uint8_t zone)
 {
-	int8_t si = Fire_FindSlotZone(zone);
+	int8_t si = Fire_FindSlotZoneExact(zone);
 	if (si < 0) {
 		return 0u;
 	}
@@ -1583,7 +1603,7 @@ static uint8_t Fire_ZoneIsExtinguishLocked(uint8_t zone)
 
 static uint8_t Fire_EnsureSlotForZone(uint8_t zone, uint32_t now_ms)
 {
-	int8_t si = Fire_FindSlotZone(zone);
+	int8_t si = Fire_FindSlotZoneExact(zone);
 	if (si >= 0) {
 		return 1u;
 	}
@@ -1610,7 +1630,7 @@ static uint8_t Fire_MarkExternalExtinguishZone(uint8_t zone, uint32_t now_ms)
 	if (!Fire_EnsureSlotForZone(zone, now_ms)) {
 		return 0u;
 	}
-	int8_t si = Fire_FindSlotZone(zone);
+	int8_t si = Fire_FindSlotZoneExact(zone);
 	if (si < 0) {
 		return 0u;
 	}
@@ -1971,9 +1991,10 @@ static uint8_t Fire_StartAllExistingZonesAndMarkSlots(void)
 static uint8_t Fire_ZoneAllIgnitersEndAck(uint8_t zone)
 {
 	uint8_t has_igniters = 0u;
+	uint8_t z = zone & 0x7Fu;
 	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
 		ActiveDeviceInfo *m = &g_active_devices[i];
-		if (!m->online || m->dev.zone != zone) {
+		if (!m->online || ((m->dev.zone & 0x7Fu) != z)) {
 			continue;
 		}
 		for (uint8_t vi = 0u; vi < m->vdev_count; vi++) {
@@ -2432,9 +2453,11 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 					started = Fire_Phase2SelectedPending(sel_zone);
 					if (started != 0u) {
 						log_zone = sel_zone;
+					} else if (Fire_CountManualStartable() > 0u) {
+						/* Выбранная уже ТУШ.ВЫП/не стартует — все awaiting
+						 * (внешняя кнопка / zone=0; иначе второй пожар silent no-op). */
+						started = Fire_Phase2AllPending();
 					}
-					/* Явный выбор: без fallback на All — иначе чужой COUNTDOWN
-					 * стартует вместо выбранной (или маскирует no-op по ТУШ.ВЫП). */
 				} else if (Fire_CountManualStartable() > 0u) {
 					/* Выбор сброшен (зона исчезла из UI) — все awaiting. */
 					started = Fire_Phase2AllPending();
@@ -2901,15 +2924,20 @@ void Fire_OnStatusFire(uint32_t msg_id, const uint8_t *msg_data)
 	SetReplyStatusFire(zone);
 }
 
+static volatile uint32_t bus_sp_cnt = 0;
+
 void Fire_OnBusStartSpButton(uint32_t msg_id)
 {
 	if (MenuUi_IsConfigSessionActive()) {
 		return;
 	}
+	/* MKU button StartSP: broadcast d_type/h/l=0, cmd 163. */
 	if (!Backend_IsIgniterBroadcastId(msg_id)) {
 		return;
 	}
-	Fire_Transition(FIRE_EVENT_BTN_START_SP, HAL_GetTick());
+	bus_sp_cnt++;
+	/* Тот же вход, что панель с zone=0 (все awaiting, без стрелочного выбора). */
+	Fire_OnPanelStartSp(0u);
 }
 
 void Fire_OnStartExtinguishment(uint32_t msg_id, const uint8_t *msg_data)

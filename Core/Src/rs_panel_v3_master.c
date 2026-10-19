@@ -657,12 +657,49 @@ static uint8_t rs_v3_emit_stream_op(RsPanelV3Poll *out, RsPanelV3PanelCtx *ctx)
     }
 }
 
-/* Последний ушедший снимок ZONES на панель — не слать тот же каждые ~40 мс. */
+/* Последний УСПЕШНО УШЕДШИЙ на провод снимок ZONES (commit только после Encode≠0).
+ * Раньше писали сюда в put_* до TX: Encode не влез → SysOnly → дельта
+ * COUNTDOWN→EXTINGUISHING потеряна навсегда → панель «ДО ПУСКА» после
+ * внешней кнопки / ПУСК ОБЩИЙ. */
 static RsPanelV3Zones s_last_tx_zones[RS_PANEL_MAX_PANELS];
 static uint8_t s_last_tx_zones_valid[RS_PANEL_MAX_PANELS];
 
+static void rs_v3_commit_fire_zones_tx(uint8_t panel_idx, const RsPanelV3Zones *z)
+{
+    if (panel_idx >= RS_PANEL_MAX_PANELS || z == 0) {
+        return;
+    }
+    s_last_tx_zones[panel_idx] = *z;
+    s_last_tx_zones_valid[panel_idx] = 1u;
+}
+
+void RsPanelV3Master_InvalidateFireZonesTx(void)
+{
+    uint8_t i;
+    for (i = 0u; i < RS_PANEL_MAX_PANELS; i++) {
+        s_last_tx_zones_valid[i] = 0u;
+    }
+}
+
+/* Encode + commit ZONES только если кадр реально собрался. */
+static uint16_t rs_v3_encode_poll_commit_zones(uint8_t *dst, uint16_t dst_size,
+                                              const RsPanelV3Poll *poll,
+                                              uint8_t panel_idx)
+{
+    uint16_t len;
+    if (poll == 0) {
+        return 0u;
+    }
+    len = RsPanelV3_EncodePoll(dst, dst_size, poll);
+    if (len != 0u && poll->has_zones != 0u) {
+        rs_v3_commit_fire_zones_tx(panel_idx, &poll->zones);
+    }
+    return len;
+}
+
 /* ZONES при пожаре — только если снимок изменился (status/remaining/…).
- * Иначе POLL без TLV зон; панель держит кэш. UI/таймер обновятся при дельте. */
+ * Иначе POLL без TLV зон; панель держит кэш. UI/таймер обновятся при дельте.
+ * last_tx НЕ трогаем — иначе потеря дельты при неудачном Encode. */
 static uint8_t rs_v3_put_fire_zones_if_changed(RsPanelV3Poll *out,
                                                uint8_t panel_idx,
                                                uint32_t now_ms)
@@ -690,8 +727,6 @@ static uint8_t rs_v3_put_fire_zones_if_changed(RsPanelV3Poll *out,
     }
     out->zones = z;
     out->has_zones = (z.count > 0u) ? 1u : 0u;
-    s_last_tx_zones[panel_idx] = z;
-    s_last_tx_zones_valid[panel_idx] = 1u;
     return 1u;
 }
 
@@ -989,7 +1024,7 @@ static uint16_t rs_v3_encode_sys_fire_zones(uint8_t *dst, uint16_t dst_size,
     if (rs_v3_put_fire_zones_if_changed(&fpoll, panel_idx, now_ms) == 0u) {
         return 0u;
     }
-    return RsPanelV3_EncodePoll(dst, dst_size, &fpoll);
+    return rs_v3_encode_poll_commit_zones(dst, dst_size, &fpoll, panel_idx);
 }
 
 uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
@@ -1021,7 +1056,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
                      poll_ack_crit.result != (uint8_t)RS_PANEL_V3_ACK_NONE))
                        ? 1u
                        : 0u;
-    len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+    len = rs_v3_encode_poll_commit_zones(dst, dst_size, &poll, panel_idx);
     if (len != 0u) {
         if (want_time != 0u && panel_idx < 8u) {
             g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
@@ -1049,7 +1084,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         if (Fire_IsActive() != 0u) {
             (void)rs_v3_put_fire_zones_if_changed(&fpoll, panel_idx, now_ms);
         }
-        len = RsPanelV3_EncodePoll(dst, dst_size, &fpoll);
+        len = rs_v3_encode_poll_commit_zones(dst, dst_size, &fpoll, panel_idx);
         if (len != 0u) {
             if (want_time != 0u && panel_idx < 8u) {
                 g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
@@ -1084,7 +1119,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
     if (poll.has_config != 0u) {
         poll.has_config = 0u;
         memset(&poll.config, 0, sizeof(poll.config));
-        len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+        len = rs_v3_encode_poll_commit_zones(dst, dst_size, &poll, panel_idx);
         if (len != 0u) {
             if (want_time != 0u && panel_idx < 8u) {
                 g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
@@ -1095,7 +1130,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
     if (poll.has_zones != 0u && Fire_IsActive() == 0u) {
         poll.has_zones = 0u;
         memset(&poll.zones, 0, sizeof(poll.zones));
-        len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+        len = rs_v3_encode_poll_commit_zones(dst, dst_size, &poll, panel_idx);
         if (len != 0u) {
             if (want_time != 0u && panel_idx < 8u) {
                 g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
@@ -1133,7 +1168,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
             (void)rs_v3_put_fire_zones_if_changed(&poll, panel_idx, now_ms);
         }
 
-        len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+        len = rs_v3_encode_poll_commit_zones(dst, dst_size, &poll, panel_idx);
         if (len != 0u) {
             if (panel_idx < 8u) {
                 g_rs_master_dbg.time_tlv_tx_by_panel[panel_idx]++;
@@ -1163,7 +1198,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         poll.has_time = 0u;
         poll.sys.flags = (uint16_t)(poll.sys.flags &
                                    (uint16_t)(~RS_PANEL_V3_SYS_TIME_VALID));
-        len = RsPanelV3_EncodePoll(dst, dst_size, &poll);
+        len = rs_v3_encode_poll_commit_zones(dst, dst_size, &poll, panel_idx);
         if (len != 0u) {
             return len;
         }

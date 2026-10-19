@@ -1251,8 +1251,20 @@ void ResetMCU() {
 	NVIC_SystemReset();
 }
 
+/* FireServiceCmd (backend) → app: dir=0 broadcast с МКУ не идёт в Listener. */
+extern "C" void RcvStartExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t is_our_cmd)
+{
+	(void)is_our_cmd;
+	Fire_OnStartExtinguishment(MsgID, MsgData);
+}
 
-
+extern "C" void RcvStartSpButton(uint32_t MsgID, uint8_t *MsgData, uint8_t is_our_cmd)
+{
+	(void)MsgData;
+	(void)is_our_cmd;
+	/* DeviceButtonKind_StartSP → cmd 163 → ПУСК СП на всех awaiting. */
+	Fire_OnBusStartSpButton(MsgID);
+}
 
 // посылки от устройств
 void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData) {

@@ -26,6 +26,9 @@
 #define CAN_TX_RING_SIZE      256
 #define CAN_NO_RX_TIMEOUT_MS  3000
 #define CAN_DUP_WINDOW_MS     50
+/* Same-bus / cross-bus дедуп по (id,data): действует только это окно.
+ * Позже одинаковый кадр (напр. повторный StartSpButton) — снова уникальный. */
+#define CAN_DEDUP_EXPIRE_MS   3000u
 /* Эхо собственного TX на другой шине: не позже 1 с → кольцо целое. */
 #define CAN_RING_ECHO_TIMEOUT_MS 1000u
 #define UART_BRIDGE_QUEUE_SIZE 64
@@ -105,9 +108,22 @@ static uint8_t           uart_crc_lo = 0;
 #define CAN_ID_NONE  0xFFFFFFFFu
 static uint32_t last_id_can1[CAN_MAX_DEVICES];
 static uint8_t  last_data_can1[CAN_MAX_DEVICES][8];
+static uint32_t last_ms_can1[CAN_MAX_DEVICES];
 static uint32_t last_id_can2[CAN_MAX_DEVICES];
 static uint8_t  last_data_can2[CAN_MAX_DEVICES][8];
+static uint32_t last_ms_can2[CAN_MAX_DEVICES];
 static uint8_t  can_init_done = 0;
+
+/* 1 — запись last_* ещё в окне CAN_DEDUP_EXPIRE_MS и годится для сравнения. */
+static uint8_t CanDedupEntryFresh(uint32_t last_id, uint32_t last_ms, uint32_t now_ms)
+{
+	uint32_t age;
+	if (last_id == CAN_ID_NONE) {
+		return 0u;
+	}
+	age = now_ms - last_ms;
+	return (age <= CAN_DEDUP_EXPIRE_MS) ? 1u : 0u;
+}
 
 /** Ожидание дубликата с другой шины: с какой шины ждём, до какого тика */
 static uint8_t  pending_bus[CAN_MAX_DEVICES];
@@ -703,6 +719,8 @@ void CanInit(void)
 	for (uint16_t i = 0; i < CAN_MAX_DEVICES; i++) {
 		last_id_can1[i] = CAN_ID_NONE;
 		last_id_can2[i] = CAN_ID_NONE;
+		last_ms_can1[i] = 0u;
+		last_ms_can2[i] = 0u;
 	}
 	s_ring_intact = 1u;
 	s_ring_probe_active = 0u;
@@ -766,8 +784,10 @@ void CanProcess(void)
 			uint8_t other_bus;
 			uint32_t *last_id_other;
 			uint8_t  *last_data_other;
+			uint32_t *last_ms_other;
 			uint32_t *last_id_cur;
 			uint8_t  *last_data_cur;
+			uint32_t *last_ms_cur;
 
 			dev = CAN_DEVICE_INDEX(e->id);
 			if (e->can_bus == CAN_BUS_1) {
@@ -779,34 +799,42 @@ void CanProcess(void)
 			if (other_bus == CAN_BUS_1) {
 				last_id_other = &last_id_can1[dev];
 				last_data_other = last_data_can1[dev];
+				last_ms_other = &last_ms_can1[dev];
 			} else {
 				last_id_other = &last_id_can2[dev];
 				last_data_other = last_data_can2[dev];
+				last_ms_other = &last_ms_can2[dev];
 			}
 
 			if (e->can_bus == CAN_BUS_1) {
 				last_id_cur = &last_id_can1[dev];
 				last_data_cur = last_data_can1[dev];
+				last_ms_cur = &last_ms_can1[dev];
 			} else {
 				last_id_cur = &last_id_can2[dev];
 				last_data_cur = last_data_can2[dev];
+				last_ms_cur = &last_ms_can2[dev];
 			}
 
-			/* Дубликат с другой шины: тот же пакет уже пришёл с другой линии — не парсить, снять ожидание */
-			if (*last_id_other != CAN_ID_NONE && e->id == *last_id_other && memcmp(e->data, last_data_other, 8) == 0) {
+			/* Дубликат с другой шины (в окне CAN_DEDUP_EXPIRE_MS): не парсить. */
+			if (CanDedupEntryFresh(*last_id_other, *last_ms_other, now) != 0u &&
+			    e->id == *last_id_other && memcmp(e->data, last_data_other, 8) == 0) {
 				*last_id_cur = e->id;
 				memcpy(last_data_cur, e->data, 8);
+				*last_ms_cur = now;
 				pending_timeout[dev] = 0;
 				device_can_error[dev] &= (uint8_t)(~(1 << (e->can_bus - 1)));
 				continue;
 			}
 
-			/* Один и тот же пакет дважды с одной шины — пропустить.
-			 * 156/158 хост шлёт повторно тем же кадром, если ACK потерян:
-			 * без исключения ретрай никогда не доходит до SetUpdateWord. */
+			/* Один и тот же пакет дважды с одной шины — пропустить только в окне 3 с.
+			 * Позже одинаковый (id,data) снова уникальный (повторный StartSpButton и т.п.).
+			 * 156/158: хост ретраит тем же кадром при потере ACK — без исключения
+			 * ретрай внутри окна не доходит до SetUpdateWord. */
 			if (e->data[0] != ServiceCmd_SetUpdateWord &&
 			    e->data[0] != ServiceCmd_UpdateTransmit &&
-			    *last_id_cur != CAN_ID_NONE && e->id == *last_id_cur &&
+			    CanDedupEntryFresh(*last_id_cur, *last_ms_cur, now) != 0u &&
+			    e->id == *last_id_cur &&
 			    memcmp(e->data, last_data_cur, 8) == 0) {
 				continue;
 			}
@@ -819,6 +847,7 @@ void CanProcess(void)
 
 			*last_id_cur = e->id;
 			memcpy(last_data_cur, e->data, 8);
+			*last_ms_cur = now;
 
 			pending_bus[dev] = other_bus;
 			pending_timeout[dev] = now + CAN_DUP_WINDOW_MS;
