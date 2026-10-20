@@ -253,7 +253,7 @@ static uint8_t Fire_TryAddNewFireZone(uint8_t zone, uint32_t source_key, uint8_t
 static uint8_t Fire_IsAndEnabledForZone(uint8_t zone);
 static uint8_t Fire_CountOnlineDptForZone(uint8_t zone);
 static uint8_t Fire_IsAndEffectiveForZone(uint8_t zone);
-static uint32_t Fire_SourceKeyFromMsgId(uint32_t msg_id);
+static uint32_t Fire_SourceKeyFromFireMsg(uint32_t msg_id, const uint8_t *msg_data);
 static uint8_t Fire_AddSourceToSlot(FireZoneSlot *slot, uint32_t source_key);
 static uint8_t Fire_HasFire1Waiting(void);
 static uint8_t Fire_PromoteFire1WhenAndUnavailable(uint32_t now_ms);
@@ -1383,13 +1383,34 @@ static uint8_t Fire_IsAndEffectiveForZone(uint8_t zone)
 	return (Fire_CountOnlineDptForZone(zone) >= 2u) ? 1u : 0u;
 }
 
-static uint32_t Fire_SourceKeyFromMsgId(uint32_t msg_id)
+/*
+ * Ключ источника для слота / ZONES UI:
+ *   [20:14] origin_d_type (ДПТ/КН/… из payload SetStatusFire data[1])
+ *   [13:6]  mcu h_adr (из CAN ID отправителя-МКУ)
+ *   [5:0]   origin_l_adr (канал из payload data[2])
+ * Раньше брали d_type/l_adr из CAN ID (= тип МКУ) → панель не находила
+ * «ДПТ»/«КН» и рисовала только имя зоны.
+ */
+static uint32_t Fire_SourceKeyFromFireMsg(uint32_t msg_id, const uint8_t *msg_data)
 {
 	can_ext_id_t id;
+	uint8_t origin_type;
+	uint8_t origin_l;
+	uint8_t mcu_h;
+
 	id.ID = msg_id & 0x0FFFFFFFu;
-	return (((uint32_t)(id.field.d_type & 0x7Fu)) << 14) |
-	       (((uint32_t)(id.field.h_adr & 0xFFu)) << 6) |
-	       ((uint32_t)(id.field.l_adr & 0x3Fu));
+	mcu_h = (uint8_t)(id.field.h_adr & 0xFFu);
+	if (msg_data != 0 &&
+	    msg_data[0] == (uint8_t)ServiceCmd_Fire_SetStatusFire) {
+		origin_type = (uint8_t)(msg_data[1] & 0x7Fu);
+		origin_l = (uint8_t)(msg_data[2] & 0x3Fu);
+	} else {
+		origin_type = (uint8_t)(id.field.d_type & 0x7Fu);
+		origin_l = (uint8_t)(id.field.l_adr & 0x3Fu);
+	}
+	return (((uint32_t)origin_type) << 14) |
+	       (((uint32_t)mcu_h) << 6) |
+	       ((uint32_t)origin_l);
 }
 
 static uint8_t Fire_AddSourceToSlot(FireZoneSlot *slot, uint32_t source_key)
@@ -2218,7 +2239,7 @@ static uint8_t Fire_UiModeRank(uint8_t mode)
 	case 2u: return 60u; /* ТУШЕНИЕ */
 	case 5u: return 50u; /* ПАУЗА */
 	case 4u: return 40u; /* ПОЖАР/ОСТ. */
-	case 8u: return 30u; /* ПУСК ЗАБЛ. */
+	case 8u: return 30u; /* ПУСК БЛОК */
 	case 6u: return 20u; /* ПОЖАР1 */
 	case 1u: return 10u; /* ДО ПУСКА */
 	default: return 0u;
@@ -2952,7 +2973,7 @@ void Fire_OnStatusFire(uint32_t msg_id, const uint8_t *msg_data)
 	/* zone в формате CAN (обычно 1..N), без декремента:
 	 * именно это значение нужно для адресации МКУ этой зоны. */
 	uint8_t zone = (uint8_t)(id.field.zone & 0x7Fu);
-	uint32_t source_key = Fire_SourceKeyFromMsgId(msg_id);
+	uint32_t source_key = Fire_SourceKeyFromFireMsg(msg_id, msg_data);
 	uint32_t now = HAL_GetTick();
 
 	/* Mode 4: лог + ACK МКУ, без слота/звука/сценария. */
@@ -3203,7 +3224,8 @@ void Fire_OnPanelFireReset(uint8_t zone)
 
 void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms)
 {
-	/* ZONES TLV: zone/status/remaining. Имена — отдельный ZONE_NAMES каталог. */
+	/* ZONES TLV: zone/status/remaining + источник (mcu_h_adr/ch_type/ch_l_adr).
+	 * Имена зон — каталог ZONE_NAMES; суффикс «МКУ N ДПТk» собирает панель. */
 	uint8_t zm[FIRE_UI_MAX_ZONES];
 	uint8_t zr[FIRE_UI_MAX_ZONES];
 	uint8_t zones[FIRE_UI_MAX_ZONES];
@@ -3226,10 +3248,25 @@ void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms)
 		nz = RS_PANEL_V3_MAX_ZONES;
 	}
 	for (i = 0u; i < nz; i++) {
+		int8_t si;
 		Fire_UiStatusForZone(zones[i], now_ms, &zm[i], &zr[i]);
 		out->items[i].zone = zones[i];
 		out->items[i].status = zm[i];
 		out->items[i].remaining_s = zr[i];
+		out->items[i].mcu_h_adr = 0u;
+		out->items[i].ch_type = 0u;
+		out->items[i].ch_l_adr = 0u;
+		/* Первый источник слота → суффикс бегущей на панели (как неисправности). */
+		si = Fire_FindSlotZoneExact(zones[i]);
+		if (si >= 0) {
+			const FireZoneSlot *s = &g_fire.slots[(uint8_t)si];
+			if (s->source_count > 0u) {
+				const uint32_t key = s->source_keys[0];
+				out->items[i].ch_type = (uint8_t)((key >> 14) & 0x7Fu);
+				out->items[i].mcu_h_adr = (uint8_t)((key >> 6) & 0xFFu);
+				out->items[i].ch_l_adr = (uint8_t)(key & 0x3Fu);
+			}
+		}
 	}
 	out->count = nz;
 }

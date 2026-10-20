@@ -2365,7 +2365,7 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
         if (Fire_IsActive() != 0u) {
             return 0u; /* во время пожара режим зон не меняется */
         }
-        /* mode: 0 авто / 2 ручной / 3 пуск выкл / 4 пожар выкл */
+        /* mode: 0 авто / 2 ручной / 3 пуск блок / 4 пожар выкл */
         if (zone >= 1u && zone <= ZONE_NUMBER &&
             (mode == 0u || mode == 2u || mode == 3u || mode == 4u)) {
             PPKY_ZoneFireModeSet((uint8_t)(zone - 1u), mode);

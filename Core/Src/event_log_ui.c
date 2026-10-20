@@ -540,7 +540,7 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 		case 0u: mode_s = "АВТО"; break;
 		case 1u: mode_s = "АВТОНОМ"; break;
 		case 2u: mode_s = "РУЧНОЙ"; break;
-		case 3u: mode_s = "ПУСК ВЫКЛ"; break;
+		case 3u: mode_s = "ПУСК БЛОК"; break;
 		case 4u: mode_s = "ПОЖАР ВЫКЛ"; break;
 		default: break;
 		}
