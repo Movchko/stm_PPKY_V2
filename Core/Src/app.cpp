@@ -291,12 +291,10 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters) {
 		}
 	}break;
 	case 13: {
-		/* Установка режима пуска:
-		 * Parameters[0] = 0 (auto), 1 (автономный), 2 (manual). */
-		if (Parameters != nullptr) {
-			if (Parameters[0] <= 2u) {
-				PPKYConfig.fire_mode = Parameters[0];
-			}
+		/* CAN/концевик: режим пуска для всех именованных зон.
+		 * Parameters[0] = 0 auto / 1 автономный / 2 manual (зоны из списка — позже). */
+		if (Parameters != nullptr && Parameters[0] <= 2u) {
+			PPKY_ZoneFireModeSetAllNamed(Parameters[0]);
 		}
 	}break;
 	case 14: {
@@ -946,12 +944,16 @@ void AppInit() {
 
 		ReadSavedConfig();
 		PPKYConfig = SavedPPKYConfig;
+		/* Legacy beep 0/1 → маска: 1 → 0xFF (все панели). */
+		if (PPKYConfig.beep == 1u) {
+			PPKYConfig.beep = 0xFFu;
+		}
 		/* Миграция: если zone_fire_mode[] ещё все «авто» (0), взять дефолт из fire_mode. */
 		{
 			uint8_t any_non_auto = 0u;
 			for (uint16_t zi = 0; zi < ZONE_NUMBER; zi++) {
 				uint8_t m = PPKYConfig.zone_fire_mode[zi];
-				if (m > 3u) {
+				if (m > 4u) {
 					PPKYConfig.zone_fire_mode[zi] = 0u;
 					m = 0u;
 				}
@@ -1051,43 +1053,84 @@ void AppProcess(uint32_t now_ms) {
 uint32_t counter1s = 0;
 
 
-/* Гистерезис порогов входа питания: ширина зоны возврата (~2% номинала, не меньше 300 мВ).
+/* Гистерезис порогов входа питания: зона возврата (не меньше 300 мВ).
  * Без него на границе enter-порога ADC даёт частые set/clear → спам EventLog. */
-static constexpr uint32_t PPKU_POWER_HYST_PCT = 2u;
-static constexpr uint32_t PPKU_POWER_HYST_MIN_MV = 300u;
-static uint8_t s_ppku_input_fault_latched = 0u;
+static constexpr uint32_t PPKU_POWER_HYST_MV = 300u;
+/* ОБРЫВ — всегда «около нуля», независимо от номинала 12/24 В. */
+static constexpr uint32_t PPKU_POWER_OPEN_ENTER_MV = 3300u;
+/* Latched kind на канал: PPKU_INPUT_FAULT_* (0 = норма). */
+static uint8_t s_ppku_input_fault_kind[2] = {0u, 0u};
 
-static uint8_t App_PpkuInputFaultHyst(uint32_t mv_mV, uint8_t prev_fault,
-				      uint32_t low_enter_mv, uint32_t high_enter_mv,
-				      uint32_t low_exit_mv, uint32_t high_exit_mv)
+/* Классификация входа: ОБРЫВ / НИЖЕ / ВЫШЕ с гистерезисом по предыдущему kind. */
+static uint8_t App_PpkuInputFaultClassify(uint32_t mv_mV, uint8_t prev_kind,
+					  uint32_t open_enter_mv, uint32_t open_exit_mv,
+					  uint32_t low_enter_mv, uint32_t high_enter_mv,
+					  uint32_t low_exit_mv, uint32_t high_exit_mv)
 {
-	if (prev_fault != 0u) {
-		/* Сброс только когда напряжение уверенно внутри рабочей полосы. */
-		return (mv_mV >= low_exit_mv && mv_mV <= high_exit_mv) ? 0u : 1u;
+	if (prev_kind == PPKU_INPUT_FAULT_HIGH) {
+		if (mv_mV > high_exit_mv) {
+			return PPKU_INPUT_FAULT_HIGH;
+		}
+		prev_kind = PPKU_INPUT_FAULT_OK;
+	} else if (prev_kind == PPKU_INPUT_FAULT_OPEN) {
+		if (mv_mV < open_exit_mv) {
+			return PPKU_INPUT_FAULT_OPEN;
+		}
+		prev_kind = PPKU_INPUT_FAULT_OK;
+	} else if (prev_kind == PPKU_INPUT_FAULT_LOW) {
+		if (mv_mV >= low_exit_mv && mv_mV <= high_exit_mv) {
+			return PPKU_INPUT_FAULT_OK;
+		}
+		if (mv_mV > high_enter_mv) {
+			return PPKU_INPUT_FAULT_HIGH;
+		}
+		if (mv_mV < open_enter_mv) {
+			return PPKU_INPUT_FAULT_OPEN;
+		}
+		return PPKU_INPUT_FAULT_LOW;
 	}
-	/* Установка при выходе за enter-пороги. */
-	return (mv_mV < low_enter_mv || mv_mV > high_enter_mv) ? 1u : 0u;
+
+	/* Норма или выход из latched HIGH/OPEN — решаем по enter-порогам. */
+	if (mv_mV > high_enter_mv) {
+		return PPKU_INPUT_FAULT_HIGH;
+	}
+	if (mv_mV < open_enter_mv) {
+		return PPKU_INPUT_FAULT_OPEN;
+	}
+	if (mv_mV < low_enter_mv) {
+		return PPKU_INPUT_FAULT_LOW;
+	}
+	return PPKU_INPUT_FAULT_OK;
 }
 
 static void App_UpdatePowerFaultIndication(uint32_t now_ms)
 {
-	uint8_t power_fault_mask = 0u;       /* Ошибки выходов power-модуля (внешнее питание МКУ). */
-	uint8_t ppku_input_fault_mask = 0u;  /* Ошибки входов питания ППКУ. */
+	uint8_t power_fault_mask = 0u; /* Ошибки выходов power-модуля (внешнее питание МКУ). */
 	(void)now_ms;
 
-	/* Для "пропадания питания" используем порог присутствия 15%/10% от номинала + гистерезис. */
-	uint32_t nominal_mv = ((PPKYConfig.power_value != 0u) ? (uint32_t)PPKYConfig.power_value : 24u) * 1000u;
-	uint32_t lov_present_threshold_mv = (nominal_mv * 15u) / 100u;
-	uint32_t high_present_threshold_mv = nominal_mv / 10u;
-	uint32_t hyst_mv = (nominal_mv * PPKU_POWER_HYST_PCT) / 100u;
-	if (hyst_mv < PPKU_POWER_HYST_MIN_MV) {
-		hyst_mv = PPKU_POWER_HYST_MIN_MV;
+	/* Абсолютные пороги по номиналу конфига:
+	 *  12 В → норма 10…16 В;  24 В → норма 20…32 В.
+	 * ОБРЫВ: < 3.3 В; НИЖЕ: ниже нижней границы нормы; ВЫШЕ: выше верхней. */
+	uint32_t nominal_v = (PPKYConfig.power_value != 0u) ? (uint32_t)PPKYConfig.power_value : 24u;
+	uint32_t nominal_mv = nominal_v * 1000u;
+	uint32_t low_enter_mv;
+	uint32_t high_enter_mv;
+	if (nominal_v == 12u) {
+		low_enter_mv = 10000u;
+		high_enter_mv = 16000u;
+	} else {
+		/* 24 В и любой иной номинал — полоса 20…32 В. */
+		low_enter_mv = 20000u;
+		high_enter_mv = 32000u;
 	}
-	uint32_t low_enter_mv = (nominal_mv > lov_present_threshold_mv) ?
-				(nominal_mv - lov_present_threshold_mv) : 0u;
-	uint32_t high_enter_mv = nominal_mv + high_present_threshold_mv;
+	const uint32_t open_enter_mv = PPKU_POWER_OPEN_ENTER_MV;
+	const uint32_t hyst_mv = PPKU_POWER_HYST_MV;
+	uint32_t open_exit_mv = open_enter_mv + hyst_mv;
 	uint32_t low_exit_mv = low_enter_mv + hyst_mv;
 	uint32_t high_exit_mv = (high_enter_mv > hyst_mv) ? (high_enter_mv - hyst_mv) : high_enter_mv;
+	if (open_exit_mv > low_enter_mv) {
+		open_exit_mv = low_enter_mv;
+	}
 	if (low_exit_mv > high_exit_mv) {
 		low_exit_mv = high_exit_mv;
 	}
@@ -1096,20 +1139,19 @@ static void App_UpdatePowerFaultIndication(uint32_t now_ms)
 	uint32_t reserve_mv = (CHANNEL_VAL[0] > 0) ? (uint32_t)CHANNEL_VAL[0] : 0u; /* Резервный ввод */
 	uint8_t reserve_required = (PPKYConfig.power_input == 2u) ? 1u : 0u; /* 2 = используем оба ввода */
 
-	if (App_PpkuInputFaultHyst(main_mv, (uint8_t)(s_ppku_input_fault_latched & 0x01u),
-				   low_enter_mv, high_enter_mv, low_exit_mv, high_exit_mv) != 0u) {
-		ppku_input_fault_mask |= 0x01u; /* ПИТАНИЕ 1 */
-	}
+	uint8_t kind1 = App_PpkuInputFaultClassify(main_mv, s_ppku_input_fault_kind[0],
+						   open_enter_mv, open_exit_mv,
+						   low_enter_mv, high_enter_mv,
+						   low_exit_mv, high_exit_mv);
+	uint8_t kind2 = PPKU_INPUT_FAULT_OK;
 	if (reserve_required) {
-		if (App_PpkuInputFaultHyst(reserve_mv, (uint8_t)((s_ppku_input_fault_latched >> 1) & 0x01u),
-					   low_enter_mv, high_enter_mv, low_exit_mv, high_exit_mv) != 0u) {
-			ppku_input_fault_mask |= 0x02u; /* ПИТАНИЕ 2 */
-		}
-	} else {
-		/* Резерв не используется — не удерживаем старую ошибку канала 2. */
-		ppku_input_fault_mask &= (uint8_t)~0x02u;
+		kind2 = App_PpkuInputFaultClassify(reserve_mv, s_ppku_input_fault_kind[1],
+						  open_enter_mv, open_exit_mv,
+						  low_enter_mv, high_enter_mv,
+						  low_exit_mv, high_exit_mv);
 	}
-	s_ppku_input_fault_latched = ppku_input_fault_mask;
+	s_ppku_input_fault_kind[0] = kind1;
+	s_ppku_input_fault_kind[1] = kind2;
 
 	for (uint8_t i = 0u; i < POWER_NUM_CHANNELS; i++) {
 		if (Power[i] != nullptr && Power[i]->IsError()) {
@@ -1117,7 +1159,12 @@ static void App_UpdatePowerFaultIndication(uint32_t now_ms)
 		}
 	}
 	Warning_SetPowerFaultMask(power_fault_mask);
-	Warning_SetPpkuInputFaultMask(ppku_input_fault_mask);
+	{
+		uint16_t mv1 = (main_mv > 65535u) ? 65535u : (uint16_t)main_mv;
+		uint16_t mv2 = (reserve_mv > 65535u) ? 65535u : (uint16_t)reserve_mv;
+		uint16_t req = (nominal_mv > 65535u) ? 65535u : (uint16_t)nominal_mv;
+		Warning_SetPpkuInputFaultKinds(kind1, kind2, mv1, mv2, req);
+	}
 
 	/* Индикация POWER/NORM/ERR — на панели из SYS; локальных LED на ППКУ нет. */
 	(void)power_fault_mask;

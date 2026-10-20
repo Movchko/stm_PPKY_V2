@@ -779,8 +779,11 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
     if (Warning_GetPpkuInputFaultMask() != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_POWER_INPUT_FAULT;
     }
-    if (PPKYConfig.beep != 0u) {
-        out->sys.flags |= RS_PANEL_V3_SYS_SOUND_ON;
+    {
+        const uint8_t addr = RsPanelMaster_GetPanelAddr(panel_idx);
+        if (Beeper_IsPanelSoundOn(addr) != 0u) {
+            out->sys.flags |= RS_PANEL_V3_SYS_SOUND_ON;
+        }
     }
     if (PPKYConfig.beep_block != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
@@ -932,9 +935,11 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
 }
 
 /* Минимальный POLL без RsPanelV3Poll на стеке повторно — только SYS flags. */
-uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size)
+uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size,
+                                           uint8_t panel_idx)
 {
     uint16_t flags = 0u;
+    uint8_t sound_on;
     if (dst == 0 || dst_size < 5u) {
         return 0u;
     }
@@ -950,7 +955,12 @@ uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size)
     if (Warning_GetPpkuInputFaultMask() != 0u) {
         flags |= RS_PANEL_V3_SYS_POWER_INPUT_FAULT;
     }
-    if (PPKYConfig.beep != 0u) {
+    if (panel_idx < RS_PANEL_MAX_PANELS) {
+        sound_on = Beeper_IsPanelSoundOn(RsPanelMaster_GetPanelAddr(panel_idx));
+    } else {
+        sound_on = Beeper_IsSoundEnabled();
+    }
+    if (sound_on != 0u) {
         flags |= RS_PANEL_V3_SYS_SOUND_ON;
     }
     if (PPKYConfig.beep_block != 0u) {
@@ -1109,7 +1119,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
             ctx->pending_reply = poll.event_reply;
             rs_v3_latch_pending_reply(ctx, now_ms);
         }
-        return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
+        return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size, panel_idx);
     }
 
     has_stream_tlv = (poll.has_zone_names != 0u || poll.has_devices != 0u ||
@@ -1189,7 +1199,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         } else {
             *ctx = saved_ctx;
         }
-        return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
+        return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size, panel_idx);
     }
 
     /* 3) Срезать TIME, оставить стрим (FAULT/каталог resync). */
@@ -1229,7 +1239,7 @@ uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
         }
         *ctx = saved_ctx;
     }
-    return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size);
+    return RsPanelV3Master_EncodeSysOnlyPoll(dst, dst_size, panel_idx);
 }
 
 /* IRQ: только очередь / повтор ACK. Fire_Transition и journal SPI — в ProcessDeferred. */
@@ -1413,11 +1423,11 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev,
             result = (uint8_t)RS_PANEL_V3_ACK_DENIED;
         } else {
             const uint8_t on = (ev->u8_a != 0u) ? 1u : 0u;
-            if (PPKYConfig.beep != on) {
-                PPKYConfig.beep = on;
-                Beeper_SoundOnOff(on != 0u);
+            const uint8_t addr = RsPanelMaster_GetPanelAddr(panel_idx);
+            const uint8_t prev = Beeper_IsPanelSoundOn(addr);
+            if (prev != on) {
+                Beeper_SetPanelSound(addr, on);
                 EventLog_LogSoundToggle(on, 0u); /* source: panel */
-                /* Legacy CMD_SOUND + MENU_TOGGLE; в v3 панели берут SYS flags. */
             }
         }
         break;

@@ -16,6 +16,7 @@
 #include "rs_panel_master_debug.h"
 #include "rs_panel_proto.h"
 #include "rs_panel_v3_master.h"
+#include "warning.h"
 
 #define WARN_TITLE_LEN 24
 
@@ -31,10 +32,15 @@ static uint8_t g_power_fault_mask = 0u;
 static uint8_t g_ppku_input_fault_mask = 0u;
 static uint8_t g_raw_power_fault_mask = 0u;
 static uint8_t g_raw_ppku_input_fault_mask = 0u;
+static uint8_t g_ppku_input_fault_kind[2] = {0u, 0u};
+static uint8_t g_raw_ppku_input_fault_kind[2] = {0u, 0u};
+static uint16_t g_ppku_input_mv[2] = {0u, 0u};
+static uint16_t g_ppku_input_required_mv = 0u;
 static uint32_t g_power_confirm_since[4];
 static uint8_t g_power_confirm_pending[4];
 static uint8_t g_prev_power_fault_mask = 0u;
 static uint8_t g_prev_ppku_input_fault_mask = 0u;
+static uint8_t g_prev_ppku_input_fault_kind[2] = {0u, 0u};
 
 extern "C" uint8_t Warning_HasActiveFault(void);
 
@@ -337,7 +343,8 @@ static void EventLog_PostDeviceFaultItem(const WarningItem& it, uint8_t cleared)
 	(void)EventLog_Post(EVENT_LOG_DEVICE_FAULT, &payload);
 }
 
-static void EventLog_PostPowerFault(uint8_t channel, uint8_t is_ppku_input, uint8_t cleared)
+/* Выход питания МКУ — по-прежнему DEVICE_FAULT / FAULT_CLASS_POWER. */
+static void EventLog_PostPowerOutputFault(uint8_t channel, uint8_t cleared)
 {
 	EventLogPayload_t payload;
 
@@ -345,12 +352,46 @@ static void EventLog_PostPowerFault(uint8_t channel, uint8_t is_ppku_input, uint
 	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
 	payload.can_header = BuildFaultCanHeader(DEVICE_PPKY_TYPE,
 						 PPKYConfig.UId.devId.h_adr, 0u, 0u);
-	payload.can_data[0] = is_ppku_input ? 1u : 0u; /* 0=выход power, 1=вход ППКУ */
+	payload.can_data[0] = 0u; /* выход power */
 	payload.can_data[1] = channel;
 	payload.additional[0] = FAULT_CLASS_POWER;
 	payload.additional[1] = channel;
 	payload.additional[2] = cleared ? 1u : 0u;
 	(void)EventLog_Post(EVENT_LOG_DEVICE_FAULT, &payload);
+}
+
+static uint16_t EventLogCodeForPowerInputKind(uint8_t kind)
+{
+	if (kind == PPKU_INPUT_FAULT_LOW) {
+		return (uint16_t)EVENT_LOG_POWER_INPUT_LOW;
+	}
+	if (kind == PPKU_INPUT_FAULT_HIGH) {
+		return (uint16_t)EVENT_LOG_POWER_INPUT_HIGH;
+	}
+	return (uint16_t)EVENT_LOG_POWER_INPUT_OPEN;
+}
+
+/* Вход питания ППКУ — отдельные коды 28/29/30 + факт/номинал в мВ. */
+static void EventLog_PostPowerInputFault(uint8_t channel, uint8_t kind, uint8_t cleared)
+{
+	EventLogPayload_t payload;
+	uint16_t code = EventLogCodeForPowerInputKind(kind);
+	uint8_t idx = (channel >= 1u && channel <= 2u) ? (uint8_t)(channel - 1u) : 0u;
+	uint16_t cur_mv = g_ppku_input_mv[idx];
+	uint16_t req_mv = g_ppku_input_required_mv;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+	payload.can_header = BuildFaultCanHeader(DEVICE_PPKY_TYPE,
+						 PPKYConfig.UId.devId.h_adr, 0u, 0u);
+	payload.can_data[0] = (uint8_t)(cur_mv & 0xFFu);
+	payload.can_data[1] = (uint8_t)((cur_mv >> 8) & 0xFFu);
+	payload.can_data[2] = (uint8_t)(req_mv & 0xFFu);
+	payload.can_data[3] = (uint8_t)((req_mv >> 8) & 0xFFu);
+	payload.additional[0] = channel;           /* 1 или 2 */
+	payload.additional[1] = cleared ? 1u : 0u; /* 0=появилась, 1=снята */
+	payload.additional[2] = kind;              /* PPKU_INPUT_FAULT_* */
+	(void)EventLog_Post(code, &payload);
 }
 
 static void SyncPowerFaultEventLog(void)
@@ -362,21 +403,34 @@ static void SyncPowerFaultEventLog(void)
 
 	for (uint8_t ch = 0u; ch < 2u; ch++) {
 		if ((power_new & (1u << ch)) != 0u) {
-			EventLog_PostPowerFault((uint8_t)(ch + 1u), 0u, 0u);
+			EventLog_PostPowerOutputFault((uint8_t)(ch + 1u), 0u);
 		}
 		if ((input_new & (1u << ch)) != 0u) {
-			EventLog_PostPowerFault((uint8_t)(ch + 1u), 1u, 0u);
+			EventLog_PostPowerInputFault((uint8_t)(ch + 1u),
+						    g_ppku_input_fault_kind[ch], 0u);
 		}
 		if ((power_clr & (1u << ch)) != 0u) {
-			EventLog_PostPowerFault((uint8_t)(ch + 1u), 0u, 1u);
+			EventLog_PostPowerOutputFault((uint8_t)(ch + 1u), 1u);
 		}
 		if ((input_clr & (1u << ch)) != 0u) {
-			EventLog_PostPowerFault((uint8_t)(ch + 1u), 1u, 1u);
+			EventLog_PostPowerInputFault((uint8_t)(ch + 1u),
+						    g_prev_ppku_input_fault_kind[ch], 1u);
+		}
+		/* Смена типа при уже активной ошибке (например НИЖЕ → ОБРЫВ). */
+		if ((g_ppku_input_fault_mask & (1u << ch)) != 0u &&
+		    (g_prev_ppku_input_fault_mask & (1u << ch)) != 0u &&
+		    g_ppku_input_fault_kind[ch] != g_prev_ppku_input_fault_kind[ch]) {
+			EventLog_PostPowerInputFault((uint8_t)(ch + 1u),
+						    g_prev_ppku_input_fault_kind[ch], 1u);
+			EventLog_PostPowerInputFault((uint8_t)(ch + 1u),
+						    g_ppku_input_fault_kind[ch], 0u);
 		}
 	}
 
 	g_prev_power_fault_mask = g_power_fault_mask;
 	g_prev_ppku_input_fault_mask = g_ppku_input_fault_mask;
+	g_prev_ppku_input_fault_kind[0] = g_ppku_input_fault_kind[0];
+	g_prev_ppku_input_fault_kind[1] = g_ppku_input_fault_kind[1];
 }
 
 /* Поиск записи неисправности по ключу устройства/канала. */
@@ -613,6 +667,7 @@ static void UpdateDebouncedPowerFaults(uint32_t now_ms)
 
 	uint8_t out_power = 0u;
 	uint8_t out_input = 0u;
+	uint8_t out_kind[2] = {0u, 0u};
 
 	for (uint8_t ch = 0u; ch < 4u; ch++) {
 		uint8_t confirmed = (ch < 2u) ?
@@ -623,7 +678,10 @@ static void UpdateDebouncedPowerFaults(uint32_t now_ms)
 				if (ch < 2u) {
 					out_power |= (uint8_t)(1u << ch);
 				} else {
-					out_input |= (uint8_t)(1u << (ch - 2u));
+					uint8_t ich = (uint8_t)(ch - 2u);
+					out_input |= (uint8_t)(1u << ich);
+					/* Тип обновляем сразу — смена НИЖЕ↔ОБРЫВ без повторного debounce. */
+					out_kind[ich] = g_raw_ppku_input_fault_kind[ich];
 				}
 				g_power_confirm_pending[ch] = 0u;
 				continue;
@@ -635,7 +693,9 @@ static void UpdateDebouncedPowerFaults(uint32_t now_ms)
 				if (ch < 2u) {
 					out_power |= (uint8_t)(1u << ch);
 				} else {
-					out_input |= (uint8_t)(1u << (ch - 2u));
+					uint8_t ich = (uint8_t)(ch - 2u);
+					out_input |= (uint8_t)(1u << ich);
+					out_kind[ich] = g_raw_ppku_input_fault_kind[ich];
 				}
 			}
 		} else {
@@ -645,6 +705,8 @@ static void UpdateDebouncedPowerFaults(uint32_t now_ms)
 
 	g_power_fault_mask = out_power;
 	g_ppku_input_fault_mask = out_input;
+	g_ppku_input_fault_kind[0] = out_kind[0];
+	g_ppku_input_fault_kind[1] = out_kind[1];
 }
 
 static uint8_t IsItemStillFaulty(const WarningItem& it)
@@ -1083,7 +1145,14 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 		if ((g_ppku_input_fault_mask & (1u << ch)) == 0u) {
 			continue;
 		}
-		snprintf(big_titles[count], WARN_TITLE_LEN, "ПИТАНИЕ %u", (unsigned)(ch + 1u));
+		const char *kind_txt = "ОБРЫВ";
+		if (g_ppku_input_fault_kind[ch] == PPKU_INPUT_FAULT_LOW) {
+			kind_txt = "НИЖЕ";
+		} else if (g_ppku_input_fault_kind[ch] == PPKU_INPUT_FAULT_HIGH) {
+			kind_txt = "ВЫШЕ";
+		}
+		snprintf(big_titles[count], WARN_TITLE_LEN, "ПИТ%u. %s",
+			 (unsigned)(ch + 1u), kind_txt);
 		snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N:%08lX:%08lX:%08lX", PPKYConfig.UId.UId0, PPKYConfig.UId.UId1, PPKYConfig.UId.UId2);
 		count++;
 	}
@@ -1450,12 +1519,14 @@ static uint16_t BuildV3FaultSnapshotCore(RsPanelV3FaultEvtItem *out, uint16_t ma
 		}
 		memset(&out[count], 0, sizeof(out[count]));
 		out[count].code = (uint8_t)(RS_PANEL_V3_FAULT_PPKU_POWER_IN1 + ch);
-		out[count].flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		out[count].flags = (uint8_t)(RS_PANEL_V3_FAULT_FLAG_HAS_MCU |
+					     RS_PANEL_V3_FAULT_FLAG_HAS_EXTRA);
 		out[count].mcu.h_adr = PPKYConfig.UId.devId.h_adr;
 		out[count].mcu.l_adr = PPKYConfig.UId.devId.l_adr;
 		out[count].mcu.uid0 = PPKYConfig.UId.UId0;
 		out[count].mcu.uid1 = PPKYConfig.UId.UId1;
 		out[count].mcu.uid2 = PPKYConfig.UId.UId2;
+		out[count].extra = (int16_t)g_ppku_input_fault_kind[ch];
 		count++;
 	}
 
@@ -1531,14 +1602,31 @@ extern "C" void Warning_SetPowerFaultMask(uint8_t mask)
 	g_raw_power_fault_mask = (uint8_t)(mask & 0x03u);
 }
 
-extern "C" void Warning_SetPpkuInputFaultMask(uint8_t mask)
+extern "C" void Warning_SetPpkuInputFaultKinds(uint8_t kind_ch1, uint8_t kind_ch2,
+					       uint16_t mv_ch1, uint16_t mv_ch2,
+					       uint16_t required_mv)
 {
-	g_raw_ppku_input_fault_mask = (uint8_t)(mask & 0x03u);
+	g_raw_ppku_input_fault_kind[0] = (uint8_t)(kind_ch1 & 0x03u);
+	g_raw_ppku_input_fault_kind[1] = (uint8_t)(kind_ch2 & 0x03u);
+	g_raw_ppku_input_fault_mask =
+		(uint8_t)(((g_raw_ppku_input_fault_kind[0] != 0u) ? 0x01u : 0u) |
+			  ((g_raw_ppku_input_fault_kind[1] != 0u) ? 0x02u : 0u));
+	g_ppku_input_mv[0] = mv_ch1;
+	g_ppku_input_mv[1] = mv_ch2;
+	g_ppku_input_required_mv = required_mv;
 }
 
 extern "C" uint8_t Warning_GetPpkuInputFaultMask(void)
 {
 	return g_ppku_input_fault_mask;
+}
+
+extern "C" uint8_t Warning_GetPpkuInputFaultKind(uint8_t ch)
+{
+	if (ch > 1u) {
+		return PPKU_INPUT_FAULT_OK;
+	}
+	return g_ppku_input_fault_kind[ch];
 }
 
 extern "C" void Warning_SetMkuPositionFaultMask(uint32_t mask)

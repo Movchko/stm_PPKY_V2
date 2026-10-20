@@ -149,7 +149,7 @@ void FillConfigTemplate(void) {
 	PPKYConfig.UId.devId.d_type = DEVICE_PPKY_TYPE;
 
 	// Примеры значений по умолчанию
-	PPKYConfig.beep = 1; // звук включен
+	PPKYConfig.beep = 0xFF; // маска: все адреса 0..7 — звук вкл.
 
 	/* Обнуляем карту МКУ и зоны */
 	memset(&PPKYConfig.CfgDevices, 0, sizeof(PPKYConfig.CfgDevices));
@@ -237,13 +237,13 @@ void DefaultConfig() {
 	PPKYConfig.UId.devId.d_type = DEVICE_PPKY_TYPE;
 
 	// Примеры значений по умолчанию
-	PPKYConfig.beep = 1; // звук включен
-	PPKYConfig.fire_mode = 0u;
+	PPKYConfig.beep = 0xFF; // маска: все адреса 0..7 — звук вкл.
+	PPKYConfig.fire_mode = 0u; /* legacy, не используется в runtime */
 
-	// Имена зон очищаем (пустые строки); zone_fire_mode = глобальный fire_mode
+	// Имена зон очищаем; режим — только zone_fire_mode[] (по умолчанию авто).
 	for (uint16_t i = 0; i < ZONE_NUMBER; i++) {
 		memset(PPKYConfig.zone_name[i], 0, ZONE_NAME_SIZE);
-		PPKYConfig.zone_fire_mode[i] = PPKYConfig.fire_mode;
+		PPKYConfig.zone_fire_mode[i] = 0u;
 	}
 
 	// reserv оставляем нулевым

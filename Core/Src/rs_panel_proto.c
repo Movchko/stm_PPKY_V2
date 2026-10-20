@@ -1015,7 +1015,8 @@ static uint8_t rs_panel_master_addr_scan_tick(RsPanelMaster *master, uint32_t no
         }
 
         {
-            uint16_t plen = RsPanelV3Master_EncodeSysOnlyPoll(payload, sizeof(payload));
+            uint16_t plen = RsPanelV3Master_EncodeSysOnlyPoll(payload, sizeof(payload),
+                                                             0xFFu);
             if (plen == 0u) {
                 continue;
             }
@@ -1556,6 +1557,14 @@ uint8_t RsPanelMaster_IsSmallPanel(void)
         }
     }
     return 0u;
+}
+
+uint8_t RsPanelMaster_GetPanelAddr(uint8_t panel_idx)
+{
+    if (g_active_master == 0 || panel_idx >= g_active_master->panel_count) {
+        return 0xFFu;
+    }
+    return g_active_master->panels[panel_idx].cfg.addr;
 }
 
 void RsPanelMaster_SetCanMirrorEnable(uint8_t enable)
@@ -2352,10 +2361,16 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
     }
     case RS_PANEL_V3_EVT_ZONE_BLOCK_SET: {
         uint8_t zone = ev->zone;
-        if (zone >= 1u && zone <= ZONE_NUMBER) {
-            PPKY_ZoneFireModeSet((uint8_t)(zone - 1u), (ev->u8_a != 0u) ? 1u : 0u);
+        uint8_t mode = ev->u8_a;
+        if (Fire_IsActive() != 0u) {
+            return 0u; /* во время пожара режим зон не меняется */
+        }
+        /* mode: 0 авто / 2 ручной / 3 пуск выкл / 4 пожар выкл */
+        if (zone >= 1u && zone <= ZONE_NUMBER &&
+            (mode == 0u || mode == 2u || mode == 3u || mode == 4u)) {
+            PPKY_ZoneFireModeSet((uint8_t)(zone - 1u), mode);
             reply->payload[0] = zone;
-            reply->payload[1] = (ev->u8_a != 0u) ? 1u : 0u;
+            reply->payload[1] = mode;
             reply->payload_len = 2u;
             return 1u;
         }

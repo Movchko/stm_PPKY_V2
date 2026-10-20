@@ -311,11 +311,17 @@ void EventLog_LogSoundToggle(uint8_t enabled, uint8_t source)
 	(void)EventLog_Post(EVENT_LOG_SOUND_TOGGLE, &payload);
 }
 
-void EventLog_LogFireModeChange(uint8_t mode, uint8_t source)
+void EventLog_LogFireModeChange(uint8_t zone, uint8_t mode, uint8_t source)
 {
 	EventLogPayload_t payload;
-	if (!g_initialized) return;
-	memset(&payload, 0, sizeof(payload)); payload.master_wagon_num = PPKYConfig.UId.devId.h_adr; payload.additional[0] = mode; payload.additional[1] = source;
+	if (!g_initialized) {
+		return;
+	}
+	memset(&payload, 0, sizeof(payload));
+	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+	payload.additional[0] = zone & 0x7Fu;
+	payload.additional[1] = mode;
+	payload.additional[2] = source;
 	(void)EventLog_Post(EVENT_LOG_FIRE_MODE_CHANGE, &payload);
 }
 

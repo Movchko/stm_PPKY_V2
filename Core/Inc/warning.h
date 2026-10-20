@@ -12,10 +12,20 @@ extern "C" {
 void WarningProcess1ms(void);
 /* Ошибки выходов модуля power: bits0..1 => ВЫХОД1/2 (МКУ), bit2 => панель */
 void Warning_SetPowerFaultMask(uint8_t mask);
-/* Ошибки входов питания ППКУ: bits0..1 => ПИТАНИЕ1/2 */
-void Warning_SetPpkuInputFaultMask(uint8_t mask);
+/* Тип неисправности входа питания ППКУ (для ПИТ1/ПИТ2). */
+#define PPKU_INPUT_FAULT_OK    0u /* норма */
+#define PPKU_INPUT_FAULT_OPEN  1u /* ОБРЫВ — питания нет */
+#define PPKU_INPUT_FAULT_LOW   2u /* НИЖЕ нормы */
+#define PPKU_INPUT_FAULT_HIGH  3u /* ВЫШЕ нормы */
+/* kinds: ch1/ch2 = PPKU_INPUT_FAULT_*; 0 = норма (бита маски нет).
+ * mv_ch* / required_mv — мВ для записи в журнал (факт / номинал). */
+void Warning_SetPpkuInputFaultKinds(uint8_t kind_ch1, uint8_t kind_ch2,
+				    uint16_t mv_ch1, uint16_t mv_ch2,
+				    uint16_t required_mv);
 /* Текущая (после debounce) маска входов питания — для SYS POLL v3 / LED_POWER. */
 uint8_t Warning_GetPpkuInputFaultMask(void);
+/* Текущий тип неисправности входа (ch 0..1), 0 если нет ошибки. */
+uint8_t Warning_GetPpkuInputFaultKind(uint8_t ch);
 /* Ошибки несоответствия физической позиции МКУ (бит h_adr-1 => МКУ с адресом h_adr). */
 void Warning_SetMkuPositionFaultMask(uint32_t mask);
 /* Ошибка доставки журнала на панели (бит panel_addr-1 => панель addr 1..8). */

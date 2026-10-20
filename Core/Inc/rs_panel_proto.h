@@ -66,6 +66,8 @@ void RsPanelMaster_SetCanMirrorEnable(uint8_t enable);
 uint8_t RsPanelMaster_IsCanMirrorEnabled(void);
 /* Поставить полный BSU CAN-кадр (22 байта) в очередь на RS (если mirror ON). */
 void RsPanelMaster_PushCanMirrorBsu(const uint8_t *bsu_pkt, uint16_t len);
+/* RS-адрес панели по slot (panel_idx), 0xFF если нет. */
+uint8_t RsPanelMaster_GetPanelAddr(uint8_t panel_idx);
 
 #ifdef __cplusplus
 }

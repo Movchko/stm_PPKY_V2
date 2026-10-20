@@ -46,6 +46,9 @@ typedef enum {
 	EVENT_LOG_COUNTDOWN_RESUME       = 25,
 	EVENT_LOG_CONFIG_SAVED           = 26,
 	EVENT_LOG_ZONE_NAME              = 27,
+	EVENT_LOG_POWER_INPUT_OPEN       = 28, /* ПИТn. ОБРЫВ — питания нет */
+	EVENT_LOG_POWER_INPUT_LOW        = 29, /* ПИТn. НИЖЕ нормы */
+	EVENT_LOG_POWER_INPUT_HIGH       = 30, /* ПИТn. ВЫШЕ нормы */
 } EventLogCode_t;
 
 typedef struct {

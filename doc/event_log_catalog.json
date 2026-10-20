@@ -1,6 +1,6 @@
 {
-  "schema_version": "1.0",
-  "updated": "2026-10-16",
+  "schema_version": "1.1",
+  "updated": "2026-10-20",
   "source_firmware": {
     "catalog_header": "stm_PPKY_V2/Core/Inc/event_log_catalog.h",
     "catalog_table": "stm_PPKY_V2/Core/Src/event_log_catalog.c",
@@ -411,7 +411,7 @@
       "level": "critical",
       "debug_only": false,
       "status": "implemented",
-      "description": "Фронт неисправности из warning: обрыв/КЗ/Fault линии vdev, CAN МКУ/ППКУ, позиция МКУ, питание. additional[0]=fault_class, [1]=channel или h_adr (для position), [2]=fault_phase (0=появилась, 1=устранена).",
+      "description": "Фронт неисправности из warning: обрыв/КЗ/Fault линии vdev, CAN МКУ/ППКУ, позиция МКУ, выход питания (ВЫХОД1/2). Входы питания ППКУ — коды 28..30. additional[0]=fault_class, [1]=channel или h_adr (для position), [2]=fault_phase (0=появилась, 1=устранена).",
       "uses": {
         "can_header": "required",
         "can_data": "required",
@@ -424,7 +424,7 @@
         },
         "can_data": {
           "required": true,
-          "description": "Для vdev/CAN — статусное сообщение; для position — can_data[0]=h_adr МКУ; для power — [0]=input/output, [1]=channel"
+          "description": "Для vdev/CAN — статусное сообщение; для position — can_data[0]=h_adr МКУ; для power output — [0]=0, [1]=channel"
         },
         "additional": [
           {
@@ -439,7 +439,8 @@
               "4": "power_fault",
               "5": "other",
               "6": "position"
-            }
+            },
+            "note": "fault_class=4 (power_fault) — только выходы ВЫХОД1/2; входы питания — EVENT_LOG_POWER_INPUT_*"
           },
           {
             "offset": 1,
@@ -888,11 +889,11 @@
     {
       "code": 19,
       "symbol": "EVENT_LOG_FIRE_MODE_CHANGE",
-      "name": "Смена режима работы",
+      "name": "Смена режима зоны",
       "level": "critical",
       "debug_only": false,
-      "status": "not_posted",
-      "description": "EventLog_LogFireModeChange записывает additional[0]=режим и additional[1]=источник. Вызовов функции в прошивке нет.",
+      "status": "implemented",
+      "description": "Смена zone_fire_mode[]. EventLog_LogFireModeChange(zone, mode, source).",
       "uses": {
         "can_header": "unused",
         "can_data": "unused",
@@ -902,22 +903,32 @@
         "additional": [
           {
             "offset": 0,
-            "name": "fire_mode",
+            "name": "zone",
+            "type": "uint8",
+            "required": true,
+            "description": "Номер зоны 1-based"
+          },
+          {
+            "offset": 1,
+            "name": "zone_fire_mode",
             "type": "uint8",
             "required": true,
             "enum": {
               "0": "auto",
               "1": "autonomous",
-              "2": "manual"
+              "2": "manual",
+              "3": "launch_blocked",
+              "4": "fire_blocked"
             },
-            "description": "Установленный режим (ППКУ: 0 автоматический, 1 автономный, 2 ручной)"
+            "description": "0 авто, 1 автономный, 2 ручной, 3 пуск выкл, 4 пожар выкл"
           },
           {
-            "offset": 1,
+            "offset": 2,
             "name": "source",
             "type": "uint8",
             "enum": {
-              "0": "menu"
+              "0": "menu",
+              "1": "can_cmd13"
             }
           }
         ]
@@ -1212,6 +1223,154 @@
         "Собрать имя: 8 байт can_data, затем 8 байт additional, затем добавить NUL при разборе.",
         "Пустые зоны (zone_name[i][0]==0) не пишутся."
       ]
+    },
+    {
+      "code": 28,
+      "symbol": "EVENT_LOG_POWER_INPUT_OPEN",
+      "name": "Питание входа: обрыв",
+      "level": "critical",
+      "debug_only": false,
+      "status": "implemented",
+      "description": "Вход питания ППКУ < 3.3 В (обрыв). Норма: 12В→10…16В, 24В→20…32В. UI: ПИТn. ОБРЫВ. Пишет warning.cpp на фронте/снятии и при смене типа неисправности.",
+      "uses": {
+        "can_header": "required",
+        "can_data": "required",
+        "additional": "required"
+      },
+      "payload": {
+        "can_header": {
+          "required": true,
+          "description": "ID ППКУ"
+        },
+        "can_data": {
+          "required": true,
+          "description": "can_data[0..1]=current_mv uint16 LE (факт); can_data[2..3]=required_mv uint16 LE (номинал PPKYConfig.power_value*1000)"
+        },
+        "additional": [
+          {
+            "offset": 0,
+            "name": "channel",
+            "type": "uint8",
+            "description": "Номер входа питания 1 или 2"
+          },
+          {
+            "offset": 1,
+            "name": "fault_phase",
+            "type": "uint8",
+            "enum": {
+              "0": "appeared",
+              "1": "cleared"
+            }
+          },
+          {
+            "offset": 2,
+            "name": "kind",
+            "type": "uint8",
+            "enum": {
+              "1": "OPEN",
+              "2": "LOW",
+              "3": "HIGH"
+            },
+            "description": "Дублирует тип события; для OPEN всегда 1"
+          }
+        ]
+      },
+      "parse_hints": [
+        "current_mv = can_data[0] | (can_data[1]<<8); required_mv = can_data[2] | (can_data[3]<<8).",
+        "Старые прошивки писали вход как DEVICE_FAULT class=4, can_data[0]=1."
+      ]
+    },
+    {
+      "code": 29,
+      "symbol": "EVENT_LOG_POWER_INPUT_LOW",
+      "name": "Питание входа: ниже нормы",
+      "level": "critical",
+      "debug_only": false,
+      "status": "implemented",
+      "description": "Вход питания ППКУ ниже полосы нормы (≥3.3В, но <10В при 12В / <20В при 24В). UI: ПИТn. НИЖЕ. Поля как у кода 28; additional[2]=2 (LOW).",
+      "uses": {
+        "can_header": "required",
+        "can_data": "required",
+        "additional": "required"
+      },
+      "payload": {
+        "can_header": {
+          "required": true,
+          "description": "ID ППКУ"
+        },
+        "can_data": {
+          "required": true,
+          "description": "can_data[0..1]=current_mv; can_data[2..3]=required_mv (мВ, LE)"
+        },
+        "additional": [
+          {
+            "offset": 0,
+            "name": "channel",
+            "type": "uint8"
+          },
+          {
+            "offset": 1,
+            "name": "fault_phase",
+            "type": "uint8",
+            "enum": {
+              "0": "appeared",
+              "1": "cleared"
+            }
+          },
+          {
+            "offset": 2,
+            "name": "kind",
+            "type": "uint8",
+            "description": "Всегда 2 (LOW)"
+          }
+        ]
+      }
+    },
+    {
+      "code": 30,
+      "symbol": "EVENT_LOG_POWER_INPUT_HIGH",
+      "name": "Питание входа: выше нормы",
+      "level": "critical",
+      "debug_only": false,
+      "status": "implemented",
+      "description": "Вход питания ППКУ выше полосы нормы (>16В при 12В / >32В при 24В). UI: ПИТn. ВЫШЕ. Поля как у кода 28; additional[2]=3 (HIGH).",
+      "uses": {
+        "can_header": "required",
+        "can_data": "required",
+        "additional": "required"
+      },
+      "payload": {
+        "can_header": {
+          "required": true,
+          "description": "ID ППКУ"
+        },
+        "can_data": {
+          "required": true,
+          "description": "can_data[0..1]=current_mv; can_data[2..3]=required_mv (мВ, LE)"
+        },
+        "additional": [
+          {
+            "offset": 0,
+            "name": "channel",
+            "type": "uint8"
+          },
+          {
+            "offset": 1,
+            "name": "fault_phase",
+            "type": "uint8",
+            "enum": {
+              "0": "appeared",
+              "1": "cleared"
+            }
+          },
+          {
+            "offset": 2,
+            "name": "kind",
+            "type": "uint8",
+            "description": "Всегда 3 (HIGH)"
+          }
+        ]
+      }
     }
   ]
 }

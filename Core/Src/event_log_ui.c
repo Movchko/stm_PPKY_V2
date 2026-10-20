@@ -229,8 +229,18 @@ static void FormatDeviceFaultTitle(const EventLogRecord_t *rec, char *title, siz
 	}
 
 	if (fc == ELUI_FC_POWER) {
+		/* Старые записи: вход ППКУ ещё шёл как DEVICE_FAULT class=power.
+		 * Новые входы — коды 28..30 (см. FormatPowerInputTitle). */
 		if (rec->can_data[0] != 0u) {
-			snprintf(title, title_sz, "ПИТАНИЕ %u", (unsigned)(ch != 0u ? ch : 1u));
+			uint8_t kind = rec->can_data[2];
+			const char *kind_txt = "ОБРЫВ";
+			if (kind == 2u) {
+				kind_txt = "НИЖЕ";
+			} else if (kind == 3u) {
+				kind_txt = "ВЫШЕ";
+			}
+			snprintf(title, title_sz, "ПИТ%u. %s",
+				 (unsigned)(ch != 0u ? ch : 1u), kind_txt);
 		} else {
 			snprintf(title, title_sz, "ВЫХОД %u", (unsigned)(ch != 0u ? ch : 1u));
 		}
@@ -298,6 +308,39 @@ static void FormatDeviceFaultDetail(const EventLogRecord_t *rec, char *detail, s
 	FormatPpkyDetail(detail, detail_sz);
 }
 
+static const char *PowerInputKindText(uint16_t event_code, uint8_t kind_byte)
+{
+	if (event_code == EVENT_LOG_POWER_INPUT_LOW || kind_byte == 2u) {
+		return "НИЖЕ";
+	}
+	if (event_code == EVENT_LOG_POWER_INPUT_HIGH || kind_byte == 3u) {
+		return "ВЫШЕ";
+	}
+	return "ОБРЫВ";
+}
+
+static void FormatPowerInputTitle(const EventLogRecord_t *rec, char *title, size_t title_sz)
+{
+	uint8_t ch = rec->additional[0];
+	if (ch == 0u) {
+		ch = 1u;
+	}
+	snprintf(title, title_sz, "ПИТ%u. %s",
+		 (unsigned)ch,
+		 PowerInputKindText(rec->event_code, rec->additional[2]));
+}
+
+static void FormatPowerInputDetail(const EventLogRecord_t *rec, char *detail, size_t detail_sz)
+{
+	uint16_t cur_mv = (uint16_t)rec->can_data[0] | ((uint16_t)rec->can_data[1] << 8);
+	uint16_t req_mv = (uint16_t)rec->can_data[2] | ((uint16_t)rec->can_data[3] << 8);
+	/* Целые вольты для краткости на панели; дробь — десятые. */
+	unsigned cur_v = (unsigned)(cur_mv / 1000u);
+	unsigned cur_t = (unsigned)((cur_mv / 100u) % 10u);
+	unsigned req_v = (unsigned)(req_mv / 1000u);
+	snprintf(detail, detail_sz, "факт %u.%uВ ном %uВ", cur_v, cur_t, req_v);
+}
+
 static void FormatTitle(const EventLogRecord_t *rec, char *title, size_t title_sz)
 {
 	const uint8_t *a = rec->additional;
@@ -305,6 +348,11 @@ static void FormatTitle(const EventLogRecord_t *rec, char *title, size_t title_s
 	switch (rec->event_code) {
 	case EVENT_LOG_DEVICE_FAULT:
 		FormatDeviceFaultTitle(rec, title, title_sz);
+		break;
+	case EVENT_LOG_POWER_INPUT_OPEN:
+	case EVENT_LOG_POWER_INPUT_LOW:
+	case EVENT_LOG_POWER_INPUT_HIGH:
+		FormatPowerInputTitle(rec, title, title_sz);
 		break;
 	case EVENT_LOG_FIRE_DETECTED:
 		snprintf(title, title_sz, "ПОЖАР");
@@ -358,7 +406,7 @@ static void FormatTitle(const EventLogRecord_t *rec, char *title, size_t title_s
 		snprintf(title, title_sz, "ЗВУК");
 		break;
 	case EVENT_LOG_FIRE_MODE_CHANGE:
-		snprintf(title, title_sz, "РЕЖИМ");
+		snprintf(title, title_sz, "РЕЖ.ЗОНЫ");
 		break;
 	case EVENT_LOG_FIRE_RESET:
 		snprintf(title, title_sz, "СБРОС");
@@ -398,16 +446,23 @@ static void FormatTitle(const EventLogRecord_t *rec, char *title, size_t title_s
 static void PrependPhasePrefix(const EventLogRecord_t *rec, char *title, size_t title_sz)
 {
 	char tmp[EVENT_LOG_UI_TITLE_LEN];
+	uint8_t cleared = 0u;
 
 	if (title_sz == 0u || title[0] == '\0') {
 		return;
 	}
-	if (rec->event_code != EVENT_LOG_DEVICE_FAULT) {
+	if (rec->event_code == EVENT_LOG_DEVICE_FAULT) {
+		cleared = rec->additional[2];
+	} else if (rec->event_code == EVENT_LOG_POWER_INPUT_OPEN ||
+		   rec->event_code == EVENT_LOG_POWER_INPUT_LOW ||
+		   rec->event_code == EVENT_LOG_POWER_INPUT_HIGH) {
+		cleared = rec->additional[1];
+	} else {
 		return;
 	}
 
 	snprintf(tmp, sizeof(tmp), "%c%s",
-		 (rec->additional[2] != 0u) ? '+' : '-',
+		 (cleared != 0u) ? '+' : '-',
 		 title);
 	strncpy(title, tmp, title_sz);
 	title[title_sz - 1u] = '\0';
@@ -427,6 +482,11 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 	switch (rec->event_code) {
 	case EVENT_LOG_DEVICE_FAULT:
 		FormatDeviceFaultDetail(rec, detail, detail_sz);
+		break;
+	case EVENT_LOG_POWER_INPUT_OPEN:
+	case EVENT_LOG_POWER_INPUT_LOW:
+	case EVENT_LOG_POWER_INPUT_HIGH:
+		FormatPowerInputDetail(rec, detail, detail_sz);
 		break;
 	case EVENT_LOG_FIRE_DETECTED:
 		if (rec->can_header != 0u && IsMcuDType(d_type)) {
@@ -471,9 +531,25 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 	case EVENT_LOG_MASTER_STOP:
 	case EVENT_LOG_SYSTEM_START_OK:
 	case EVENT_LOG_SOUND_TOGGLE:
-	case EVENT_LOG_FIRE_MODE_CHANGE:
 		FormatPpkyDetail(detail, detail_sz);
 		break;
+	case EVENT_LOG_FIRE_MODE_CHANGE: {
+		/* additional[0]=зона, [1]=mode 0/1/2/3/4, [2]=source */
+		const char *mode_s = "?";
+		switch (a[1]) {
+		case 0u: mode_s = "АВТО"; break;
+		case 1u: mode_s = "АВТОНОМ"; break;
+		case 2u: mode_s = "РУЧНОЙ"; break;
+		case 3u: mode_s = "ПУСК ВЫКЛ"; break;
+		case 4u: mode_s = "ПОЖАР ВЫКЛ"; break;
+		default: break;
+		}
+		if (a[0] != 0u) {
+			snprintf(detail, detail_sz, "З%u %s", (unsigned)a[0], mode_s);
+		} else {
+			snprintf(detail, detail_sz, "%s", mode_s);
+		}
+	} break;
 	case EVENT_LOG_HOST_LINK:
 		if (a[0] != 0u) {
 			snprintf(detail, detail_sz, "ПАНЕЛЬ %u %s",

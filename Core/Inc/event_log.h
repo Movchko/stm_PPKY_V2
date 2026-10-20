@@ -63,7 +63,8 @@ void EventLog_LogAllCfgMcusSaved(void);
 void EventLog_LogConfigApplyFail(uint8_t d_type, uint8_t h_adr, uint8_t l_adr, uint8_t zone,
                                  uint8_t slot, uint8_t reason);
 void EventLog_LogSoundToggle(uint8_t enabled, uint8_t source);
-void EventLog_LogFireModeChange(uint8_t mode, uint8_t source);
+/* Смена zone_fire_mode: zone 1-based, mode 0/1/2/3/4, source 0=меню 1=CAN. */
+void EventLog_LogFireModeChange(uint8_t zone, uint8_t mode, uint8_t source);
 
 #ifndef EVENT_LOG_TELEMETRY_SAMPLE_PERIOD_MS
 #define EVENT_LOG_TELEMETRY_SAMPLE_PERIOD_MS  (10u * 60u * 1000u)

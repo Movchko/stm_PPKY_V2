@@ -22,8 +22,9 @@ uint8_t RsPanelV3Master_IsSysReady(void);
 uint32_t RsPanelV3Master_GetBootAgeMs(void);
 uint16_t RsPanelV3Master_EncodePollToBuf(uint8_t *dst, uint16_t dst_size,
                                         uint8_t panel_idx, uint32_t now_ms);
-/* Короткий POLL только SYS (addr_scan probe) — с реальными flags, в т.ч. READY. */
-uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size);
+/* Короткий POLL только SYS. panel_idx=0xFF — probe без слота (SOUND_ON если маска≠0). */
+uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size,
+                                           uint8_t panel_idx);
 
 void RsPanelV3Master_SetFaultSnapshot(const RsPanelV3FaultEvtItem *items, uint16_t count);
 RsPanelV3FaultEvtItem *RsPanelV3Master_FaultItemsWritable(uint16_t *max_count);
