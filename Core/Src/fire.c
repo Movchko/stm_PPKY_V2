@@ -1315,26 +1315,6 @@ static void Fire_ResumeZoneCountdown(uint8_t zone, uint32_t now_ms)
 	Fire_LogCountdownResume(zone, FIRE_LOG_PAUSE_SRC_PANEL);
 }
 
-static uint8_t Fire_AbortZoneExtinguishOperator(uint8_t zone, uint32_t now_ms)
-{
-	int8_t si = Fire_FindSlotZone(zone);
-	if (si < 0) {
-		return 0u;
-	}
-	FireZoneSlot *s = &g_fire.slots[(uint8_t)si];
-	if (!s->active || !s->phase2_sent || s->extinguish_aborted != 0u) {
-		return 0u;
-	}
-	(void)now_ms;
-	Fire_ResetSuppressAddFromSlot(s);
-	Fire_SendStopZone(zone);
-	Fire_AbortExtinguishRetriesForZone(zone);
-	s->extinguish_aborted = 1u;
-	s->ext_retry_failed = 0u;
-	s->ext_retry_next_ms = 0u;
-	s->launch_stopped = 1u;
-	return 1u;
-}
 #endif
 
 static int8_t Fire_AllocSlot(void)
@@ -2397,7 +2377,14 @@ static void Fire_GostResetFire(uint32_t now_ms)
 static void Fire_EnterManualStop(uint32_t now_ms, uint8_t blink_stop_text, uint8_t stop_reason)
 {
 	/* Общее поведение "ОСТАНОВ ПУСКА": таймеры остановлены, arm на МКУ снят,
-	 * дотушивание (повторный Start) запрещено, manual UI/LED. */
+	 * дотушивание (повторный Start) запрещено, manual UI/LED.
+	 * Уже идущее тушение (phase2) не прерываем. */
+	if (Fire_IsExtinguishIndicationActive()) {
+		(void)blink_stop_text;
+		(void)now_ms;
+		(void)stop_reason;
+		return;
+	}
 	Fire_LogForceStop(stop_reason, 0u);
 	g_fire.zone_countdown_stopped = 1u;
 	g_fire.zone_countdown_paused = 0u;
@@ -2482,7 +2469,11 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 		g_fire.reply_received = 1u;
 		break;
 	case FIRE_EVENT_STOP_EXT:
-		/* Команда StopExtinguishment с CAN: остановка таймеров/автопуска/дотушивания, без сброса слотов */
+		/* Команда StopExtinguishment с CAN: остановка таймеров/автопуска/дотушивания, без сброса слотов.
+		 * Уже идущее тушение (phase2) прерывать нельзя. */
+		if (Fire_IsExtinguishIndicationActive()) {
+			break;
+		}
 		Fire_LogForceStop(FIRE_LOG_STOP_OTHER, 0u);
 		Fire_SendStopAllMcus();
 		Fire_AbortExtinguishRetriesAll();
@@ -2595,10 +2586,9 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 	} break;
 	case FIRE_EVENT_BTN_STOP:
 		/* ОСТАНОВ ПУСКА.
-		 * GOST: по выбранной зоне — pause/resume таймера или стоп тушения.
+		 * GOST: по выбранной зоне — pause/resume таймера до пуска.
+		 * Идущее тушение (phase2) кнопкой ОСТАНОВ не прерывается.
 		 * Ручные зоны без таймера: pause/resume no-op (см. Fire_Pause/ResumeZoneCountdown). */
-		/* Не игнорировать ОСТАНОВ после ПУСК без phase2: иначе нельзя прервать
-		 * уже идущее тушение/таймер (на ППКУ1 кнопки локальные — доходило всегда). */
 		g_fire.start_launch_pressed_latched = 0u;
 		if (!Fire_AnyActiveSlot()) {
 			/* Нет активного слота: для ПОЖАР1 — только дежурный звук. */
@@ -2622,17 +2612,6 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 				}
 				if (si >= 0) {
 					FireZoneSlot *s = &g_fire.slots[(uint8_t)si];
-					if (s->phase2_sent && s->extinguish_aborted == 0u &&
-					    s->ext_retry_failed == 0u &&
-					    !Fire_ZoneAllIgnitersEndAck(sel_zone)) {
-						Fire_LogForceStop(FIRE_LOG_STOP_OPERATOR, sel_zone);
-						(void)Fire_AbortZoneExtinguishOperator(sel_zone, now_ms);
-						g_fire.start_launch_pressed_latched = 0u;
-						g_fire.stop_launch_pressed_latched = 1u;
-						Fire_SyncStateFromSlots();
-						fire_processed = 1u;
-						break;
-					}
 					if (!s->phase2_sent && !s->fire1_waiting &&
 					    s->extinguish_aborted == 0u) {
 						if (s->countdown_paused != 0u) {
@@ -2647,8 +2626,9 @@ static void Fire_Transition(FireEvent ev, uint32_t now_ms)
 						fire_processed = 1u;
 						break;
 					}
-					/* ТУШ.ВЫП / ТУШ.ОСТ / ТУШ.ОШ / ПОЖАР1: короткий ОСТАНОВ
-					 * не переводит в «ПОЖАР/ОСТ.ПУСКА» (сброс — удержанием ≥5 с). */
+					/* ТУШЕНИЕ / ТУШ.ВЫП / ТУШ.ОСТ / ТУШ.ОШ / ПОЖАР1: короткий ОСТАНОВ
+					 * не прерывает тушение и не переводит в «ПОЖАР/ОСТ.ПУСКА»
+					 * (сброс пожара — удержанием ≥5 с). */
 					break;
 				}
 			} else {

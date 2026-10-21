@@ -196,6 +196,7 @@ static uint8_t IsTrackedVdevType(uint8_t v_d_type)
 {
 	return (v_d_type == DEVICE_DPT_TYPE ||
 		v_d_type == DEVICE_IGNITER_TYPE ||
+		v_d_type == DEVICE_BUTTON_TYPE ||
 		v_d_type == DEVICE_LSWITCH_TYPE) ? 1u : 0u;
 }
 
