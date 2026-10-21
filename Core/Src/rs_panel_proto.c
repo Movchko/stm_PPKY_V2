@@ -2121,10 +2121,33 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     }
 }
 
-/* Сколько записей журнала в одном event_reply (лимит 200 байт → текст режется). */
+/* Сколько записей просить за раз. В ответ кладутся только те, что влезают целиком. */
 #define RS_V3_JOURNAL_BATCH 3u
 /* Мин. размер одной записи: rec+ts+code + 3×(len=0). */
 #define RS_V3_JOURNAL_ITEM_MIN 13u
+
+static uint8_t rs_journal_field_len(const char *src, uint8_t max_len)
+{
+    uint8_t n = 0u;
+
+    if (src != 0) {
+        while (n < max_len && src[n] != '\0') {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* rec_idx+ts+code и три counted-строки, уже ограниченные RS_JOURNAL_*_MAX. */
+static uint16_t rs_journal_item_wire_size(const EventLogUiLines_t *lines)
+{
+    uint16_t n = 10u;
+
+    n = (uint16_t)(n + 1u + rs_journal_field_len(lines->header, RS_JOURNAL_HDR_MAX));
+    n = (uint16_t)(n + 1u + rs_journal_field_len(lines->title, RS_JOURNAL_TITLE_MAX));
+    n = (uint16_t)(n + 1u + rs_journal_field_len(lines->detail, RS_JOURNAL_DETAIL_MAX));
+    return n;
+}
 
 static uint16_t rs_panel_v3_put_one_journal_item(uint8_t *dst,
                                                 uint16_t pos,
@@ -2136,6 +2159,7 @@ static uint16_t rs_panel_v3_put_one_journal_item(uint8_t *dst,
     EventLogRecord_t *rec_ptr = 0;
     EventLogUiLines_t lines;
     uint16_t code;
+    uint16_t need;
     uint32_t ts = 0u;
 
     if (dst == 0 || (uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN) > item_cap) {
@@ -2147,6 +2171,12 @@ static uint16_t rs_panel_v3_put_one_journal_item(uint8_t *dst,
         rec.event_code = 0u;
     }
     rs_panel_master_format_journal_lines(rec_ptr, rec_idx, &lines);
+    /* Не усекать detail: короткая нижняя строка на панели — это обрезанное имя зоны/МКУ.
+     * Максимум одной записи 187 байт, вместе с заголовком списка (13) это ровно 200. */
+    need = rs_journal_item_wire_size(&lines);
+    if ((uint16_t)(pos + need) > item_cap) {
+        return pos;
+    }
     code = rec.event_code;
 
     dst[pos++] = (uint8_t)(rec_idx & 0xFFu);
@@ -2159,7 +2189,6 @@ static uint16_t rs_panel_v3_put_one_journal_item(uint8_t *dst,
     dst[pos++] = (uint8_t)((ts >> 24) & 0xFFu);
     dst[pos++] = (uint8_t)(code & 0xFFu);
     dst[pos++] = (uint8_t)((code >> 8) & 0xFFu);
-    /* Строки укладываются в item_cap: put_counted_str сам усечёт. */
     pos = rs_journal_put_counted_str(dst, pos, item_cap, lines.header, RS_JOURNAL_HDR_MAX);
     pos = rs_journal_put_counted_str(dst, pos, item_cap, lines.title, RS_JOURNAL_TITLE_MAX);
     pos = rs_journal_put_counted_str(dst, pos, item_cap, lines.detail, RS_JOURNAL_DETAIL_MAX);
@@ -2167,7 +2196,8 @@ static uint16_t rs_panel_v3_put_one_journal_item(uint8_t *dst,
 }
 
 /**
- * Упаковать окно журнала: window_first..+n_want (усечётся по cap / total).
+ * Упаковать окно журнала: window_first.. пока записи влезают целиком в cap.
+ * Неполная запись не пишется: панель доберёт её следующим GET_N.
  * selected в заголовке — g_journal_selected.
  */
 static uint16_t rs_panel_v3_put_journal_list_payload(uint8_t *dst, uint16_t cap,
@@ -2230,23 +2260,20 @@ static uint16_t rs_panel_v3_put_journal_list_payload(uint8_t *dst, uint16_t cap,
     n_pos = (uint8_t)pos;
     dst[pos++] = n_items;
 
-    for (i = 0u; i < n_items; i++) {
-        uint32_t rec_idx = window_first + (uint32_t)i;
-        uint8_t left = (uint8_t)(n_items - 1u - i);
-        uint16_t reserve = (uint16_t)((uint16_t)left * RS_V3_JOURNAL_ITEM_MIN);
-        uint16_t item_cap;
+    {
+        uint8_t written = 0u;
 
-        if ((uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN) > cap) {
-            n_items = i;
-            dst[n_pos] = n_items;
-            break;
+        for (i = 0u; i < n_items; i++) {
+            uint32_t rec_idx = window_first + (uint32_t)i;
+            uint16_t next = rs_panel_v3_put_one_journal_item(dst, pos, cap, rec_idx);
+
+            if (next == pos) {
+                break;
+            }
+            pos = next;
+            written++;
         }
-        if ((uint16_t)(cap - reserve) < (uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN)) {
-            item_cap = (uint16_t)(pos + RS_V3_JOURNAL_ITEM_MIN);
-        } else {
-            item_cap = (uint16_t)(cap - reserve);
-        }
-        pos = rs_panel_v3_put_one_journal_item(dst, pos, item_cap, rec_idx);
+        dst[n_pos] = written;
     }
     return pos;
 }
