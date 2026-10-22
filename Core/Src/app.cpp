@@ -1180,7 +1180,7 @@ void AppTimer1ms() {
 	/* Grace перед warning/relay/log: wall-time в Warning_IsProcessDelayActive. */
 	(void)Warning_IsProcessDelayActive();
 
-	if (!MenuUi_IsConfigSessionActive()) {
+	if (!MenuUi_IsFaultFireBlocked()) {
 		CheckMkuConfigMismatch();
 	}
 
@@ -1215,16 +1215,14 @@ void AppTimer10ms() {
 	}
 
 	ConfigIgnBlockSync_Process1ms(now);
-	if (!MenuUi_IsConfigSessionActive()) {
+	if (!MenuUi_IsFaultFireBlocked()) {
 		ConfigMonitor_Process1ms(now);
 		Position_EvaluateMismatch(now);
 		g_position_fault_mask = Position_GetFaultMask();
+		Warning_SetMkuPositionFaultMask(g_position_fault_mask);
+		App_UpdatePowerFaultIndication(now);
 	}
 	RefreshActiveDevices(now);
-	if (!MenuUi_IsConfigSessionActive()) {
-		Warning_SetMkuPositionFaultMask(g_position_fault_mask);
-	}
-	App_UpdatePowerFaultIndication(now);
 	EventLog_ProcessTelemetrySample(now);
 	EspManager_Process(now);
 	MenuConfig_Process1ms(now);

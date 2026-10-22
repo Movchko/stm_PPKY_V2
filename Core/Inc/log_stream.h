@@ -55,6 +55,8 @@ void LogStream_HandleRequest(LogTransportPort_t port,
                              uint16_t payload_len);
 void LogStream_Process(void);
 bool LogStream_IsDumpActive(void);
+/** 1 = панель не должна читать журнал (идёт dump ПК или <5 с после команды ПО). */
+bool LogStream_IsPanelJournalBlocked(void);
 
 #ifdef __cplusplus
 }

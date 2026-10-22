@@ -20,7 +20,8 @@ void Beeper_SoundOnOff(bool soundOn);
 /* Бит панели по RS-адресу (SOUND_SET с панели). */
 void Beeper_SetPanelSound(uint8_t addr, uint8_t on);
 uint8_t Beeper_IsPanelSoundOn(uint8_t addr);
-/* GOST: unmute при новом извещении → маска 0xFF (даже если снят один бит панели). */
+/* GOST: unmute при новом извещении → маска 0xFF (даже если снят один бит панели).
+ * beep_block не мешает: он только запрещает SOUND_SET с клавиатуры. */
 void Beeper_ResumeSoundOnNewEvent(void);
 /* 1 если маска ≠ 0. */
 uint8_t Beeper_IsSoundEnabled(void);

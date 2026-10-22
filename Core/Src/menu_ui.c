@@ -7,6 +7,8 @@
 #include "esp_manager.h"
 
 #define MENU_CFG_SUCCESS_HOLD_MS 5000u
+/* После последней команды конфига с ПО столько мс не поднимать неисправности/пожары. */
+#define MENU_CFG_HOST_FAULT_HOLD_MS 5000u
 
 /* Объявлено в config_sync.hpp; без include C++-заголовка в .c */
 extern uint8_t ConfigSync_GetApplyPercent(void);
@@ -21,6 +23,7 @@ static uint16_t g_cfg_words_max = 0u;
 static uint16_t g_cfg_total_words = 0u;
 static uint32_t g_cfg_success_from_ms = 0u;
 static uint8_t g_cfg_success_beep_done = 0u;
+static uint32_t g_host_cfg_cmd_ms; /* 0 = ПО ещё не слало команды конфига */
 
 static uint8_t g_mcu_detail_slot = 0u;
 
@@ -50,6 +53,28 @@ uint8_t MenuUi_IsConfigOverlayActive(void)
 {
 	return (g_config_session_active != 0u &&
 		g_cfg_state != MENU_CFG_STATE_IDLE) ? 1u : 0u;
+}
+
+void MenuUi_NoteHostConfigActivity(void)
+{
+	uint32_t now = HAL_GetTick();
+	g_host_cfg_cmd_ms = (now == 0u) ? 1u : now;
+}
+
+uint8_t MenuUi_IsFaultFireBlocked(void)
+{
+	uint32_t now;
+
+	if (g_config_session_active != 0u) {
+		return 1u;
+	}
+	if (g_host_cfg_cmd_ms == 0u) {
+		return 0u;
+	}
+	now = HAL_GetTick();
+	return ((int32_t)(now - g_host_cfg_cmd_ms) < (int32_t)MENU_CFG_HOST_FAULT_HOLD_MS)
+		       ? 1u
+		       : 0u;
 }
 
 void MenuUi_SetMainScreenActive(uint8_t active)

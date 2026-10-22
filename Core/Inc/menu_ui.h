@@ -18,6 +18,11 @@ void MenuUi_SetConfigSession(uint8_t active);
 uint8_t MenuUi_IsConfigSessionActive(void);
 uint8_t MenuUi_IsConfigOverlayActive(void);
 
+/** Отметить команду конфигурирования с ПО (обновляет таймер удержания 5 с). */
+void MenuUi_NoteHostConfigActivity(void);
+/** 1 = не поднимать неисправности/пожары: сессия конфига или <5 с после команды ПО. */
+uint8_t MenuUi_IsFaultFireBlocked(void);
+
 void MenuUi_SetMainScreenActive(uint8_t active);
 uint8_t MenuUi_IsMainScreenActive(void);
 

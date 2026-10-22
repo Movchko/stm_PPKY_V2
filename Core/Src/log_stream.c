@@ -1,8 +1,12 @@
 #include "log_stream.h"
 #include "event_log_reader.h"
 #include "event_log.h"
+#include "stm32h5xx_hal.h"
 
 #include <string.h>
+
+/* После последней команды журнала с ПК — столько мс не обслуживать JOURNAL_* панели. */
+#define LOG_STREAM_PANEL_JOURNAL_HOLD_MS  5000u
 
 #define LOG_PKT_TYPE_RSP               17u
 #define LOG_PKT_TYPE_DATA              18u
@@ -37,6 +41,7 @@ typedef struct {
 static LogStream_SendFn s_send_fn;
 static LogStreamSession_t s_session;
 static uint16_t s_next_stream_id = 1u;
+static uint32_t s_host_req_ms; /* 0 = ПО ещё не запрашивало журнал */
 
 static void put_u16_le(uint8_t *buf, uint16_t value) { buf[0] = (uint8_t)(value & 0xFFu); buf[1] = (uint8_t)(value >> 8); }
 static void put_u32_le(uint8_t *buf, uint32_t value) { buf[0]=(uint8_t)(value&0xFFu); buf[1]=(uint8_t)((value>>8)&0xFFu); buf[2]=(uint8_t)((value>>16)&0xFFu); buf[3]=(uint8_t)((value>>24)&0xFFu); }
@@ -114,12 +119,24 @@ static uint8_t LogStream_StartDump(LogTransportPort_t port, uint16_t seq, uint8_
 static void LogStream_HandleStopDump(LogTransportPort_t port, uint16_t seq) { uint8_t rsp[LOG_STOP_DUMP_RSP_SIZE] = { LOG_STATUS_OK, LOG_OPCODE_STOP_DUMP }; LogStream_ResetSession(); LogStream_SendRsp(port, seq, rsp, sizeof(rsp)); }
 static void LogStream_HandleGetDumpStatus(LogTransportPort_t port, uint16_t seq) { uint8_t rsp[LOG_GET_STATUS_RSP_SIZE] = {0}; rsp[0]=LOG_STATUS_OK; rsp[1]=LOG_OPCODE_GET_DUMP_STATUS; rsp[2]=s_session.active; put_u16_le(&rsp[3], s_session.stream_id); put_u16_le(&rsp[5], s_session.pkt_sent); put_u32_le(&rsp[7], s_session.records_sent); LogStream_SendRsp(port, seq, rsp, sizeof(rsp)); }
 
-void LogStream_Init(LogStream_SendFn send_fn) { s_send_fn = send_fn; LogStream_ResetSession(); }
+void LogStream_Init(LogStream_SendFn send_fn)
+{
+	s_send_fn = send_fn;
+	s_host_req_ms = 0u;
+	LogStream_ResetSession();
+}
+
+static void LogStream_NoteHostRequest(void)
+{
+	uint32_t now = HAL_GetTick();
+	s_host_req_ms = (now == 0u) ? 1u : now;
+}
 
 void LogStream_HandleRequest(LogTransportPort_t port, uint16_t seq, const uint8_t *payload, uint16_t payload_len)
 {
 	uint8_t opcode;
 	if (payload == NULL || payload_len == 0u) return;
+	LogStream_NoteHostRequest();
 	opcode = payload[0];
 	switch (opcode) {
 	case LOG_OPCODE_PING: LogStream_HandlePing(port, seq); break;
@@ -140,6 +157,19 @@ void LogStream_HandleRequest(LogTransportPort_t port, uint16_t seq, const uint8_
 }
 
 bool LogStream_IsDumpActive(void) { return (s_session.active != 0u); }
+
+bool LogStream_IsPanelJournalBlocked(void)
+{
+	uint32_t now;
+	if (s_session.active != 0u) {
+		return true;
+	}
+	if (s_host_req_ms == 0u) {
+		return false;
+	}
+	now = HAL_GetTick();
+	return ((int32_t)(now - s_host_req_ms) < (int32_t)LOG_STREAM_PANEL_JOURNAL_HOLD_MS);
+}
 
 void LogStream_Process(void)
 {

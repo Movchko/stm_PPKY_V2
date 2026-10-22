@@ -1147,6 +1147,7 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 			continue;
 		}
 		const char *kind_txt = "ОБРЫВ";
+		const char *power_zone = (ch == 0u) ? "ОСНОВНОЕ" : "РЕЗЕРВНОЕ";
 		if (g_ppku_input_fault_kind[ch] == PPKU_INPUT_FAULT_LOW) {
 			kind_txt = "НИЖЕ";
 		} else if (g_ppku_input_fault_kind[ch] == PPKU_INPUT_FAULT_HIGH) {
@@ -1154,7 +1155,9 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 		}
 		snprintf(big_titles[count], WARN_TITLE_LEN, "ПИТ%u. %s",
 			 (unsigned)(ch + 1u), kind_txt);
-		snprintf(details[count], ZONE_NAME_SIZE + 1, "ППКУ S/N:%08lX:%08lX:%08lX", PPKYConfig.UId.UId0, PPKYConfig.UId.UId1, PPKYConfig.UId.UId2);
+		/* Как имя зоны у неисправности МКУ: сначала ОСНОВНОЕ/РЕЗЕРВНОЕ, затем S/N. */
+		snprintf(details[count], ZONE_NAME_SIZE + 1, "%s ППКУ S/N:%08lX:%08lX:%08lX",
+			 power_zone, PPKYConfig.UId.UId0, PPKYConfig.UId.UId1, PPKYConfig.UId.UId2);
 		count++;
 	}
 
@@ -1556,7 +1559,7 @@ static uint8_t s_fault_pipeline_primed = 0u;
 /* Главный 1мс-тик модуля: сбор, фильтрация, LED и публикация предупреждений. */
 extern "C" void WarningProcess1ms(void)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 

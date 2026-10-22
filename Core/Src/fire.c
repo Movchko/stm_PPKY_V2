@@ -2734,7 +2734,7 @@ void Fire_Init(void)
 /* Периодический тик 1 мс: FSM, таймеры автопуска, LED/звук. */
 void Fire_Timer1ms(void)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	/* 1мс-путь: крутит FSM при активном сценарии или удержании ПУСК ОБЩИЙ. */
@@ -2879,7 +2879,7 @@ void Fire_Timer10ms(void)
 			}
 			/* <1с: обычный ПУСК СП. ≥1с и отпустили до 3с: ничего. */
 			if (held < FIRE_SP_TO_ALL_HOLD_MS &&
-			    MenuUi_IsConfigSessionActive() == 0u &&
+			    MenuUi_IsFaultFireBlocked() == 0u &&
 			    (g_fire.state != FIRE_STATE_IDLE || Fire_AnyActiveSlot())) {
 				if (g_fire.last_btn_start_sp_action_ms == 0u ||
 				    (now_ms - g_fire.last_btn_start_sp_action_ms) >= 500u) {
@@ -2914,7 +2914,7 @@ void Fire_Timer10ms(void)
 		}
 	}
 
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 
@@ -2943,7 +2943,7 @@ void Fire_Timer10ms(void)
 /* Входящее событие ПОЖАР от МКУ: добавляет зону и запускает сценарий. */
 void Fire_OnStatusFire(uint32_t msg_id, const uint8_t *msg_data)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	/* Вход статуса пожара от МКУ: учитываем уникальные источники в зоне
@@ -2988,7 +2988,7 @@ static volatile uint32_t bus_sp_cnt = 0;
 
 void Fire_OnBusStartSpButton(uint32_t msg_id)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	/* MKU button StartSP: broadcast d_type/h/l=0, cmd 163. */
@@ -3002,7 +3002,7 @@ void Fire_OnBusStartSpButton(uint32_t msg_id)
 
 void Fire_OnStartExtinguishment(uint32_t msg_id, const uint8_t *msg_data)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	if (msg_data == NULL) {
@@ -3026,7 +3026,7 @@ void Fire_OnStartExtinguishment(uint32_t msg_id, const uint8_t *msg_data)
 /* Входящий ReplyStatusFire от МКУ (подтверждение статуса пожара). */
 void Fire_OnReplyStatusFire(uint32_t msg_id)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	(void)msg_id;
@@ -3036,7 +3036,7 @@ void Fire_OnReplyStatusFire(uint32_t msg_id)
 /* Входящая команда StopExtinguishment от МКУ/CAN. */
 void Fire_OnStopExtinguishment(uint32_t msg_id)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	(void)msg_id;
@@ -3045,7 +3045,7 @@ void Fire_OnStopExtinguishment(uint32_t msg_id)
 
 void Fire_OnPauseExtinguishmentTimer(uint32_t msg_id)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	(void)msg_id;
@@ -3054,7 +3054,7 @@ void Fire_OnPauseExtinguishmentTimer(uint32_t msg_id)
 
 void Fire_OnResumeExtinguishmentTimer(uint32_t msg_id)
 {
-	if (MenuUi_IsConfigSessionActive()) {
+	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
 	(void)msg_id;

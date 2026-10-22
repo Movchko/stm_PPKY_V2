@@ -12,6 +12,7 @@
 #include "event_log_reader.h"
 #include "event_logger.h"
 #include "event_log_ui.h"
+#include "log_stream.h"
 #include "esp_manager.h"
 #include "esp_protocol.h"
 #include "can_bus.h"
@@ -2292,6 +2293,14 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
     }
     jsel = &s_v3_journal_selected[panel_idx];
     memset(reply, 0, sizeof(*reply));
+
+    /* ПО читает журнал по USART2 — не конкурировать со SPI Flash панели. */
+    if ((ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_COUNT ||
+         ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET ||
+         ev->type == (uint8_t)RS_PANEL_V3_EVT_JOURNAL_GET_N) &&
+        LogStream_IsPanelJournalBlocked()) {
+        return 0u;
+    }
 
     switch (ev->type) {
     case RS_PANEL_V3_EVT_JOURNAL_COUNT: {

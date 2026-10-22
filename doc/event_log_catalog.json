@@ -1164,7 +1164,7 @@
       "level": "critical",
       "debug_only": false,
       "status": "implemented",
-      "description": "ППКУ записала свой конфиг во Flash (SaveConfig). Не путать с кодом 16 CONFIG_APPLY_OK (заливка в МКУ). После этой записи идут события 27 ZONE_NAME по одной на каждую зону с непустым именем.",
+      "description": "ППКУ записала свой конфиг во Flash (SaveConfig). Не путать с кодом 16 CONFIG_APPLY_OK (заливка в МКУ). После этой записи идут события 27 ZONE_NAME — пакеты имён зон (несколько на длинное имя).",
       "uses": {
         "can_header": "unused",
         "can_data": "unused",
@@ -1174,9 +1174,9 @@
         "additional": [
           {
             "offset": 0,
-            "name": "named_zone_count",
+            "name": "zone_name_packet_count",
             "type": "uint8",
-            "description": "Число следующих записей EVENT_LOG_ZONE_NAME (только зоны с непустым именем)"
+            "description": "Число следующих записей EVENT_LOG_ZONE_NAME (сумма пакетов по всем непустым зонам)"
           },
           {
             "offset": 1,
@@ -1194,7 +1194,7 @@
       "level": "critical",
       "debug_only": false,
       "status": "implemented",
-      "description": "Снимок имени зоны сразу после EVENT_LOG_CONFIG_SAVED. Пишется только для зон с непустым именем. Имя обрезается до 16 байт: can_data[0..7] + additional[0..7]. Если имя короче 16 — хвост нули; если ровно 16 или длиннее — без NUL.",
+      "description": "Пакет имени зоны сразу после EVENT_LOG_CONFIG_SAVED. can_data[0]=индекс пакета; can_data[1..7]+additional[0..7]=до 15 символов. Конец имени — NUL. Длинное имя (до ZONE_NAME_SIZE=64) пишется несколькими событиями.",
       "uses": {
         "can_header": "required",
         "can_data": "required",
@@ -1207,20 +1207,21 @@
         },
         "can_data": {
           "required": true,
-          "description": "Байты имени зоны [0..7]"
+          "description": "can_data[0]=индекс пакета; can_data[1..7]=символы имени"
         },
         "additional": [
           {
             "offset": 0,
-            "name": "name_bytes_8_15",
+            "name": "name_bytes_cont",
             "type": "bytes",
             "size": 8,
-            "description": "Байты имени зоны [8..15]"
+            "description": "Продолжение символов имени (байты 7..14 относительно начала пакета)"
           }
         ]
       },
       "parse_hints": [
-        "Собрать имя: 8 байт can_data, затем 8 байт additional, затем добавить NUL при разборе.",
+        "Собрать фрагмент: can_data[1..7], затем additional[0..7], остановиться на первом NUL.",
+        "Полное имя = конкатенация пакетов 0,1,2… одной зоны в порядке записи.",
         "Пустые зоны (zone_name[i][0]==0) не пишутся."
       ]
     },

@@ -571,18 +571,34 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 		}
 		break;
 	case EVENT_LOG_CONFIG_SAVED:
-		snprintf(detail, detail_sz, "ППКУ зон %u/%u",
+		snprintf(detail, detail_sz, "ППКУ пак %u/%u",
 			 (unsigned)a[0], (unsigned)a[1]);
 		break;
 	case EVENT_LOG_ZONE_NAME: {
-		char name[17];
-		memcpy(name, rec->can_data, 8u);
-		memcpy(name + 8u, rec->additional, 8u);
-		name[16] = '\0';
+		/* can_data[0]=индекс пакета; символы: can_data[1..7]+additional[0..7]. */
+		char name[16];
+		uint8_t pkt = rec->can_data[0];
+		uint8_t ni = 0u;
+		uint8_t i;
+		for (i = 1u; i < 8u && ni + 1u < sizeof(name); i++) {
+			if (rec->can_data[i] == 0u) {
+				break;
+			}
+			name[ni++] = (char)rec->can_data[i];
+		}
+		if (i >= 8u) {
+			for (i = 0u; i < 8u && ni + 1u < sizeof(name); i++) {
+				if (rec->additional[i] == 0u) {
+					break;
+				}
+				name[ni++] = (char)rec->additional[i];
+			}
+		}
+		name[ni] = '\0';
 		if (name[0] == '\0') {
-			snprintf(detail, detail_sz, "%u", (unsigned)zone);
+			snprintf(detail, detail_sz, "%u #%u", (unsigned)zone, (unsigned)pkt);
 		} else {
-			snprintf(detail, detail_sz, "%u %s", (unsigned)zone, name);
+			snprintf(detail, detail_sz, "%u #%u %s", (unsigned)zone, (unsigned)pkt, name);
 		}
 		break;
 	}

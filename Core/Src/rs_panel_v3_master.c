@@ -779,14 +779,17 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
     if (Warning_GetPpkuInputFaultMask() != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_POWER_INPUT_FAULT;
     }
-    {
-        const uint8_t addr = RsPanelMaster_GetPanelAddr(panel_idx);
-        if (Beeper_IsPanelSoundOn(addr) != 0u) {
-            out->sys.flags |= RS_PANEL_V3_SYS_SOUND_ON;
-        }
+
+    const uint8_t addr = RsPanelMaster_GetPanelAddr(panel_idx);
+    if (Beeper_IsPanelSoundOn(addr) != 0u) {
+    	out->sys.flags |= RS_PANEL_V3_SYS_SOUND_ON;
     }
+
     if (PPKYConfig.beep_block != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
+    }
+    if (PPKYConfig.wifi_block != 0u) {
+        out->sys.flags |= RS_PANEL_V3_SYS_WIFI_BLOCKED;
     }
     if (EspManager_IsUserWifiOn() != 0u) {
         out->sys.flags |= RS_PANEL_V3_SYS_WIFI_ON;
@@ -917,7 +920,7 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
      * время каталога. EncodePollToBuf при нехватке места приоритерует TIME над
      * стримом (не срезает TIME в пользу zone/MCU TLV).
      * ZONES fire — только при изменении снимка. TIME — per-panel. */
-    {
+
         rs_v3_maybe_attach_time(out, ctx, now_ms);
 
         if (fire_active != 0u) {
@@ -929,7 +932,7 @@ void RsPanelV3Master_BuildPoll(RsPanelV3Poll *out, uint8_t panel_idx, uint32_t n
             Fire_FillV3Zones(&out->zones, now_ms);
             out->has_zones = (out->zones.count > 0u) ? 1u : 0u;
         }
-    }
+
 
     (void)s_fault_snapshot_dirty;
 }
@@ -965,6 +968,9 @@ uint16_t RsPanelV3Master_EncodeSysOnlyPoll(uint8_t *dst, uint16_t dst_size,
     }
     if (PPKYConfig.beep_block != 0u) {
         flags |= RS_PANEL_V3_SYS_SOUND_BLOCKED;
+    }
+    if (PPKYConfig.wifi_block != 0u) {
+        flags |= RS_PANEL_V3_SYS_WIFI_BLOCKED;
     }
     if (EspManager_IsUserWifiOn() != 0u) {
         flags |= RS_PANEL_V3_SYS_WIFI_ON;
@@ -1432,7 +1438,9 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev,
         }
         break;
     case RS_PANEL_V3_EVT_WIFI_SET:
-        if (ev->u8_a != 0u) {
+        if (PPKYConfig.wifi_block != 0u) {
+            result = (uint8_t)RS_PANEL_V3_ACK_DENIED;
+        } else if (ev->u8_a != 0u) {
             EspManager_RequestWifiEnable();
         } else {
             EspManager_RequestWifiDisable();

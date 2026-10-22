@@ -180,72 +180,111 @@ void EventLog_LogConfigApplyOk(uint8_t mcu_ok_count, uint8_t mcu_total)
 	(void)EventLog_Post(EVENT_LOG_CONFIG_APPLY_OK, &payload);
 }
 
-#define EVENT_LOG_ZONE_NAME_PACKED_BYTES  16u /* can_data[8] + additional[8] */
+/* Пакет имени зоны: can_data[0]=индекс пакета, далее до 15 символов
+ * (can_data[1..7] + additional[0..7]). Конец имени — NUL, как в конфиге. */
+#define EVENT_LOG_ZONE_NAME_CHARS_PER_PKT  15u
 
-static uint8_t EventLog_CountNamedZones(void)
+static uint16_t EventLog_ZoneNameLen(const int8_t *src)
+{
+	uint16_t n = 0u;
+	if (src == nullptr) {
+		return 0u;
+	}
+	while (n < ZONE_NAME_SIZE && src[n] != 0) {
+		n++;
+	}
+	return n;
+}
+
+static uint8_t EventLog_ZoneNamePacketCount(uint16_t name_len)
+{
+	if (name_len == 0u) {
+		return 0u;
+	}
+	return (uint8_t)((name_len + (EVENT_LOG_ZONE_NAME_CHARS_PER_PKT - 1u)) /
+			 EVENT_LOG_ZONE_NAME_CHARS_PER_PKT);
+}
+
+static uint8_t EventLog_CountZoneNamePackets(void)
 {
 	uint8_t count = 0u;
 	for (uint16_t zi = 0u; zi < ZONE_NUMBER; zi++) {
-		if (PPKYConfig.zone_name[zi][0] != 0) {
-			count++;
-		}
+		uint16_t len = EventLog_ZoneNameLen(PPKYConfig.zone_name[zi]);
+		uint8_t pkts = EventLog_ZoneNamePacketCount(len);
+		/* uint8 хватит: ZONE_NUMBER×ceil(64/15) ≪ 255. */
+		count = (uint8_t)(count + pkts);
 	}
 	return count;
 }
 
-static void EventLog_PackZoneName(const int8_t *src, uint8_t can_data[8], uint8_t additional[8])
+static void EventLog_PackZoneNamePacket(const int8_t *src, uint8_t pkt_idx,
+					uint8_t can_data[8], uint8_t additional[8])
 {
-	uint8_t packed[EVENT_LOG_ZONE_NAME_PACKED_BYTES];
+	uint16_t name_len = EventLog_ZoneNameLen(src);
+	uint16_t off = (uint16_t)pkt_idx * EVENT_LOG_ZONE_NAME_CHARS_PER_PKT;
 	uint8_t i;
 
-	memset(packed, 0, sizeof(packed));
-	if (src == nullptr) {
-		memcpy(can_data, packed, 8u);
-		memcpy(additional, packed + 8u, 8u);
+	memset(can_data, 0, 8u);
+	memset(additional, 0, 8u);
+	can_data[0] = pkt_idx;
+	if (src == nullptr || off >= name_len) {
 		return;
 	}
-	for (i = 0u; i < EVENT_LOG_ZONE_NAME_PACKED_BYTES && i < ZONE_NAME_SIZE; i++) {
-		if (src[i] == 0) {
+	for (i = 0u; i < EVENT_LOG_ZONE_NAME_CHARS_PER_PKT; i++) {
+		uint16_t src_i = (uint16_t)(off + i);
+		uint8_t b;
+		if (src_i >= name_len) {
 			break;
 		}
-		packed[i] = (uint8_t)src[i];
+		b = (uint8_t)src[src_i];
+		if (i < 7u) {
+			can_data[1u + i] = b;
+		} else {
+			additional[i - 7u] = b;
+		}
 	}
-	memcpy(can_data, packed, 8u);
-	memcpy(additional, packed + 8u, 8u);
 }
 
 static void EventLog_LogZoneName(uint8_t zone_1based, const int8_t *name)
 {
 	EventLogPayload_t payload;
 	can_ext_id_t id;
+	uint16_t name_len = EventLog_ZoneNameLen(name);
+	uint8_t pkt_count = EventLog_ZoneNamePacketCount(name_len);
+	uint8_t pkt;
 
-	memset(&payload, 0, sizeof(payload));
-	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+	if (pkt_count == 0u) {
+		return;
+	}
 
 	id.ID = 0u;
 	id.field.zone = zone_1based & 0x7Fu;
 	id.field.d_type = DEVICE_PPKY_TYPE;
 	id.field.h_adr = PPKYConfig.UId.devId.h_adr;
 	id.field.dir = 1u;
-	payload.can_header = id.ID & 0x1FFFFFFFu;
 
-	EventLog_PackZoneName(name, payload.can_data, payload.additional);
-	(void)EventLog_Post(EVENT_LOG_ZONE_NAME, &payload);
+	for (pkt = 0u; pkt < pkt_count; pkt++) {
+		memset(&payload, 0, sizeof(payload));
+		payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+		payload.can_header = id.ID & 0x1FFFFFFFu;
+		EventLog_PackZoneNamePacket(name, pkt, payload.can_data, payload.additional);
+		(void)EventLog_Post(EVENT_LOG_ZONE_NAME, &payload);
+	}
 }
 
 void EventLog_LogConfigSaved(void)
 {
 	EventLogPayload_t payload;
-	uint8_t named_count;
+	uint8_t packet_count;
 
 	if (!g_initialized) {
 		return;
 	}
 
-	named_count = EventLog_CountNamedZones();
+	packet_count = EventLog_CountZoneNamePackets();
 	memset(&payload, 0, sizeof(payload));
 	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
-	payload.additional[0] = named_count;
+	payload.additional[0] = packet_count;
 	payload.additional[1] = (uint8_t)ZONE_NUMBER;
 	if (!EventLog_Post(EVENT_LOG_CONFIG_SAVED, &payload)) {
 		return;
@@ -382,10 +421,19 @@ void EventLog_ProcessTelemetrySample(uint32_t now_ms)
 extern "C" void App_OnHostConfigCommand(uint8_t bus, uint8_t command)
 {
 	(void)bus;
-	if (command == ServiceCmd_SetConfigWord || command == ServiceCmd_StartSetConfig) {
+	if (command == ServiceCmd_SetConfigWord || command == ServiceCmd_StartSetConfig ||
+	    command == ServiceCmd_SaveConfig) {
+		/* Запись/старт/save с ПО — сессия + таймер блокировки неисправностей/пожаров. */
+		MenuUi_NoteHostConfigActivity();
 		if (!MenuUi_IsConfigSessionActive()) {
 			MenuUi_SetConfigSession(1u);
 			MenuConfig_Reset();
+		}
+	} else if (command == ServiceCmd_GetConfigSize || command == ServiceCmd_GetConfigCRC ||
+		   command == ServiceCmd_GetConfigWord) {
+		/* Чтение — продлевает 5 с hold только во время уже идущей конфигурации. */
+		if (MenuUi_IsConfigSessionActive()) {
+			MenuUi_NoteHostConfigActivity();
 		}
 	}
 	if ((bus & BUS_UART1) != 0u) {

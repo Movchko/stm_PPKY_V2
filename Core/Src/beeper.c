@@ -55,9 +55,8 @@ uint8_t Beeper_IsSoundEnabled(void)
 void Beeper_ResumeSoundOnNewEvent(void)
 {
 #if GOST_MODE
-	if (PPKYConfig.beep_block != 0u) {
-		return;
-	}
+	/* ГОСТ: новое извещение снова включает звук (SYS_SOUND_ON).
+	 * beep_block запрещает только SOUND_SET с клавиатуры панели, не авто-unmute. */
 	/* Mute панели — бит в маске, не глобальный beep_sound.
 	 * Если снят только один бит, beep_sound может остаться 1 — всё равно
 	 * поднять маску до 0xFF, иначе SYS_SOUND_ON для этой панели не появится. */

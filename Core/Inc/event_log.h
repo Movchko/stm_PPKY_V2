@@ -56,7 +56,7 @@ void EventLog_LogCanTelemetry(uint32_t can_id, const uint8_t *data);
 void EventLog_LogHostLink(uint8_t media);
 void EventLog_HostLinkSessionReset(uint8_t media);
 void EventLog_LogConfigApplyOk(uint8_t mcu_ok_count, uint8_t mcu_total);
-/** SaveConfig ППКУ: CONFIG_SAVED, затем ZONE_NAME (имя в can_data+additional). */
+/** SaveConfig ППКУ: CONFIG_SAVED, затем ZONE_NAME пакетами (индекс + до 15 символов). */
 void EventLog_LogConfigSaved(void);
 void EventLog_LogMcuSaved(const Device *dev, const UniqId *uid);
 void EventLog_LogAllCfgMcusSaved(void);
