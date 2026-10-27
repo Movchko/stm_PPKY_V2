@@ -166,8 +166,10 @@ static uint8_t EraseUpdateSlot(void)
 
 void Boot_WriteProgramWatchDog(void)
 {
-	/* Program WD @ 0x0800BFBC (qword 0x0800BFB0): соседствует с footer 0x0800BFC0,
-	 * не пересекается. После SetApp(MAIN) сектор стёрт — первая запись в 0xFF. */
+	/* Пока ППКУ без бутлоадера (линк @ 0x08000000) — WD не пишем.
+	 * С бутом: снять return и писать 0xAABBCCDD @ BOOT_PROGRAM_WD_ADDR. */
+	return;
+#if 0
 	uint32_t quad_word[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, WATCHDOG };
 
 	if (*(volatile uint32_t *)BOOT_PROGRAM_WD_ADDR == WATCHDOG) {
@@ -180,6 +182,7 @@ void Boot_WriteProgramWatchDog(void)
 	HAL_FLASH_Lock();
 	(void)HAL_ICACHE_Invalidate();
 	(void)HAL_ICACHE_Enable();
+#endif
 }
 
 void App_WriteProgramWatchdog(void)

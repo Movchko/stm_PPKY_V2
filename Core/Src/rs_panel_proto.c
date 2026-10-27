@@ -648,6 +648,10 @@ static void rs_panel_master_wifi_presence_tick(RsPanelMaster *master, uint32_t n
             (now_ms - panel->last_rx_ms) > RS_PANEL_WIFI_PRESENCE_ALIVE_MS) {
             continue;
         }
+        /* Без свежего CAPS (панель в бутлоадере) — только реальный ACTIVITY с шины. */
+        if (panel->caps_valid == 0u) {
+            continue;
+        }
 
         memset(&act, 0, sizeof(act));
         act.dev_type = (uint8_t)DEVICE_PANEL_TYPE;
@@ -1440,18 +1444,25 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
             panel->last_rx_ms = HAL_GetTick();
             /* Падение uptime_sec = панель перезапустилась (питание/reset).
              * Сбрасываем READY → снова CAPS → on_panel_became_ready (полный resync). */
-            if (RsPanel_DecodeActivity(frame->payload, frame->payload_len, &act) != 0u &&
-                act.dev_type == DEVICE_PANEL_TYPE) {
-                if (panel->uptime_valid != 0u &&
-                    act.uptime_sec < panel->last_uptime_sec &&
-                    panel->link_state == PANEL_LINK_READY) {
+            if (RsPanel_DecodeActivity(frame->payload, frame->payload_len, &act) != 0u) {
+                if (act.dev_type == (uint8_t)DEVICE_PANEL_BOOTLOADER_TYPE) {
+                    /* Бут: не кормить WiFi presence старым CAPS.fw_ver (fw=7 при boot). */
                     panel->link_state = PANEL_LINK_CAPS_PENDING;
                     panel->caps_valid = 0u;
-                    /* Панель сбросила RTC — TIME в ближайших POLL, не ждать PERIOD. */
-                    RsPanelV3Master_ForceTimeSyncPanel(i);
+                    panel->last_uptime_sec = act.uptime_sec;
+                    panel->uptime_valid = 1u;
+                } else if (act.dev_type == DEVICE_PANEL_TYPE) {
+                    if (panel->uptime_valid != 0u &&
+                        act.uptime_sec < panel->last_uptime_sec &&
+                        panel->link_state == PANEL_LINK_READY) {
+                        panel->link_state = PANEL_LINK_CAPS_PENDING;
+                        panel->caps_valid = 0u;
+                        /* Панель сбросила RTC — TIME в ближайших POLL, не ждать PERIOD. */
+                        RsPanelV3Master_ForceTimeSyncPanel(i);
+                    }
+                    panel->last_uptime_sec = act.uptime_sec;
+                    panel->uptime_valid = 1u;
                 }
-                panel->last_uptime_sec = act.uptime_sec;
-                panel->uptime_valid = 1u;
             }
         }
         break;
@@ -1749,7 +1760,8 @@ void RsPanelMaster_OnRxBytes(RsPanelMaster *master, const uint8_t *data, uint16_
     rs_panel_master_dbg_sync_rx_decode(master);
 }
 
-static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cmd)
+static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cmd,
+                                                     const uint8_t *payload, uint16_t plen)
 {
     uint32_t add_ms = 0u;
 
@@ -1759,8 +1771,16 @@ static void rs_panel_master_inject_extend_poll_pause(uint32_t now_ms, uint8_t cm
      * PROFILE_SET / GET_VERSION → «нет связи» после проверки (~15 с AFTER_OK),
      * восстановление через ~45–90 с. */
     if (cmd == RS_PANEL_CMD_BOOT_SET_UPD_WORD) {
-        /* erase слова 0 — десятки секунд; POLL забивает RX бутлоадера. */
-        add_ms = 45000u;
+        uint32_t word_idx = 0u;
+        if (payload != 0 && plen >= 3u) {
+            word_idx = ((uint32_t)payload[0] << 16) |
+                       ((uint32_t)payload[1] << 8) |
+                       (uint32_t)payload[2];
+        }
+        /* Слово 0: EraseApp — десятки секунд. Дальше program/quad — короткая пауза.
+         * Раньше каждый кадр 156 ставил 45 с → ретраи updater'а продлевали паузу,
+         * а без RxHarvest ACK так и не уходил в WiFi. */
+        add_ms = (word_idx == 0u) ? 45000u : 3000u;
     } else if (cmd == RS_PANEL_CMD_ENTER_BOOTLOADER) {
         add_ms = 5000u;
     } else if (cmd == RS_PANEL_CMD_BOOT_UPD_TRANSMIT) {
@@ -1809,7 +1829,8 @@ static void rs_panel_master_inject_process_pending(RsPanelMaster *master, uint32
     (void)RsBus_SendRaw(&master->bus, item.data, item.len);
     if (RsBus_FrameDecode(item.data, item.len, &view, &consumed) != 0u &&
         rs_panel_inject_cmd_allowed(view.cmd) != 0u) {
-        rs_panel_master_inject_extend_poll_pause(now_ms, view.cmd);
+        rs_panel_master_inject_extend_poll_pause(now_ms, view.cmd,
+                                                 view.payload, view.payload_len);
     }
 }
 
@@ -1877,6 +1898,10 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
     /* Host→RS inject (в т.ч. 0xF3) — вне UART2 IRQ, максимум 1 кадр/тик.
      * Длинная пауза POLL — только после реальной boot-команды (см. extend). */
     if (s_inject_q_count != 0u) {
+        /* Снять предыдущий ACK из DMA до TX следующего 156 — иначе при частых
+         * ретраях updater'а путь inject всегда return'ит раньше quiet/harvest. */
+        RsBus_RxHarvest(&master->bus);
+        RsPanelV3Master_ProcessDeferred(now_ms);
         rs_panel_master_inject_process_pending(master, now_ms);
         rs_panel_master_arm_bus_quiet(now_ms);
         /* Не делаем POLL в том же тике (half-duplex). */
@@ -1891,7 +1916,10 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
 
     if (s_inject_pause_until_ms != 0u) {
         if ((int32_t)(now_ms - s_inject_pause_until_ms) < 0) {
-            /* Тишина на RS: ждём ACK бутлоадера, без POLL/UI TX. */
+            /* Тишина TX/POLL, но RX обязателен: ACK 156/ACTIVITY бута → WiFi/ПО.
+             * Без harvest DMA копит ответы, updater видит «нет ACK» после слова 0. */
+            RsBus_RxHarvest(&master->bus);
+            RsPanelV3Master_ProcessDeferred(now_ms);
             g_rs_master_dbg.inject_pause_active = 1u;
             g_rs_master_dbg.inject_pause_until_ms = s_inject_pause_until_ms;
             RsPanelMasterDebug_Timer10ms();
