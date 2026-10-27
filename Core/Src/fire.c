@@ -80,6 +80,9 @@ extern uint8_t g_active_devices_count;
 
 #define FIRE_LOG_PAUSE_SRC_PANEL             0u
 #define FIRE_LOG_PAUSE_SRC_CAN               1u
+/* additional[4] у кодов 14/23 и additional[1] у 24/25: вид источника. */
+#define FIRE_LOG_SRC_KIND_PANEL              0u
+#define FIRE_LOG_SRC_KIND_CAN                1u
 
 typedef enum {
 	FIRE_STATE_IDLE = 0,
@@ -186,6 +189,24 @@ static uint8_t g_fire_bus_cmd_zone = 0u;
 static uint8_t g_fire_bus_cmd_launch_type = 0u;
 /* 1 = Transition вызван с физической панели (не с CAN-кнопки). */
 static uint8_t g_fire_panel_btn_source = 0u;
+/* Контекст источника для записи в журнал (кнопки / пауза). */
+static uint8_t g_fire_log_src_kind = FIRE_LOG_SRC_KIND_PANEL;
+static uint8_t g_fire_log_panel_addr = 0u;
+static uint32_t g_fire_log_can_header = 0u;
+
+static void Fire_LogSrcSetPanel(uint8_t panel_addr)
+{
+	g_fire_log_src_kind = FIRE_LOG_SRC_KIND_PANEL;
+	g_fire_log_panel_addr = panel_addr;
+	g_fire_log_can_header = 0u;
+}
+
+static void Fire_LogSrcSetCan(uint32_t msg_id)
+{
+	g_fire_log_src_kind = FIRE_LOG_SRC_KIND_CAN;
+	g_fire_log_panel_addr = 0u;
+	g_fire_log_can_header = msg_id & 0x1FFFFFFFu;
+}
 #if GOST_MODE
 typedef struct {
 	uint8_t used;
@@ -1088,10 +1109,13 @@ static void Fire_LogPanelButton(uint8_t button, uint8_t zone, uint8_t hold_s)
 
 	memset(&payload, 0, sizeof(payload));
 	payload.master_wagon_num = Fire_LogMasterWagon();
+	payload.can_header = g_fire_log_can_header;
 	payload.additional[0] = button;
 	payload.additional[1] = zone & 0x7Fu;
 	payload.additional[2] = Fire_LogZoneModeByte(zone);
 	payload.additional[3] = hold_s;
+	payload.additional[4] = g_fire_log_src_kind;
+	payload.additional[5] = g_fire_log_panel_addr;
 	(void)EventLog_Post(EVENT_LOG_PANEL_BUTTON, &payload);
 }
 
@@ -1102,9 +1126,12 @@ static void Fire_LogPanelBtnPress(uint8_t button, uint8_t zone)
 
 	memset(&payload, 0, sizeof(payload));
 	payload.master_wagon_num = Fire_LogMasterWagon();
+	payload.can_header = g_fire_log_can_header;
 	payload.additional[0] = button;
 	payload.additional[1] = zone & 0x7Fu;
 	payload.additional[2] = Fire_LogZoneModeByte(zone);
+	payload.additional[4] = g_fire_log_src_kind;
+	payload.additional[5] = g_fire_log_panel_addr;
 	(void)EventLog_Post(EVENT_LOG_PANEL_BTN_PRESS, &payload);
 }
 
@@ -1114,9 +1141,11 @@ static void Fire_LogCountdownPause(uint8_t zone, uint8_t source)
 
 	memset(&payload, 0, sizeof(payload));
 	payload.master_wagon_num = Fire_LogMasterWagon();
+	payload.can_header = (source == FIRE_LOG_PAUSE_SRC_CAN) ? g_fire_log_can_header : 0u;
 	payload.additional[0] = zone & 0x7Fu;
 	payload.additional[1] = source;
 	payload.additional[2] = Fire_LogZoneModeByte(zone);
+	payload.additional[3] = (source == FIRE_LOG_PAUSE_SRC_PANEL) ? g_fire_log_panel_addr : 0u;
 	(void)EventLog_Post(EVENT_LOG_COUNTDOWN_PAUSE, &payload);
 }
 
@@ -1126,9 +1155,11 @@ static void Fire_LogCountdownResume(uint8_t zone, uint8_t source)
 
 	memset(&payload, 0, sizeof(payload));
 	payload.master_wagon_num = Fire_LogMasterWagon();
+	payload.can_header = (source == FIRE_LOG_PAUSE_SRC_CAN) ? g_fire_log_can_header : 0u;
 	payload.additional[0] = zone & 0x7Fu;
 	payload.additional[1] = source;
 	payload.additional[2] = Fire_LogZoneModeByte(zone);
+	payload.additional[3] = (source == FIRE_LOG_PAUSE_SRC_PANEL) ? g_fire_log_panel_addr : 0u;
 	(void)EventLog_Post(EVENT_LOG_COUNTDOWN_RESUME, &payload);
 }
 
@@ -1142,6 +1173,7 @@ static void Fire_LogFireReset(uint8_t zone, uint8_t source)
 	payload.additional[0] = zone & 0x7Fu;
 	payload.additional[1] = source; /* 0=gost_panel_hold_stop */
 	payload.additional[2] = Fire_LogZoneModeByte(zone);
+	payload.additional[3] = g_fire_log_panel_addr; /* RS-адрес панели, если известен */
 	(void)EventLog_Post(EVENT_LOG_FIRE_RESET, &payload);
 }
 
@@ -2757,6 +2789,9 @@ void Fire_Timer10ms(void)
 	uint32_t now_ms = HAL_GetTick();
 	uint8_t panel_small = RsPanelMaster_IsSmallPanel();
 
+	/* Локальный/агрегированный опрос кнопок: адрес конкретной панели неизвестен. */
+	Fire_LogSrcSetPanel(0u);
+
 	/* ПУСК ОБЩИЙ обрабатываем даже во время config-сессии: удержание поднимает
 	 * all_hold_active, UI возвращает на главный экран со счётчиком 3с. */
 	if (panel_small == 0u) {
@@ -2991,13 +3026,14 @@ void Fire_OnBusStartSpButton(uint32_t msg_id)
 	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
-	/* MKU button StartSP: broadcast d_type/h/l=0, cmd 163. */
-	if (!Backend_IsIgniterBroadcastId(msg_id)) {
-		return;
-	}
+	/* Внешняя кнопка StartSP (cmd 163): ID в can_header (после фикса MCU) или
+	 * legacy broadcast d_type/h/l=0. */
 	bus_sp_cnt++;
-	/* Тот же вход, что панель с zone=0 (все awaiting, без стрелочного выбора). */
-	Fire_OnPanelStartSp(0u);
+	Fire_LogSrcSetCan(msg_id);
+	Fire_ApplyPanelZoneSelect(0u);
+	g_fire_panel_btn_source = 1u;
+	Fire_Transition(FIRE_EVENT_BTN_START_SP, HAL_GetTick());
+	g_fire_panel_btn_source = 0u;
 }
 
 void Fire_OnStartExtinguishment(uint32_t msg_id, const uint8_t *msg_data)
@@ -3048,7 +3084,7 @@ void Fire_OnPauseExtinguishmentTimer(uint32_t msg_id)
 	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
-	(void)msg_id;
+	Fire_LogSrcSetCan(msg_id);
 	Fire_PauseCountdownAndDispatch(HAL_GetTick());
 }
 
@@ -3057,7 +3093,7 @@ void Fire_OnResumeExtinguishmentTimer(uint32_t msg_id)
 	if (MenuUi_IsFaultFireBlocked()) {
 		return;
 	}
-	(void)msg_id;
+	Fire_LogSrcSetCan(msg_id);
 	Fire_ResumeCountdownAndDispatch(HAL_GetTick());
 }
 
@@ -3161,36 +3197,40 @@ static void Fire_ApplyPanelZoneSelect(uint8_t zone)
 	g_fire_ui_manual_select_enabled = 0u;
 }
 
-void Fire_OnPanelStartAllCommit(void)
+void Fire_OnPanelStartAllCommit(uint8_t panel_addr)
 {
 	uint32_t now = HAL_GetTick();
+	Fire_LogSrcSetPanel(panel_addr);
 	g_fire_panel_btn_source = 1u;
 	Fire_Transition(FIRE_EVENT_BTN_START_ALL, now);
 	g_fire_panel_btn_source = 0u;
 }
 static volatile uint32_t sp_cnt = 0;
-void Fire_OnPanelStartSp(uint8_t zone)
+void Fire_OnPanelStartSp(uint8_t zone, uint8_t panel_addr)
 {
 	sp_cnt++;
 	uint32_t now = HAL_GetTick();
+	Fire_LogSrcSetPanel(panel_addr);
 	Fire_ApplyPanelZoneSelect(zone);
 	g_fire_panel_btn_source = 1u;
 	Fire_Transition(FIRE_EVENT_BTN_START_SP, now);
 	g_fire_panel_btn_source = 0u;
 }
 
-void Fire_OnPanelStopLaunch(uint8_t zone)
+void Fire_OnPanelStopLaunch(uint8_t zone, uint8_t panel_addr)
 {
 	uint32_t now = HAL_GetTick();
+	Fire_LogSrcSetPanel(panel_addr);
 	Fire_ApplyPanelZoneSelect(zone);
 	g_fire_panel_btn_source = 1u;
 	Fire_Transition(FIRE_EVENT_BTN_STOP, now);
 	g_fire_panel_btn_source = 0u;
 }
 
-void Fire_OnPanelFireReset(uint8_t zone)
+void Fire_OnPanelFireReset(uint8_t zone, uint8_t panel_addr)
 {
 	uint32_t now = HAL_GetTick();
+	Fire_LogSrcSetPanel(panel_addr);
 	Fire_ApplyPanelZoneSelect(zone);
 #if GOST_MODE
 	g_fire_panel_btn_source = 1u;

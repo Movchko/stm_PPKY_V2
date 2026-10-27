@@ -162,10 +162,36 @@ typedef struct {
 	uint8_t rx_can1_cnt;
 	uint8_t rx_can2_cnt;
 	uint8_t latched;
+	uint8_t fault_expected; /* место N (ожидаемый вес) */
+	uint8_t fault_actual;   /* место M (фактический вес) */
 } PositionFaultDebounce;
 
 static PositionFaultDebounce g_position_debounce[POSITION_MAX_HADR + 1u];
 static uint32_t g_position_fault_mask = 0u;
+
+/* Одно «место» для UI/лога: предпочитаем сторону CAN1; если она совпала — CAN2. */
+static void Position_PickPlaces(const PositionRxInfo *rx, uint8_t exp_a, uint8_t exp_b,
+				uint8_t can1_ok, uint8_t can2_ok,
+				uint8_t *out_exp, uint8_t *out_act)
+{
+	if (can1_ok != 0u && can2_ok != 0u) {
+		if (rx->w_can1 != exp_a) {
+			*out_exp = exp_a;
+			*out_act = rx->w_can1;
+		} else {
+			*out_exp = exp_b;
+			*out_act = rx->w_can2;
+		}
+		return;
+	}
+	if (can1_ok != 0u) {
+		*out_exp = exp_a;
+		*out_act = rx->w_can1;
+		return;
+	}
+	*out_exp = exp_b;
+	*out_act = rx->w_can2;
+}
 
 #define POSITION_FAULT_CONFIRM_MS 3000u
 #define POSITION_FAULT_CONFIRM_RX 3u
@@ -1078,6 +1104,9 @@ void Position_EvaluateMismatch(uint32_t now_ms)
 		uint8_t match = Position_WeightsMatch(rx, exp_a, exp_b, can1_ok, can2_ok);
 
 		if (match == 0u) {
+			uint8_t place_exp = 0u;
+			uint8_t place_act = 0u;
+			Position_PickPlaces(rx, exp_a, exp_b, can1_ok, can2_ok, &place_exp, &place_act);
 			if (db->latched == 0u) {
 				if (db->phase_since_ms == 0u) {
 					PositionDebounce_StartPhase(db, rx, now_ms, can1_ok, can2_ok);
@@ -1088,9 +1117,14 @@ void Position_EvaluateMismatch(uint32_t now_ms)
 							       can1_ok, can2_ok,
 							       POSITION_FAULT_CONFIRM_RX) != 0u) {
 					db->latched = 1u;
+					db->fault_expected = place_exp;
+					db->fault_actual = place_act;
 					PositionDebounce_ResetPhase(db);
 				}
 			} else {
+				/* Пока неисправность активна — обновляем N/M свежими весами. */
+				db->fault_expected = place_exp;
+				db->fault_actual = place_act;
 				PositionDebounce_ResetPhase(db);
 			}
 		} else {
@@ -1104,6 +1138,8 @@ void Position_EvaluateMismatch(uint32_t now_ms)
 							       can1_ok, can2_ok,
 							       POSITION_FAULT_CLEAR_RX) != 0u) {
 					db->latched = 0u;
+					db->fault_expected = 0u;
+					db->fault_actual = 0u;
 					PositionDebounce_ResetPhase(db);
 				}
 			} else {
@@ -1122,6 +1158,23 @@ void Position_EvaluateMismatch(uint32_t now_ms)
 uint32_t Position_GetFaultMask(void)
 {
 	return g_position_fault_mask;
+}
+
+uint8_t Position_GetFaultPlaces(uint8_t h_adr, uint8_t *expected_place, uint8_t *actual_place)
+{
+	if (h_adr == 0u || h_adr > POSITION_MAX_HADR) {
+		return 0u;
+	}
+	if ((g_position_fault_mask & (1u << (h_adr - 1u))) == 0u) {
+		return 0u;
+	}
+	if (expected_place != 0) {
+		*expected_place = g_position_debounce[h_adr].fault_expected;
+	}
+	if (actual_place != 0) {
+		*actual_place = g_position_debounce[h_adr].fault_actual;
+	}
+	return 1u;
 }
 
 void App_CanTxProcess(void)

@@ -179,6 +179,53 @@ static void FormatZoneOnlyDetail(char *out, size_t out_sz, uint8_t zone)
 	}
 }
 
+/* Источник кнопки/паузы: панель RS (panel_addr) или CAN-устройство (can_header). */
+static void FormatActionSourceDetail(char *out, size_t out_sz,
+				     uint8_t zone,
+				     uint8_t src_kind_panel0_can1,
+				     uint8_t panel_addr,
+				     uint32_t can_header)
+{
+	char zone_part[ZONE_NAME_SIZE + 8];
+	char src_part[40];
+
+	if (zone != 0u) {
+		char zone_name[ZONE_NAME_SIZE + 1];
+		GetZoneName(zone, zone_name, sizeof(zone_name));
+		snprintf(zone_part, sizeof(zone_part), "%s ", zone_name);
+	} else {
+		zone_part[0] = '\0';
+	}
+
+	if (src_kind_panel0_can1 == 0u) {
+		if (panel_addr != 0u) {
+			snprintf(src_part, sizeof(src_part), "ПАН.%u", (unsigned)panel_addr);
+		} else {
+			snprintf(src_part, sizeof(src_part), "ПАНЕЛЬ");
+		}
+	} else if (can_header != 0u) {
+		uint8_t z = 0u;
+		uint8_t h = 0u;
+		uint8_t l = 0u;
+		uint8_t dt = 0u;
+		ParseCanHeader(can_header, &z, &h, &l, &dt);
+		if (IsVdevDType(dt)) {
+			snprintf(src_part, sizeof(src_part), "%s%u МКУ%u",
+				 ChannelTypeShort(dt), (unsigned)l, (unsigned)h);
+		} else if (IsMcuDType(dt)) {
+			snprintf(src_part, sizeof(src_part), "%s %u",
+				 McuTypeName(dt), (unsigned)h);
+		} else {
+			snprintf(src_part, sizeof(src_part), "CAN %u/%u/%u",
+				 (unsigned)z, (unsigned)h, (unsigned)l);
+		}
+	} else {
+		snprintf(src_part, sizeof(src_part), "CAN");
+	}
+
+	snprintf(out, out_sz, "%s%s", zone_part, src_part);
+}
+
 static uint8_t LookupMcuDType(uint8_t zone, uint8_t h_adr, uint8_t fallback)
 {
 	uint8_t i;
@@ -285,7 +332,11 @@ static void FormatDeviceFaultDetail(const EventLogRecord_t *rec, char *detail, s
 	ParseCanHeader(rec->can_header, &zone, &h_adr, &l_adr, &d_type);
 
 	if (fc == ELUI_FC_POSITION) {
-		snprintf(detail, detail_sz, "МКУ %u", (unsigned)(ch != 0u ? ch : rec->can_data[0]));
+		uint8_t ha = (ch != 0u) ? ch : rec->can_data[0];
+		snprintf(detail, detail_sz, "МКУ %u ожид.%u сейч.%u",
+			 (unsigned)ha,
+			 (unsigned)rec->can_data[1],
+			 (unsigned)rec->can_data[2]);
 		return;
 	}
 
@@ -502,30 +553,31 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 	case EVENT_LOG_EXTINGUISH_FORCE_STOP:
 	case EVENT_LOG_EXTINGUISH_COMPLETE:
 	case EVENT_LOG_EXTINGUISH_INCOMPLETE:
-	case EVENT_LOG_FIRE_RESET:
 		if (rec->event_code == EVENT_LOG_EXTINGUISH_START) {
 			FormatZoneOnlyDetail(detail, detail_sz, a[1]);
 		} else if (rec->event_code == EVENT_LOG_EXTINGUISH_FORCE_STOP) {
 			FormatZoneOnlyDetail(detail, detail_sz, a[1]);
 		} else if (rec->event_code == EVENT_LOG_EXTINGUISH_COMPLETE) {
 			FormatZoneOnlyDetail(detail, detail_sz, a[3]);
-		} else if (rec->event_code == EVENT_LOG_EXTINGUISH_INCOMPLETE) {
-			FormatZoneOnlyDetail(detail, detail_sz, a[2]);
 		} else {
-			FormatZoneOnlyDetail(detail, detail_sz, a[0]);
+			FormatZoneOnlyDetail(detail, detail_sz, a[2]);
 		}
+		break;
+	case EVENT_LOG_FIRE_RESET:
+		/* additional[0]=zone, [3]=panel_addr (RS); источник — только панель. */
+		FormatActionSourceDetail(detail, detail_sz, a[0], 0u, a[3], 0u);
 		break;
 	case EVENT_LOG_PANEL_BUTTON:
 	case EVENT_LOG_PANEL_BTN_PRESS:
-		if (a[1] != 0u) {
-			FormatZoneOnlyDetail(detail, detail_sz, a[1]);
-		} else {
-			FormatPpkyDetail(detail, detail_sz);
-		}
+		/* [4]=src_kind 0 панель/1 CAN, [5]=panel_addr; can_header при CAN. */
+		FormatActionSourceDetail(detail, detail_sz, a[1], a[4], a[5],
+					rec->can_header);
 		break;
 	case EVENT_LOG_COUNTDOWN_PAUSE:
 	case EVENT_LOG_COUNTDOWN_RESUME:
-		FormatZoneOnlyDetail(detail, detail_sz, a[0]);
+		/* [1]=0 панель/1 CAN, [3]=panel_addr при панели; can_header при CAN. */
+		FormatActionSourceDetail(detail, detail_sz, a[0], a[1], a[3],
+					rec->can_header);
 		break;
 	case EVENT_LOG_MASTER_START:
 	case EVENT_LOG_MASTER_STOP:

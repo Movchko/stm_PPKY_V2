@@ -107,7 +107,8 @@ const char *GetAppVersion(void)
     static char ver_buf[64];
     /* fw: версия прошивки (пока константа) */
     //(void)snprintf(ver_buf, sizeof(ver_buf), "БСУ 04 версия программной части %u", (unsigned)APP_VERSION_U32);
-    (void)snprintf(ver_buf, sizeof(ver_buf), "04");
+    //(void)snprintf(ver_buf, sizeof(ver_buf), "04");
+    (void)snprintf(ver_buf, sizeof(ver_buf), "04 v.%u", (unsigned)APP_VERSION_U32);
     return ver_buf;
 }
 

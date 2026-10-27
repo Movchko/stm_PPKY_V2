@@ -338,6 +338,8 @@ static void EventLog_PostDeviceFaultItem(const WarningItem& it, uint8_t cleared)
 		payload.can_header = BuildFaultCanHeader(DEVICE_PPKY_TYPE,
 							 PPKYConfig.UId.devId.h_adr, 0u, 0u);
 		payload.can_data[0] = it.h_adr;
+		payload.can_data[1] = (uint8_t)(it.extra & 0xFFu);           /* N ожидаемое место */
+		payload.can_data[2] = (uint8_t)(((uint16_t)it.extra >> 8) & 0xFFu); /* M фактическое */
 		payload.additional[1] = it.h_adr;
 	}
 
@@ -993,11 +995,16 @@ static void SyncMkuPositionFaultItems(uint32_t now_ms)
 	}
 
 	for (uint8_t ha = 1u; ha <= 32u; ha++) {
+		uint8_t place_exp = 0u;
+		uint8_t place_act = 0u;
+		int16_t extra;
 		if ((g_position_fault_mask & (1u << (ha - 1u))) == 0u) {
 			continue;
 		}
+		(void)Position_GetFaultPlaces(ha, &place_exp, &place_act);
+		extra = (int16_t)((uint16_t)place_exp | ((uint16_t)place_act << 8));
 		UpsertItem(WARN_KIND_MCU_POSITION_FAULT, 0u, ha, 0u,
-			   DEVICE_PPKY_TYPE, 0u, 0u, 0u, 0u, now_ms);
+			   DEVICE_PPKY_TYPE, 0u, 0u, 0u, extra, now_ms);
 	}
 }
 
@@ -1183,8 +1190,12 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 			snprintf(big_titles[count], WARN_TITLE_LEN, "%s CAN%u", fault, (unsigned)it.can_idx);
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
 		} else if (it.kind == WARN_KIND_MCU_POSITION_FAULT) {
+			uint8_t place_exp = (uint8_t)(it.extra & 0xFFu);
+			uint8_t place_act = (uint8_t)(((uint16_t)it.extra >> 8) & 0xFFu);
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ПОЗИЦИЯ");
-			snprintf(details[count], ZONE_NAME_SIZE + 1, "МКУ %u", (unsigned)it.h_adr);
+			snprintf(details[count], ZONE_NAME_SIZE + 1,
+				 "МКУ %u ожид.%u сейч.%u",
+				 (unsigned)it.h_adr, (unsigned)place_exp, (unsigned)place_act);
 		} else if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ЖУРНАЛ RS");
 			snprintf(details[count], ZONE_NAME_SIZE + 1, "ПАНЕЛЬ %u", (unsigned)it.h_adr);

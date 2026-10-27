@@ -1413,16 +1413,16 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev,
 
     switch (ev->type) {
     case RS_PANEL_V3_EVT_START_ALL_COMMIT:
-        Fire_OnPanelStartAllCommit();
+        Fire_OnPanelStartAllCommit(RsPanelMaster_GetPanelAddr(panel_idx));
         break;
     case RS_PANEL_V3_EVT_START_SP:
-        Fire_OnPanelStartSp(ev->zone);
+        Fire_OnPanelStartSp(ev->zone, RsPanelMaster_GetPanelAddr(panel_idx));
         break;
     case RS_PANEL_V3_EVT_STOP_LAUNCH:
-        Fire_OnPanelStopLaunch(ev->zone);
+        Fire_OnPanelStopLaunch(ev->zone, RsPanelMaster_GetPanelAddr(panel_idx));
         break;
     case RS_PANEL_V3_EVT_FIRE_RESET:
-        Fire_OnPanelFireReset(ev->zone);
+        Fire_OnPanelFireReset(ev->zone, RsPanelMaster_GetPanelAddr(panel_idx));
         break;
     case RS_PANEL_V3_EVT_SOUND_SET:
         if (PPKYConfig.beep_block != 0u) {

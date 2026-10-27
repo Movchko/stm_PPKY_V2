@@ -56,11 +56,11 @@ uint8_t Fire_UiGetSelectedIndex(void);
 /* Смена zone_fire_mode[] (меню РЕЖИМ ЗОН). */
 void Fire_NotifyZoneModeChanged(void);
 
-/* События с панели (протокол v3): zone=0 — все зоны. */
-void Fire_OnPanelStartAllCommit(void);
-void Fire_OnPanelStartSp(uint8_t zone);
-void Fire_OnPanelStopLaunch(uint8_t zone);
-void Fire_OnPanelFireReset(uint8_t zone);
+/* События с панели (протокол v3): zone=0 — все зоны. panel_addr — RS-адрес панели 1..8. */
+void Fire_OnPanelStartAllCommit(uint8_t panel_addr);
+void Fire_OnPanelStartSp(uint8_t zone, uint8_t panel_addr);
+void Fire_OnPanelStopLaunch(uint8_t zone, uint8_t panel_addr);
+void Fire_OnPanelFireReset(uint8_t zone, uint8_t panel_addr);
 
 /* Снимок зон для POLL v3 (ZONES). */
 void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms);

@@ -97,6 +97,9 @@ void App_PositionRxFromCan(uint32_t msg_id, const uint8_t *msg_data, uint8_t can
 
 void Position_EvaluateMismatch(uint32_t now_ms);
 uint32_t Position_GetFaultMask(void);
+/* Для latched позиции: ожидаемое (N) и фактическое (M) место (веса кольца, 0-based).
+ * Возвращает 1, если h_adr в маске неисправности. */
+uint8_t Position_GetFaultPlaces(uint8_t h_adr, uint8_t *expected_place, uint8_t *actual_place);
 
 #ifdef __cplusplus
 }
