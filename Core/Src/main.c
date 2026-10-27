@@ -25,7 +25,6 @@
 #include "app.hpp"
 #include "can_bus.h"
 #include "menu_ui.h"
-#include "fw_update.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -204,9 +203,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   if(isFlash == true) {
 	  AppInit();
-	  /* Сразу после старта: SetApp(MAIN,UPDATE) стирает сектор с Program WD.
-	   * Без флага бутлоадер при следующем reset делает SetDefaultBoot() → откат на заводскую. */
-	  Boot_WriteProgramWatchDog();
+	  /* Program WD пишет AppTimer10ms через ~3 с (см. app.cpp): проверка, что
+	   * приложение реально крутится. Ранняя запись здесь отключила бы откат
+	   * бутлоадера при зависании сразу после AppInit. */
 
 	  HAL_TIM_Base_Start_IT(&htim1);
 	  HAL_TIM_Base_Start_IT(&htim2);
@@ -253,23 +252,10 @@ int main(void)
 	 CanProcess();
 	 App_CanTxProcess();
 
-	 /* Раз в минуту сохраняем текущую дату/время в свободный BKP-регистр RTC.
-	  * Формат хранения: 0xMMDDHHmm (BCD) в RTC_BKP_DR1. */
+	 /* Раз в минуту — метка RTC в BKP DR1 (MMDDHHmm) + DR2 (год/сек) для MASTER_STOP. */
 	 if ((cur_tick - last_rtc_bkp_tick) >= RTC_PING_PERIOD_S) {
 		 last_rtc_bkp_tick = cur_tick;
-
-		 RTC_TimeTypeDef rtc_time;
-		 RTC_DateTypeDef rtc_date;
-		 if (HAL_RTC_GetTime(&hrtc, &rtc_time, RTC_FORMAT_BCD) == HAL_OK &&
-		     HAL_RTC_GetDate(&hrtc, &rtc_date, RTC_FORMAT_BCD) == HAL_OK) {
-			 uint32_t packed =
-					 ((uint32_t)rtc_date.Month << 24) |
-					 ((uint32_t)rtc_date.Date  << 16) |
-					 ((uint32_t)rtc_time.Hours << 8)  |
-					 ((uint32_t)rtc_time.Minutes)  ;
-			 HAL_PWR_EnableBkUpAccess();
-			 HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, packed);
-		 }
+		 PPKY_SaveLastRunRtcStamp();
 	 }
   }
   /* USER CODE END 3 */

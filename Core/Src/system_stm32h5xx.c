@@ -143,7 +143,8 @@
 /*!< Uncomment the following line if you need to relocate your vector Table in
      Internal SRAM. */
 /* #define VECT_TAB_SRAM */
-#define VECT_TAB_OFFSET  0x0000U/*0xC000U*/ /*!< Vector Table base offset field.
+/* App @ MAIN_APP_START_ADDR 0x0800C000 (boot_layout.h); boot sets VTOR then app keeps it. */
+#define VECT_TAB_OFFSET  0xC000U /*!< Vector Table base offset field.
                                    This value must be a multiple of 0x200. */
 /******************************************************************************/
 

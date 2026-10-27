@@ -52,6 +52,8 @@ bool EventLog_Post(uint16_t code, const EventLogPayload_t *payload);
 bool EventLog_PostAt(const uint8_t time_bcd[6], uint16_t code, const EventLogPayload_t *payload);
 
 void EventLog_LogMasterBoot(void);
+/* После SetSystemTime: дописать отложенный MASTER_START и обновить BKP-метку. */
+void EventLog_OnSystemTimeSet(void);
 void EventLog_LogCanTelemetry(uint32_t can_id, const uint8_t *data);
 void EventLog_LogHostLink(uint8_t media);
 void EventLog_HostLinkSessionReset(uint8_t media);

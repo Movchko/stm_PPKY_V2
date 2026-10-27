@@ -19,6 +19,37 @@ typedef struct {
 } UpdateBinFooter;
 
 _Static_assert(sizeof(UpdateBinFooter) == FLASH_FOOTER_SZ, "footer size");
+/* SPI: CFG(128K) | FACTORY(512K) | UPDATE(512K) | LOG… — без дыр и перекрытий. */
+_Static_assert((FLASH_CFG_ERASE_BLOCKS * 0x10000u) == FLASH_FW_FACTORY_ADDR,
+               "cfg end must equal factory start");
+_Static_assert((FLASH_FW_FACTORY_ADDR + FLASH_FW_SLOT_SIZE) == FLASH_FW_UPDATE_ADDR,
+               "factory end must equal update start");
+_Static_assert((FLASH_FW_UPDATE_ADDR + FLASH_FW_SLOT_SIZE) ==
+               (FLASH_LOG_START_SECTOR * 4096u),
+               "update end must equal log start");
+_Static_assert((MAIN_APP_SIZE + FLASH_FOOTER_SZ) <= FLASH_FW_SLOT_SIZE,
+               "app+footer must fit update slot");
+
+static uint8_t s_upd_log_mute = 0u;
+static uint32_t s_upd_last_pkt_ms = 0u;
+
+static void FwUpdate_NotePacket(void)
+{
+	s_upd_log_mute = 1u;
+	s_upd_last_pkt_ms = HAL_GetTick();
+}
+
+uint8_t FwUpdate_IsEventLogMuted(void)
+{
+	if (s_upd_log_mute == 0u) {
+		return 0u;
+	}
+	if ((HAL_GetTick() - s_upd_last_pkt_ms) >= FW_UPDATE_LOG_MUTE_MS) {
+		s_upd_log_mute = 0u;
+		return 0u;
+	}
+	return 1u;
+}
 
 static const uint32_t s_crc32_tab[256] = {
 	0x00000000u, 0x77073096u, 0xee0e612cu, 0x990951bau, 0x076dc419u, 0x706af48fu,
@@ -135,8 +166,8 @@ static uint8_t EraseUpdateSlot(void)
 
 void Boot_WriteProgramWatchDog(void)
 {
-	//TODO: delete return
-		return;
+	/* Program WD @ 0x0800BFBC (qword 0x0800BFB0): соседствует с footer 0x0800BFC0,
+	 * не пересекается. После SetApp(MAIN) сектор стёрт — первая запись в 0xFF. */
 	uint32_t quad_word[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, WATCHDOG };
 
 	if (*(volatile uint32_t *)BOOT_PROGRAM_WD_ADDR == WATCHDOG) {
@@ -166,6 +197,9 @@ uint8_t SetUpdateWord(uint32_t num, uint32_t word)
 	if (num >= max_words) {
 		return 0u;
 	}
+
+	/* Mute EventLog на время записи UPDATE (та же SPI Flash). */
+	FwUpdate_NotePacket();
 
 	addr = FLASH_FW_UPDATE_ADDR + (num * 4u);
 
@@ -209,6 +243,7 @@ uint8_t GetUpdateWord(uint32_t num, uint32_t *word)
 
 uint8_t FinishUpdateTransmit(void)
 {
+	FwUpdate_NotePacket();
 	/* До reset: если CRC UPDATE не сходится — бутлоадер всё равно откатит/пропустит.
 	 * Не ресетимся, чтобы хост получил NACK (status=0) и не ждал «тишины». */
 	if (!ValidateUpdateSlot()) {

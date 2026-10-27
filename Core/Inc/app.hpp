@@ -55,10 +55,15 @@ extern "C" {
 void FillConfigTemplate(void);
 void ReadSavedConfig(void);
 
-/* Чтение содержимого BKP-регистра RTC с моментом последнего сохранения
- * (месяц/день/часы/минуты). Поля возвращаются в формате RTC (BCD),
- * как в HAL_RTC_GetDate / HAL_RTC_GetTime.
- * Любой из указателей может быть NULL, если часть данных не нужна. */
+/* Метка последнего «живого» RTC для журнала выключения:
+ * DR1 = 0xMMDDHHmm (BCD), DR2 = 0xA5 | SS<<8 | YY (BCD), magic 0xA5 в [31:24]. */
+#define RTC_BKP_YEAR_MAGIC_BYTE  0xA5u
+
+/* Сохранить текущие дату/время RTC в BKP DR1+DR2 (для MASTER_STOP на следующем старте). */
+void PPKY_SaveLastRunRtcStamp(void);
+
+/* Чтение метки: Month/Date/Year и Hours/Minutes/Seconds в BCD (HAL).
+ * Year/Seconds валидны, только если DR2 с magic 0xA5. Указатели могут быть NULL. */
 void PPKY_GetLastPowerOnDate(RTC_DateTypeDef *out_date, RTC_TimeTypeDef *out_time);
 
 #define PPKY_MAX_ACTIVE_VDEVS_PER_MCU 16

@@ -239,24 +239,52 @@ void AplyConfig() {
 
 void USBSendData(uint8_t *Buf) {};
 
+void PPKY_SaveLastRunRtcStamp(void)
+{
+	RTC_TimeTypeDef rtc_time;
+	RTC_DateTypeDef rtc_date;
+
+	if (HAL_RTC_GetTime(&hrtc, &rtc_time, RTC_FORMAT_BCD) != HAL_OK ||
+	    HAL_RTC_GetDate(&hrtc, &rtc_date, RTC_FORMAT_BCD) != HAL_OK) {
+		return;
+	}
+
+	const uint32_t packed_mmddhhmm =
+		((uint32_t)rtc_date.Month << 24) |
+		((uint32_t)rtc_date.Date << 16) |
+		((uint32_t)rtc_time.Hours << 8) |
+		((uint32_t)rtc_time.Minutes);
+	const uint32_t packed_year =
+		((uint32_t)RTC_BKP_YEAR_MAGIC_BYTE << 24) |
+		((uint32_t)rtc_time.Seconds << 8) |
+		((uint32_t)rtc_date.Year & 0xFFu);
+
+	HAL_PWR_EnableBkUpAccess();
+	HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, packed_mmddhhmm);
+	HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, packed_year);
+}
+
 void PPKY_GetLastPowerOnDate(RTC_DateTypeDef *out_date, RTC_TimeTypeDef *out_time)
 {
-	uint32_t v = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
+	const uint32_t v = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
+	const uint32_t y = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+	const uint8_t year_valid =
+		(((y >> 24) & 0xFFu) == RTC_BKP_YEAR_MAGIC_BYTE) ? 1u : 0u;
 
-	/* Формат BKP-регистра: 0xMMDDHHmm (BCD) */
+	/* DR1: 0xMMDDHHmm (BCD). DR2: 0xA5xxxxxx — Year + Seconds. */
 	if (out_date != nullptr) {
 		RTC_DateTypeDef d = {};
-		d.Month = (uint8_t)((v >> 24) & 0xFFu);  // BCD-месяц
-		d.Date  = (uint8_t)((v >> 16) & 0xFFu);  // BCD-день
-		// Год и день недели не сохраняем
+		d.Month = (uint8_t)((v >> 24) & 0xFFu);
+		d.Date = (uint8_t)((v >> 16) & 0xFFu);
+		d.Year = (year_valid != 0u) ? (uint8_t)(y & 0xFFu) : 0u;
 		*out_date = d;
 	}
 
 	if (out_time != nullptr) {
 		RTC_TimeTypeDef t = {};
-		t.Hours   = (uint8_t)((v >> 8)  & 0xFFu);  // BCD-часы
-		t.Minutes = (uint8_t)((v >> 0)  & 0xFFu);  // BCD-минуты
-		// Секунды не сохраняем
+		t.Hours = (uint8_t)((v >> 8) & 0xFFu);
+		t.Minutes = (uint8_t)(v & 0xFFu);
+		t.Seconds = (year_valid != 0u) ? (uint8_t)((y >> 8) & 0xFFu) : 0u;
 		*out_time = t;
 	}
 }
@@ -1283,6 +1311,8 @@ void RcvSetSystemTime(uint8_t *MsgData) {
 	}
 	HAL_RTC_SetDate(&hrtc, &d, RTC_FORMAT_BCD);
 	RtcCache_Refresh();
+	PPKY_SaveLastRunRtcStamp();
+	EventLog_OnSystemTimeSet();
 }
 /*
 uint32_t GetID() {

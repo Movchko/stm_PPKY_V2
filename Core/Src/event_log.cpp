@@ -4,6 +4,7 @@
 #include "device_config.h"
 #include "menu_ui.h"
 #include "backend.h"
+#include "fw_update.h"
 #include "stm32h5xx_hal.h"
 
 #include <string.h>
@@ -83,8 +84,27 @@ static uint32_t EventLog_PackMmDdHhMm(uint8_t month, uint8_t day, uint8_t hours,
 static uint8_t EventLog_DecYearBcd(uint8_t year_bcd)
 {
 	uint8_t val = (uint8_t)(((year_bcd >> 4) & 0x0Fu) * 10u + (year_bcd & 0x0Fu));
-	val = (val > 0u) ? (uint8_t)(val - 1u) : 99u;
+	/* Не уходить в 99 при Year=0 (заводской RTC) — это давало «2099» в журнале. */
+	if (val == 0u) {
+		return 0u;
+	}
+	val = (uint8_t)(val - 1u);
 	return (uint8_t)(((val / 10u) << 4) | (val % 10u));
+}
+
+static bool EventLog_BkpYearPresent(void)
+{
+	const uint32_t y = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+	return (((y >> 24) & 0xFFu) == RTC_BKP_YEAR_MAGIC_BYTE);
+}
+
+static bool EventLog_RtcLooksFactoryDefault(const RTC_TimeTypeDef *t, const RTC_DateTypeDef *d)
+{
+	if (t == NULL || d == NULL) {
+		return true;
+	}
+	return (d->Year == 0u && d->Month == RTC_MONTH_JANUARY && d->Date == 0x01u &&
+		t->Hours == 0u && t->Minutes == 0u && t->Seconds == 0u);
 }
 
 static bool EventLog_ReadLastRunTimeBcd(uint8_t time_bcd[6])
@@ -94,15 +114,42 @@ static bool EventLog_ReadLastRunTimeBcd(uint8_t time_bcd[6])
 	RTC_DateTypeDef cur_date = {};
 	RTC_TimeTypeDef cur_time = {};
 	const uint32_t bkp_raw = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
-	if (time_bcd == NULL || bkp_raw == 0u) return false;
-	PPKY_GetLastPowerOnDate(&bkp_date, &bkp_time);
-	if (!EventLog_BcdFieldValid(bkp_date.Month, 1u, 12u) || !EventLog_BcdFieldValid(bkp_date.Date, 1u, 31u) || !EventLog_BcdFieldValid(bkp_time.Hours, 0u, 23u) || !EventLog_BcdFieldValid(bkp_time.Minutes, 0u, 59u)) return false;
-	if (!RtcCache_GetBcd(&cur_time, &cur_date)) time_bcd[0] = 0u;
-	else {
-		time_bcd[0] = cur_date.Year;
-		if (EventLog_PackMmDdHhMm(cur_date.Month, cur_date.Date, cur_time.Hours, cur_time.Minutes) < EventLog_PackMmDdHhMm(bkp_date.Month, bkp_date.Date, bkp_time.Hours, bkp_time.Minutes)) time_bcd[0] = EventLog_DecYearBcd(cur_date.Year);
+	const uint8_t have_bkp_year = EventLog_BkpYearPresent() ? 1u : 0u;
+
+	if (time_bcd == NULL || bkp_raw == 0u) {
+		return false;
 	}
-	time_bcd[1] = bkp_date.Month; time_bcd[2] = bkp_date.Date; time_bcd[3] = bkp_time.Hours; time_bcd[4] = bkp_time.Minutes; time_bcd[5] = 0u;
+	PPKY_GetLastPowerOnDate(&bkp_date, &bkp_time);
+	if (!EventLog_BcdFieldValid(bkp_date.Month, 1u, 12u) ||
+	    !EventLog_BcdFieldValid(bkp_date.Date, 1u, 31u) ||
+	    !EventLog_BcdFieldValid(bkp_time.Hours, 0u, 23u) ||
+	    !EventLog_BcdFieldValid(bkp_time.Minutes, 0u, 59u)) {
+		return false;
+	}
+
+	if (have_bkp_year != 0u && EventLog_BcdFieldValid(bkp_date.Year, 0u, 99u)) {
+		time_bcd[0] = bkp_date.Year;
+		time_bcd[5] = EventLog_BcdFieldValid(bkp_time.Seconds, 0u, 59u) ? bkp_time.Seconds : 0u;
+	} else if (RtcCache_GetBcd(&cur_time, &cur_date)) {
+		/* Старый BKP без DR2: год из текущих часов + эвристика смены года. */
+		if (EventLog_RtcLooksFactoryDefault(&cur_time, &cur_date)) {
+			/* Нет ни сохранённого года, ни валидного RTC — не пишем STOP с 2099. */
+			return false;
+		}
+		time_bcd[0] = cur_date.Year;
+		if (EventLog_PackMmDdHhMm(cur_date.Month, cur_date.Date, cur_time.Hours, cur_time.Minutes) <
+		    EventLog_PackMmDdHhMm(bkp_date.Month, bkp_date.Date, bkp_time.Hours, bkp_time.Minutes)) {
+			time_bcd[0] = EventLog_DecYearBcd(cur_date.Year);
+		}
+		time_bcd[5] = 0u;
+	} else {
+		return false;
+	}
+
+	time_bcd[1] = bkp_date.Month;
+	time_bcd[2] = bkp_date.Date;
+	time_bcd[3] = bkp_time.Hours;
+	time_bcd[4] = bkp_time.Minutes;
 	return true;
 }
 
@@ -111,6 +158,8 @@ static bool EventLog_PostInternal(const uint8_t *time_bcd, uint16_t code, const 
 	const EventLogDescriptor_t *desc;
 	EventLogTier_t *tier;
 	if (!g_initialized) return false;
+	/* Во время FW update UPDATE-слот и журнал на одной SPI Flash — не пишем. */
+	if (FwUpdate_IsEventLogMuted() != 0u) return true;
 	desc = EventLogCatalog_Find(code);
 	if (desc == NULL) return false;
 	if (desc->debug_only != 0u && g_debug_enabled == 0u) return true;
@@ -136,16 +185,54 @@ const EventLogCapacityInfo_t *EventLog_GetCapacityInfo(void) { return &g_capacit
 bool EventLog_Post(uint16_t code, const EventLogPayload_t *payload) { return EventLog_PostInternal(NULL, code, payload); }
 bool EventLog_PostAt(const uint8_t time_bcd[6], uint16_t code, const EventLogPayload_t *payload) { return (time_bcd == NULL) ? false : EventLog_PostInternal(time_bcd, code, payload); }
 
+static uint8_t s_master_start_pending = 0u;
+
+static void EventLog_PostMasterStartNow(void)
+{
+	EventLogPayload_t payload;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+	payload.additional[0] = 0u;
+	(void)EventLog_Post(EVENT_LOG_MASTER_START, &payload);
+}
+
 void EventLog_LogMasterBoot(void)
 {
 	EventLogPayload_t payload;
 	uint8_t stop_time_bcd[6];
-	if (!g_initialized) return;
+	RTC_TimeTypeDef cur_time = {};
+	RTC_DateTypeDef cur_date = {};
+
+	if (!g_initialized) {
+		return;
+	}
+
+	/* Порядок: сначала выключение предыдущей сессии, затем включение. */
 	memset(&payload, 0, sizeof(payload));
 	payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
-	if (EventLog_ReadLastRunTimeBcd(stop_time_bcd)) { payload.additional[0] = 1u; (void)EventLog_PostAt(stop_time_bcd, EVENT_LOG_MASTER_STOP, &payload); }
-	memset(payload.additional, 0, sizeof(payload.additional)); payload.additional[0] = 0u;
-	(void)EventLog_Post(EVENT_LOG_MASTER_START, &payload);
+	if (EventLog_ReadLastRunTimeBcd(stop_time_bcd)) {
+		payload.additional[0] = 1u;
+		(void)EventLog_PostAt(stop_time_bcd, EVENT_LOG_MASTER_STOP, &payload);
+	}
+
+	s_master_start_pending = 0u;
+	if (RtcCache_GetBcd(&cur_time, &cur_date) &&
+	    !EventLog_RtcLooksFactoryDefault(&cur_time, &cur_date)) {
+		EventLog_PostMasterStartNow();
+	} else {
+		/* RTC ещё 2000-01-01 — START после первой SetSystemTime. */
+		s_master_start_pending = 1u;
+	}
+}
+
+void EventLog_OnSystemTimeSet(void)
+{
+	if (!g_initialized || s_master_start_pending == 0u) {
+		return;
+	}
+	s_master_start_pending = 0u;
+	EventLog_PostMasterStartNow();
 }
 
 void EventLog_LogCanTelemetry(uint32_t can_id, const uint8_t *data)
