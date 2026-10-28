@@ -138,9 +138,12 @@ void FillConfigTemplate(void) {
 	PPKYConfig.UId.devId.zone  = 0;
 	PPKYConfig.UId.devId.l_adr = 0;
 
-	uint8_t hadr = (uint8_t)(uid0 & 0xFF);
+	/* S/N = UId0:UId1:UId2. UId1 и UId2 на одной партии одинаковые.
+	 * В UId0 байты [31:24] и [15:8] нулевые, [7:0] сжат (0x40..0x62),
+	 * [23:16] самый широкий разброс — от него начальный h_adr. */
+	uint8_t hadr = (uint8_t)((uid0 >> 16) & 0xFFu);
 	if (hadr == 0) {
-		hadr = (uint8_t)(uid1 & 0xFF);
+		hadr = (uint8_t)(uid0 & 0xFFu);
 		if (hadr == 0) {
 			hadr = 1; // на всякий случай, чтобы не был 0
 		}
@@ -226,9 +229,12 @@ void DefaultConfig() {
 	PPKYConfig.UId.devId.zone  = 0;
 	PPKYConfig.UId.devId.l_adr = 0;
 
-	uint8_t hadr = (uint8_t)(uid0 & 0xFF);
+	/* S/N = UId0:UId1:UId2. UId1 и UId2 на одной партии одинаковые.
+	 * В UId0 байты [31:24] и [15:8] нулевые, [7:0] сжат (0x40..0x62),
+	 * [23:16] самый широкий разброс — от него начальный h_adr. */
+	uint8_t hadr = (uint8_t)((uid0 >> 16) & 0xFFu);
 	if (hadr == 0) {
-		hadr = (uint8_t)(uid1 & 0xFF);
+		hadr = (uint8_t)(uid0 & 0xFFu);
 		if (hadr == 0) {
 			hadr = 1; // на всякий случай, чтобы не был 0
 		}

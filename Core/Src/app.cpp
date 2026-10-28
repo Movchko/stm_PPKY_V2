@@ -22,7 +22,6 @@
 #include "rs_panel_v3_master.h"
 #include "fire.h"
 #include "warning.h"
-#include "fw_update.h"
 
 #define WARNING_TITLE_LEN 24
 
@@ -572,6 +571,10 @@ static void RelayAuto_OnFireServiceCmd(uint32_t MsgID, uint8_t command)
 
 static uint8_t RelayAuto_IsFaultTriggerInZone(uint8_t zone)
 {
+	/* Любая активная неисправность warning (в т.ч. пропажа панели) — глобальный триггер. */
+	if (Warning_HasActiveFault() != 0u) {
+		return 1u;
+	}
 	for (uint8_t i = 0u; i < g_active_devices_count; i++) {
 		const ActiveDeviceInfo *m = &g_active_devices[i];
 		if (!m->online || ((m->dev.zone & 0x7Fu) != (zone & 0x7Fu))) {
@@ -1230,8 +1233,6 @@ void AppTimerRsBus()
 
 void AppTimer10ms() {
 	uint32_t now = HAL_GetTick();
-	static uint16_t s_app_wd_ticks = 0u;
-	static uint8_t s_app_wd_done = 0u;
 
 	/* Чтение кнопок делаем реже, чтобы не перегружать I2C.
 	 * Теперь Button_Process вызывается раз в ~с (при шаге AppTimer10ms ~10 мс). */
@@ -1265,16 +1266,7 @@ void AppTimer10ms() {
 
 	Fire_Timer10ms();
 	/* RS-опрос панели — AppTimerRsBus() (TIM3 @ 2 кГц), не здесь. */
-
-	/* 300 * 10 мс = 3 с после старта приложения — app WD для бутлоадера ППКУ. */
-	if (s_app_wd_done == 0u) {
-		if (s_app_wd_ticks < 300u) {
-			s_app_wd_ticks++;
-		} else {
-			s_app_wd_done = 1u;
-			Boot_WriteProgramWatchDog();
-		}
-	}
+	/* Program WD (Boot_WriteProgramWatchDog) — только с бутлоадером; сейчас отключён. */
 }
 
 

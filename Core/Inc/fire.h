@@ -61,6 +61,8 @@ void Fire_OnPanelStartAllCommit(uint8_t panel_addr);
 void Fire_OnPanelStartSp(uint8_t zone, uint8_t panel_addr);
 void Fire_OnPanelStopLaunch(uint8_t zone, uint8_t panel_addr);
 void Fire_OnPanelFireReset(uint8_t zone, uint8_t panel_addr);
+/* ESC hold: zone_fire_mode=3 для активного пожара (не phase2). zone=0 — все. */
+void Fire_OnPanelFireLaunchBlock(uint8_t zone, uint8_t panel_addr);
 
 /* Снимок зон для POLL v3 (ZONES). */
 void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms);

@@ -49,6 +49,8 @@ typedef enum {
 	EVENT_LOG_POWER_INPUT_OPEN       = 28, /* ПИТn. ОБРЫВ — питания нет */
 	EVENT_LOG_POWER_INPUT_LOW        = 29, /* ПИТn. НИЖЕ нормы */
 	EVENT_LOG_POWER_INPUT_HIGH       = 30, /* ПИТn. ВЫШЕ нормы */
+	EVENT_LOG_PANEL_LINK             = 31, /* пропажа/восстановление связи с панелью */
+	EVENT_LOG_FIRE_LAUNCH_BLOCK      = 32, /* блокировка пуска активного пожара (ESC) */
 } EventLogCode_t;
 
 typedef struct {

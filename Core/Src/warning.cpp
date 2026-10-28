@@ -59,6 +59,7 @@ constexpr uint8_t WARN_KIND_DEVICE_MISSING = 6u;
 constexpr uint8_t WARN_KIND_DEVICE_FOUND = 7u;
 constexpr uint8_t WARN_KIND_CONFIG_MISMATCH = 8u;
 constexpr uint8_t WARN_KIND_PANEL_JOURNAL_FAULT = 9u;
+constexpr uint8_t WARN_KIND_PANEL_LINK = 10u; /* пропажа связи с панелью */
 constexpr uint8_t WARN_TITLE_MARK_ATTN = 0x01u;
 
 struct WarningItem {
@@ -90,6 +91,12 @@ static uint8_t g_prev_sound_fault_count = 0u;
 static uint8_t g_prev_sound_attention_count = 0u;
 static uint32_t g_position_fault_mask = 0u;
 static uint8_t g_panel_journal_fault_mask = 0u;
+/* Пропажа связи с панелью (бит panel_addr-1). UID — последние известные. */
+static uint8_t g_panel_link_fault_mask = 0u;
+static uint32_t g_panel_link_uid0[8];
+static uint32_t g_panel_link_uid1[8];
+static uint32_t g_panel_link_uid2[8];
+static uint8_t g_panel_link_uid_valid[8];
 
 /* Текстовое имя типа МКУ для отображения в UI предупреждений. */
 static const char* McuTypeName(uint8_t d_type)
@@ -247,7 +254,8 @@ static uint8_t IsFaultKind(uint8_t kind)
 		kind == WARN_KIND_DEVICE_MISSING ||
 		kind == WARN_KIND_DEVICE_FOUND ||
 		kind == WARN_KIND_CONFIG_MISMATCH ||
-		kind == WARN_KIND_PANEL_JOURNAL_FAULT) ? 1u : 0u;
+		kind == WARN_KIND_PANEL_JOURNAL_FAULT ||
+		kind == WARN_KIND_PANEL_LINK) ? 1u : 0u;
 }
 
 static uint32_t BuildFaultCanHeader(uint8_t d_type, uint8_t h_adr, uint8_t l_adr, uint8_t zone)
@@ -310,7 +318,10 @@ static void EventLog_PostDeviceFaultItem(const WarningItem& it, uint8_t cleared)
 {
 	EventLogPayload_t payload;
 
-	if (!IsFaultKind(it.kind) || it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
+	if (!IsFaultKind(it.kind) ||
+	    it.kind == WARN_KIND_PANEL_JOURNAL_FAULT ||
+	    it.kind == WARN_KIND_PANEL_LINK) {
+		/* PANEL_LINK / JOURNAL — отдельный EventLog_Post на фронте, не DEVICE_FAULT. */
 		return;
 	}
 
@@ -774,6 +785,13 @@ static uint8_t IsItemStillFaulty(const WarningItem& it)
 		}
 		return ((g_panel_journal_fault_mask & (1u << (pa - 1u))) != 0u) ? 1u : 0u;
 	}
+	if (it.kind == WARN_KIND_PANEL_LINK) {
+		uint8_t pa = it.h_adr;
+		if (pa == 0u || pa > 8u) {
+			return 0u;
+		}
+		return ((g_panel_link_fault_mask & (1u << (pa - 1u))) != 0u) ? 1u : 0u;
+	}
 	if (it.kind == WARN_KIND_DEVICE_MISSING ||
 	    it.kind == WARN_KIND_DEVICE_FOUND ||
 	    it.kind == WARN_KIND_CONFIG_MISMATCH) {
@@ -1029,6 +1047,27 @@ static void SyncPanelJournalFaultItems(uint32_t now_ms)
 	}
 }
 
+static void SyncPanelLinkFaultItems(uint32_t now_ms)
+{
+	for (uint8_t i = 0u; i < WARN_MAX_ITEMS; i++) {
+		if (!g_items[i].used || g_items[i].kind != WARN_KIND_PANEL_LINK) {
+			continue;
+		}
+		uint8_t pa = g_items[i].h_adr;
+		if (pa == 0u || pa > 8u || ((g_panel_link_fault_mask & (1u << (pa - 1u))) == 0u)) {
+			RemoveItemAt(i);
+		}
+	}
+
+	for (uint8_t pa = 1u; pa <= 8u; pa++) {
+		if ((g_panel_link_fault_mask & (1u << (pa - 1u))) == 0u) {
+			continue;
+		}
+		UpsertItem(WARN_KIND_PANEL_LINK, 0u, pa, 0u,
+			   DEVICE_PPKY_TYPE, 0u, 0u, 0u, 0u, now_ms);
+	}
+}
+
 static void SyncConfigMonitorItems(uint32_t now_ms)
 {
 	for (uint8_t slot = 0u; slot < 32u; slot++) {
@@ -1199,6 +1238,20 @@ static uint8_t BuildUiPayload(char (*big_titles)[WARN_TITLE_LEN], char (*details
 		} else if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ЖУРНАЛ RS");
 			snprintf(details[count], ZONE_NAME_SIZE + 1, "ПАНЕЛЬ %u", (unsigned)it.h_adr);
+		} else if (it.kind == WARN_KIND_PANEL_LINK) {
+			uint8_t pi = (it.h_adr >= 1u && it.h_adr <= 8u) ? (uint8_t)(it.h_adr - 1u) : 0u;
+			snprintf(big_titles[count], WARN_TITLE_LEN, "НЕТ СВЯЗИ");
+			if (it.h_adr >= 1u && it.h_adr <= 8u && g_panel_link_uid_valid[pi] != 0u) {
+				snprintf(details[count], ZONE_NAME_SIZE + 1,
+					 "ПАНЕЛЬ %u S/N:%08lX:%08lX:%08lX",
+					 (unsigned)it.h_adr,
+					 (unsigned long)g_panel_link_uid0[pi],
+					 (unsigned long)g_panel_link_uid1[pi],
+					 (unsigned long)g_panel_link_uid2[pi]);
+			} else {
+				snprintf(details[count], ZONE_NAME_SIZE + 1,
+					 "ПАНЕЛЬ %u", (unsigned)it.h_adr);
+			}
 		} else if (it.kind == WARN_KIND_DEVICE_MISSING) {
 			snprintf(big_titles[count], WARN_TITLE_LEN, "ОТСУСТВ.");
 			Warning_FormatMkuAndSerial(details[count], ZONE_NAME_SIZE + 1, it);
@@ -1450,6 +1503,18 @@ static uint8_t Warning_AppendV3FaultFromItem(const WarningItem& it, RsPanelV3Fau
 	} else if (it.kind == WARN_KIND_PANEL_JOURNAL_FAULT) {
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_PANEL_JOURNAL;
 		fe.panel_addr = it.h_adr;
+	} else if (it.kind == WARN_KIND_PANEL_LINK) {
+		uint8_t pi = (it.h_adr >= 1u && it.h_adr <= 8u) ? (uint8_t)(it.h_adr - 1u) : 0u;
+		fe.code = (uint8_t)RS_PANEL_V3_FAULT_PANEL_LINK;
+		fe.panel_addr = it.h_adr;
+		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
+		fe.mcu.h_adr = it.h_adr;
+		fe.mcu.l_adr = 0u;
+		if (it.h_adr >= 1u && it.h_adr <= 8u && g_panel_link_uid_valid[pi] != 0u) {
+			fe.mcu.uid0 = g_panel_link_uid0[pi];
+			fe.mcu.uid1 = g_panel_link_uid1[pi];
+			fe.mcu.uid2 = g_panel_link_uid2[pi];
+		}
 	} else if (it.kind == WARN_KIND_DEVICE_MISSING) {
 		fe.code = (uint8_t)RS_PANEL_V3_FAULT_DEVICE_MISSING;
 		fe.flags = RS_PANEL_V3_FAULT_FLAG_HAS_MCU;
@@ -1588,6 +1653,7 @@ extern "C" void WarningProcess1ms(void)
 	SyncPpkuCanFaultItems(now_ms);
 	SyncMkuPositionFaultItems(now_ms);
 	SyncPanelJournalFaultItems(now_ms);
+	SyncPanelLinkFaultItems(now_ms);
 	SyncConfigMonitorItems(now_ms);
 	UpdateDebouncedPowerFaults(now_ms);
 	ProcessPendingConfirmations(now_ms);
@@ -1652,6 +1718,30 @@ extern "C" void Warning_SetMkuPositionFaultMask(uint32_t mask)
 extern "C" void Warning_SetPanelJournalFaultMask(uint8_t mask)
 {
 	g_panel_journal_fault_mask = mask;
+}
+
+extern "C" void Warning_SetPanelLinkFault(uint8_t panel_addr, uint8_t lost,
+					  uint32_t uid0, uint32_t uid1, uint32_t uid2,
+					  uint8_t uid_valid)
+{
+	uint8_t bit;
+	uint8_t pi;
+	if (panel_addr < 1u || panel_addr > 8u) {
+		return;
+	}
+	pi = (uint8_t)(panel_addr - 1u);
+	bit = (uint8_t)(1u << pi);
+	if (uid_valid != 0u) {
+		g_panel_link_uid0[pi] = uid0;
+		g_panel_link_uid1[pi] = uid1;
+		g_panel_link_uid2[pi] = uid2;
+		g_panel_link_uid_valid[pi] = 1u;
+	}
+	if (lost != 0u) {
+		g_panel_link_fault_mask = (uint8_t)(g_panel_link_fault_mask | bit);
+	} else {
+		g_panel_link_fault_mask = (uint8_t)(g_panel_link_fault_mask & (uint8_t)~bit);
+	}
 }
 
 extern "C" uint8_t Warning_HasActiveFault(void)

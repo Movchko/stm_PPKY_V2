@@ -488,6 +488,12 @@ static void FormatTitle(const EventLogRecord_t *rec, char *title, size_t title_s
 	case EVENT_LOG_ZONE_NAME:
 		snprintf(title, title_sz, "ИМЯ ЗОНЫ");
 		break;
+	case EVENT_LOG_PANEL_LINK:
+		snprintf(title, title_sz, "НЕТ СВЯЗИ");
+		break;
+	case EVENT_LOG_FIRE_LAUNCH_BLOCK:
+		snprintf(title, title_sz, "ПУСК ЗАБЛ.");
+		break;
 	default:
 		snprintf(title, title_sz, "СОБ.%u", (unsigned)rec->event_code);
 		break;
@@ -508,6 +514,8 @@ static void PrependPhasePrefix(const EventLogRecord_t *rec, char *title, size_t 
 		   rec->event_code == EVENT_LOG_POWER_INPUT_LOW ||
 		   rec->event_code == EVENT_LOG_POWER_INPUT_HIGH) {
 		cleared = rec->additional[1];
+	} else if (rec->event_code == EVENT_LOG_PANEL_LINK) {
+		cleared = rec->additional[0];
 	} else {
 		return;
 	}
@@ -602,6 +610,34 @@ static void FormatDetail(const EventLogRecord_t *rec, char *detail, size_t detai
 			snprintf(detail, detail_sz, "%s", mode_s);
 		}
 	} break;
+	case EVENT_LOG_PANEL_LINK: {
+		/* [0]=cleared, [1]=panel_addr; can_data=uid0|uid1, [2..5]=uid2, [6]=uid_valid */
+		uint32_t u0 = 0u;
+		uint32_t u1 = 0u;
+		uint32_t u2 = 0u;
+		if (a[6] != 0u) {
+			u0 = (uint32_t)rec->can_data[0] |
+			     ((uint32_t)rec->can_data[1] << 8) |
+			     ((uint32_t)rec->can_data[2] << 16) |
+			     ((uint32_t)rec->can_data[3] << 24);
+			u1 = (uint32_t)rec->can_data[4] |
+			     ((uint32_t)rec->can_data[5] << 8) |
+			     ((uint32_t)rec->can_data[6] << 16) |
+			     ((uint32_t)rec->can_data[7] << 24);
+			u2 = (uint32_t)a[2] | ((uint32_t)a[3] << 8) |
+			     ((uint32_t)a[4] << 16) | ((uint32_t)a[5] << 24);
+			snprintf(detail, detail_sz,
+				 "ПАНЕЛЬ %u S/N:%08lX:%08lX:%08lX",
+				 (unsigned)a[1],
+				 (unsigned long)u0, (unsigned long)u1, (unsigned long)u2);
+		} else {
+			snprintf(detail, detail_sz, "ПАНЕЛЬ %u", (unsigned)a[1]);
+		}
+	} break;
+	case EVENT_LOG_FIRE_LAUNCH_BLOCK:
+		/* [0]=zone 1-based (0=все), [1]=mode, [2]=panel_addr */
+		FormatActionSourceDetail(detail, detail_sz, a[0], 0u, a[2], 0u);
+		break;
 	case EVENT_LOG_HOST_LINK:
 		if (a[0] != 0u) {
 			snprintf(detail, detail_sz, "ПАНЕЛЬ %u %s",

@@ -24,6 +24,8 @@ extern PPKYCfg PPKYConfig;
 
 static RsPanelMaster *g_active_master = 0;
 static uint8_t s_v3_poll_seen[RS_PANEL_MAX_PANELS];
+/* 1 = панель уже была READY и сейчас считается потерянной (лог/WARN на фронте). */
+static uint8_t s_panel_link_lost_latched[RS_PANEL_MAX_PANELS];
 static uint16_t g_esp_uart_fwd_seq = 1u;
 static uint32_t g_journal_total = 0u;
 static uint32_t g_journal_selected = 0u;
@@ -278,6 +280,64 @@ static uint8_t rs_panel_master_any_panel_ready(const RsPanelMaster *master)
     return 0u;
 }
 
+static void rs_panel_post_link_event(const PanelState *panel, uint8_t cleared)
+{
+    EventLogPayload_t payload;
+    if (panel == 0) {
+        return;
+    }
+    memset(&payload, 0, sizeof(payload));
+    payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+    payload.additional[0] = cleared ? 1u : 0u; /* 0=пропала, 1=восстановлена */
+    payload.additional[1] = panel->cfg.addr;
+    if (panel->uid_valid != 0u) {
+        payload.can_data[0] = (uint8_t)(panel->uid0 & 0xFFu);
+        payload.can_data[1] = (uint8_t)((panel->uid0 >> 8) & 0xFFu);
+        payload.can_data[2] = (uint8_t)((panel->uid0 >> 16) & 0xFFu);
+        payload.can_data[3] = (uint8_t)((panel->uid0 >> 24) & 0xFFu);
+        payload.can_data[4] = (uint8_t)(panel->uid1 & 0xFFu);
+        payload.can_data[5] = (uint8_t)((panel->uid1 >> 8) & 0xFFu);
+        payload.can_data[6] = (uint8_t)((panel->uid1 >> 16) & 0xFFu);
+        payload.can_data[7] = (uint8_t)((panel->uid1 >> 24) & 0xFFu);
+        payload.additional[2] = (uint8_t)(panel->uid2 & 0xFFu);
+        payload.additional[3] = (uint8_t)((panel->uid2 >> 8) & 0xFFu);
+        payload.additional[4] = (uint8_t)((panel->uid2 >> 16) & 0xFFu);
+        payload.additional[5] = (uint8_t)((panel->uid2 >> 24) & 0xFFu);
+        payload.additional[6] = 1u; /* uid_valid */
+    }
+    (void)EventLog_Post(EVENT_LOG_PANEL_LINK, &payload);
+}
+
+static void rs_panel_notify_link_lost(uint8_t panel_idx, PanelState *panel)
+{
+    if (panel == 0 || panel_idx >= RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    if (s_panel_link_lost_latched[panel_idx] != 0u) {
+        return;
+    }
+    s_panel_link_lost_latched[panel_idx] = 1u;
+    Warning_SetPanelLinkFault(panel->cfg.addr, 1u,
+                              panel->uid0, panel->uid1, panel->uid2,
+                              panel->uid_valid);
+    rs_panel_post_link_event(panel, 0u);
+}
+
+static void rs_panel_notify_link_restored(uint8_t panel_idx, PanelState *panel)
+{
+    if (panel == 0 || panel_idx >= RS_PANEL_MAX_PANELS) {
+        return;
+    }
+    if (s_panel_link_lost_latched[panel_idx] == 0u) {
+        return;
+    }
+    s_panel_link_lost_latched[panel_idx] = 0u;
+    Warning_SetPanelLinkFault(panel->cfg.addr, 0u,
+                              panel->uid0, panel->uid1, panel->uid2,
+                              panel->uid_valid);
+    rs_panel_post_link_event(panel, 1u);
+}
+
 /* Панель стала READY: TIME в v3 POLL + отложенный UI-resync флаг. */
 static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
 {
@@ -293,6 +353,9 @@ static void rs_panel_master_on_panel_became_ready(RsPanelMaster *master)
     s_panel_ui_resync_pending = 1u;
     for (pi = 0u; pi < master->panel_count && pi < RS_PANEL_MAX_PANELS; pi++) {
         RsPanelV3Master_ForceTimeSyncPanel(pi);
+        if (PanelState_IsReady(&master->panels[pi]) != 0u) {
+            rs_panel_notify_link_restored(pi, &master->panels[pi]);
+        }
     }
 }
 
@@ -1433,6 +1496,7 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                 if (panel->link_state == PANEL_LINK_CAPS_PENDING &&
                     panel->caps_valid != 0u) {
                     panel->link_state = PANEL_LINK_READY;
+                    rs_panel_notify_link_restored(i, panel);
                 }
                 if (RsPanelV3_DecodeRsp(frame->payload, frame->payload_len, &v3rsp) != 0u) {
                     RsPanelV3Master_OnRsp(i, &v3rsp, HAL_GetTick());
@@ -1447,6 +1511,9 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
             if (RsPanel_DecodeActivity(frame->payload, frame->payload_len, &act) != 0u) {
                 if (act.dev_type == (uint8_t)DEVICE_PANEL_BOOTLOADER_TYPE) {
                     /* Бут: не кормить WiFi presence старым CAPS.fw_ver (fw=7 при boot). */
+                    if (panel->link_state == PANEL_LINK_READY) {
+                        rs_panel_notify_link_lost(i, panel);
+                    }
                     panel->link_state = PANEL_LINK_CAPS_PENDING;
                     panel->caps_valid = 0u;
                     panel->last_uptime_sec = act.uptime_sec;
@@ -1455,6 +1522,7 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                     if (panel->uptime_valid != 0u &&
                         act.uptime_sec < panel->last_uptime_sec &&
                         panel->link_state == PANEL_LINK_READY) {
+                        rs_panel_notify_link_lost(i, panel);
                         panel->link_state = PANEL_LINK_CAPS_PENDING;
                         panel->caps_valid = 0u;
                         /* Панель сбросила RTC — TIME в ближайших POLL, не ждать PERIOD. */
@@ -1488,6 +1556,7 @@ static void rs_panel_master_on_frame(const RsBusFrameView *frame, void *ctx)
                     if (panel->link_state == PANEL_LINK_CAPS_PENDING &&
                         panel->caps_valid != 0u) {
                         panel->link_state = PANEL_LINK_READY;
+                        rs_panel_notify_link_restored(idx, panel);
                     }
                     if (RsPanelV3_DecodeRsp(frame->payload, frame->payload_len,
                                             &v3rsp) != 0u) {
@@ -2050,6 +2119,9 @@ void RsPanelMaster_Process10ms(RsPanelMaster *master, uint32_t now_ms)
 
             if ((now_ms - cand->last_rx_ms) > cand->watchdog_ms &&
                 cand->last_rx_ms != 0u) {
+                if (cand->link_state == PANEL_LINK_READY) {
+                    rs_panel_notify_link_lost(panel_rr, cand);
+                }
                 cand->link_state = PANEL_LINK_CAPS_PENDING;
                 /* v3: не сбрасывать caps_valid после первого v3 POLL —
                  * иначе POLL останавливается на CAPS и SYS не доходит. */
@@ -2429,7 +2501,8 @@ uint8_t RsPanelV3Proto_DispatchDataEvent(uint8_t panel_idx,
         if (Fire_IsActive() != 0u) {
             return 0u; /* во время пожара режим зон не меняется */
         }
-        /* mode: 0 авто / 2 ручной / 3 пуск блок / 4 пожар выкл */
+        /* mode: 0 авто / 2 ручной / 3 пуск блок / 4 пожар выкл.
+         * Только RAM: панели не пишут Flash — после рестарта вернётся конфиг с ПО. */
         if (zone >= 1u && zone <= ZONE_NUMBER &&
             (mode == 0u || mode == 2u || mode == 3u || mode == 4u)) {
             PPKY_ZoneFireModeSet((uint8_t)(zone - 1u), mode);

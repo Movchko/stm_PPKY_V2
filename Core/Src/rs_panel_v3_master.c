@@ -1424,6 +1424,9 @@ static void rs_v3_handle_event(uint8_t panel_idx, const RsPanelV3Event *ev,
     case RS_PANEL_V3_EVT_FIRE_RESET:
         Fire_OnPanelFireReset(ev->zone, RsPanelMaster_GetPanelAddr(panel_idx));
         break;
+    case RS_PANEL_V3_EVT_FIRE_LAUNCH_BLOCK:
+        Fire_OnPanelFireLaunchBlock(ev->zone, RsPanelMaster_GetPanelAddr(panel_idx));
+        break;
     case RS_PANEL_V3_EVT_SOUND_SET:
         if (PPKYConfig.beep_block != 0u) {
             result = (uint8_t)RS_PANEL_V3_ACK_DENIED;
@@ -1523,7 +1526,8 @@ void RsPanelV3Master_OnRsp(uint8_t panel_idx, const RsPanelV3Rsp *rsp, uint32_t 
             } else if (rsp->event.type == (uint8_t)RS_PANEL_V3_EVT_START_SP ||
                        rsp->event.type == (uint8_t)RS_PANEL_V3_EVT_STOP_LAUNCH ||
                        rsp->event.type == (uint8_t)RS_PANEL_V3_EVT_START_ALL_COMMIT ||
-                       rsp->event.type == (uint8_t)RS_PANEL_V3_EVT_FIRE_RESET) {
+                       rsp->event.type == (uint8_t)RS_PANEL_V3_EVT_FIRE_RESET ||
+                       rsp->event.type == (uint8_t)RS_PANEL_V3_EVT_FIRE_LAUNCH_BLOCK) {
                 if (had_crit != 0u || defer_fire != 0u) {
                     rs_v3_defer_event(panel_idx, &rsp->event, 1u);
                 } else {

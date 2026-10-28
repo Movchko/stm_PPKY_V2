@@ -30,6 +30,10 @@ uint8_t Warning_GetPpkuInputFaultKind(uint8_t ch);
 void Warning_SetMkuPositionFaultMask(uint32_t mask);
 /* Ошибка доставки журнала на панели (бит panel_addr-1 => панель addr 1..8). */
 void Warning_SetPanelJournalFaultMask(uint8_t mask);
+/* Пропажа/восстановление связи с панелью (addr 1..8). UID — последние известные. */
+void Warning_SetPanelLinkFault(uint8_t panel_addr, uint8_t lost,
+			       uint32_t uid0, uint32_t uid1, uint32_t uid2,
+			       uint8_t uid_valid);
 uint8_t Warning_HasActiveFault(void);
 uint8_t Warning_HasActiveAttention(void);
 /* Принудительно переотправить текущий список неисправностей на панели (после READY). */

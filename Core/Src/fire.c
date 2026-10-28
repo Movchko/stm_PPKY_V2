@@ -2251,7 +2251,7 @@ static uint8_t Fire_UiModeRank(uint8_t mode)
 	case 2u: return 60u; /* ТУШЕНИЕ */
 	case 5u: return 50u; /* ПАУЗА */
 	case 4u: return 40u; /* ПОЖАР/ОСТ. */
-	case 8u: return 30u; /* ПУСК БЛОК */
+	case 8u: return 30u; /* ПУСК ЗАБЛ. */
 	case 6u: return 20u; /* ПОЖАР1 */
 	case 1u: return 10u; /* ДО ПУСКА */
 	default: return 0u;
@@ -2336,10 +2336,13 @@ static void Fire_GostResetFire(uint32_t now_ms)
 	/* Сброс пожара с панели (удержание ОСТАНОВ ≥5 с).
 	 * При выборе зоны на UI — квитирование только этой зоны; иначе все слоты.
 	 * Источники заносятся в suppress, чтобы ретраи SetStatusFire с МКУ
-	 * не поднимали пожар снова (датчик/МКУ часто остаются в Fire до reboot). */
+	 * не поднимали пожар снова (датчик/МКУ часто остаются в Fire до reboot).
+	 * Слоты в стадии тушения (phase2_sent) не сбрасываем — остановить уже нельзя. */
 	uint8_t log_zone = 0u;
 	uint8_t zone_only = 0u;
 	uint8_t sel_zone = 0u;
+	uint8_t any_reset = 0u;
+	uint8_t any_phase2_left = 0u;
 
 	if (g_fire_ui_manual_select_enabled && Fire_GetSelectedZoneFromUi(&sel_zone)) {
 		zone_only = 1u;
@@ -2353,34 +2356,53 @@ static void Fire_GostResetFire(uint32_t now_ms)
 
 	if (zone_only != 0u) {
 		int8_t si = Fire_FindSlotZone(sel_zone);
+		if (si >= 0 && g_fire.slots[(uint8_t)si].phase2_sent != 0u) {
+			return; /* тушение идёт — сброс игнор */
+		}
 		if (si >= 0) {
 			Fire_ResetSuppressAddFromSlot(&g_fire.slots[(uint8_t)si]);
 			Fire_LogFireReset(sel_zone, 0u);
 			Fire_SendStopZone(sel_zone);
 			Fire_AbortExtinguishRetriesForZone(sel_zone);
 			Fire_ClearSlotIndex((uint8_t)si);
+			any_reset = 1u;
 		} else {
 			Fire_LogFireReset(sel_zone, 0u);
 			Fire_SendStopZone(sel_zone);
+			any_reset = 1u;
 		}
 	} else {
 		uint8_t logged_any = 0u;
 		for (uint8_t i = 0u; i < FIRE_MAX_SLOTS; i++) {
-			if (!g_fire.slots[i].active) {
+			FireZoneSlot *s = &g_fire.slots[i];
+			if (!s->active) {
 				continue;
 			}
-			Fire_ResetSuppressAddFromSlot(&g_fire.slots[i]);
-			Fire_LogFireReset(g_fire.slots[i].zone, 0u);
+			if (s->phase2_sent != 0u) {
+				any_phase2_left = 1u;
+				continue;
+			}
+			Fire_ResetSuppressAddFromSlot(s);
+			Fire_LogFireReset(s->zone, 0u);
+			Fire_SendStopZone(s->zone);
+			Fire_AbortExtinguishRetriesForZone(s->zone);
+			Fire_ClearSlotIndex(i);
 			logged_any = 1u;
+			any_reset = 1u;
 		}
-		if (logged_any == 0u) {
+		if (logged_any == 0u && any_phase2_left == 0u) {
 			Fire_LogFireReset(log_zone, 0u);
 		}
+		if (any_phase2_left == 0u && any_reset != 0u) {
+			Fire_SendStopAllMcus();
+			Fire_AbortExtinguishRetriesAll();
+			Fire_RetryCancelAll();
+		}
+	}
 
-		Fire_SendStopAllMcus();
-		Fire_AbortExtinguishRetriesAll();
-		Fire_RetryCancelAll();
-		Fire_ClearAllSlots();
+	if (any_reset == 0u && zone_only == 0u) {
+		/* Все активные слоты в тушении — полный no-op. */
+		return;
 	}
 
 	g_fire.start_launch_pressed_latched = 0u;
@@ -3240,6 +3262,50 @@ void Fire_OnPanelFireReset(uint8_t zone, uint8_t panel_addr)
 	(void)now;
 	(void)zone;
 #endif
+}
+
+void Fire_OnPanelFireLaunchBlock(uint8_t zone, uint8_t panel_addr)
+{
+	/* ESC hold 3с: zone_fire_mode=3 в RAM, сброс countdown; phase2/тушение — игнор.
+	 * Без SaveConfig: временный блок с панели не должен переживать рестарт ППКУ. */
+	uint8_t any = 0u;
+	uint8_t i;
+
+	Fire_LogSrcSetPanel(panel_addr);
+	for (i = 0u; i < FIRE_MAX_SLOTS; i++) {
+		FireZoneSlot *s = &g_fire.slots[i];
+		uint8_t zi;
+		EventLogPayload_t payload;
+		if (s->active == 0u) {
+			continue;
+		}
+		if (zone != 0u && s->zone != zone) {
+			continue;
+		}
+		if (s->phase2_sent != 0u) {
+			continue; /* тушение уже идёт — блок пуска бесполезен/запрещён */
+		}
+		if (s->zone < 1u || s->zone > ZONE_NUMBER) {
+			continue;
+		}
+		zi = (uint8_t)(s->zone - 1u);
+		if (PPKYConfig.zone_fire_mode[zi] != 3u) {
+			PPKYConfig.zone_fire_mode[zi] = 3u;
+			any = 1u;
+		} else {
+			/* Уже mode=3 — всё равно сбросить countdown и залогировать. */
+			any = 1u;
+		}
+		memset(&payload, 0, sizeof(payload));
+		payload.master_wagon_num = PPKYConfig.UId.devId.h_adr;
+		payload.additional[0] = s->zone;
+		payload.additional[1] = 3u; /* пуск блок */
+		payload.additional[2] = panel_addr;
+		(void)EventLog_Post(EVENT_LOG_FIRE_LAUNCH_BLOCK, &payload);
+	}
+	if (any != 0u) {
+		Fire_NotifyZoneModeChanged();
+	}
 }
 
 void Fire_FillV3Zones(RsPanelV3Zones *out, uint32_t now_ms)
