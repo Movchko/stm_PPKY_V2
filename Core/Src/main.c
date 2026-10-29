@@ -99,7 +99,7 @@ uint8_t isMainInit = 0;
 /* USER CODE BEGIN 0 */
 
 
-#define APP_VERSION_U32 17u
+#define APP_VERSION_U32 18u
 
 const char *GetAppVersion(void)
 {
